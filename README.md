@@ -14,8 +14,8 @@ Data used:
     -- can use 256 x 256 or 1024 x 1024 patches
 
 
-2. Genomic data 
-    -- bulk RNA-Seq expression from the top 240 differentially expressed genes (240)
+2. Genomic data <br /> 
+    -- bulk RNA-Seq expression from the top 240 differentially expressed genes (240) <br />
        [can add  features like CNV for specific genes and IDH1 gene mutation status] 
 
 Task:
