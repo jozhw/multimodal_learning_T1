@@ -10,7 +10,7 @@ Primary cancer types:
 
 Data used:
 
-1. Histology Whole Slide Images (WSI) from TCGA
+1. Histology Whole Slide Images (WSI) from TCGA <br />
     -- can use 256 x 256 or 1024 x 1024 patches
 
 
