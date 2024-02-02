@@ -40,11 +40,16 @@ def train(opt, data, device, k):
             loss = F.nll_loss(pred, grade)
             loss_epoch += loss.data.item()
 
-            optimizer.zero_grade()
+            optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
+            pred = pred.argmax(dim=1, keepdim=True)
+            grad_acc_epoch += pred.eq(grade.view_as(pred)).sum().item()
 
+            scheduler.step()
+
+        return model, optimizer
             
 
     
