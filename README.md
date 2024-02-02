@@ -1,5 +1,5 @@
 # multimodal_lucid
-Code for multimodal model training for LUCID (Low-dose Understanding, Cellular Insights, and Molecular Discoveries)
+Code for multimodal model training using multiple data fusion techniques for LUCID (Low-dose Understanding, Cellular Insights, and Molecular Discoveries)
 
 
 Primary cancer types:
