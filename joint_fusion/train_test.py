@@ -9,6 +9,7 @@ from torch.utils.data import RandomSampler
 
 from data_loader import custom_dataloader
 from models import MultimodalNetwork
+from utils import mixed_collate
 # from utils import unfreeze_unimodal, CoxLoss, CIndex_lifeline, cox_log_rank, accuracy_cox, mixed_collate, count_parameters
 
 #from GPUtil import showUtilization as gpu_usage
@@ -33,14 +34,15 @@ def train(opt, data, device, cv_id):
     custom_data_loader = custom_dataloader(opt, data, split='train', mode=opt.input_modes)
     train_loader = torch.utils.data.DataLoader(dataset=custom_data_loader, batch_size=opt.batch_size, shuffle=True, collate_fn=mixed_collate)
 
-    for epoch in tqdm(range(opt.epoch_count, opt.niter + opt.niter_decay + 1)):
+    for epoch in tqdm(range(1, opt.num_epochs)):
 
         model.train()
         loss_epoch, grad_acc_epoch = 0, 0
 
-        for batch_idx, (x_wsi, x_rnaseq, grade) in enumerate(train_loader):
+        for batch_idx, (x_wsi, x_omic, grade) in enumerate(train_loader):
             grade = grade.to(device)
-            _, pred = model(x_wsi = x_wsi.to(device), x_rnaseq = x_rnaseq.to(device))
+            set_trace()
+            _, pred = model(x_wsi = x_wsi.to(device), x_omic = x_omic.to(device))
             loss = F.nll_loss(pred, grade)
             loss_epoch += loss.data.item()
 

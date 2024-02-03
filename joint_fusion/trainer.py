@@ -26,26 +26,27 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training')
 parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
 parser.add_argument('--lr_decay_iters', type=int, default=100, help='Learning rate decay steps')
-parser.add_argument('--epochs', type=int, default=10, help='Number of training epochs')
+parser.add_argument('--num_epochs', type=int, default=10, help='Number of training epochs')
 parser.add_argument('--gpu_ids', type=str, default='0', help='gpu ids: e.g. 0  0,1,2, 0,2. use -1 for CPU')
-parser.add_argument('--input_modes', type=str, default='wsi', help='input_modes: wsi, rnaseq, wsi_rnaseq')
+parser.add_argument('--input_modes', type=str, default='wsi', help='input_modes: wsi, omic, wsi_omic')
+parser.add_argument('--input_size_wsi', type=int, default=1024, help="input_size for path images")
 
 opt = parser.parse_args()
 
 device = torch.device('cuda:{}'.format(opt.gpu_ids[0])) if opt.gpu_ids else torch.device('cpu')
 print("Using device:", device)
 
-# keep only the samples that have both WSI data and rnaseq data, and use VGG for the image feature creation
+# keep only the samples that have both WSI data and omic data, and use VGG for the image feature creation
 ignore_missing_wsi = 1
-ignore_missing_rnaseq = 1
+ignore_missing_omic = 1
 use_vgg_features = 0
-use_rnaseq = '_rnaseq'  # pickle files with rnaseq data end with _rnaseq
+use_omic = '_rnaseq'  # pickle files with omic data end with _rnaseq
 
 # use_patch, roi_dir = ('_patch_', 'all_st_patches_512')
 use_patch, roi_dir = ('_patch_', 'all_st')
 
 # set the path to the approriate pickle files
-data_path = '%s/splits/gbmlgg15cv_%s_%d_%d_%d%s.pkl' % (dataroot, roi_dir, ignore_missing_rnaseq, ignore_missing_wsi, use_vgg_features, use_rnaseq)
+data_path = '%s/splits/gbmlgg15cv_%s_%d_%d_%d%s.pkl' % (dataroot, roi_dir, ignore_missing_omic, ignore_missing_wsi, use_vgg_features, use_omic)
 print("Loading %s" % data_path)
 
 # load the pickle file (contains data splits corresponding to 15 fold CV)

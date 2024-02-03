@@ -23,8 +23,8 @@ class MultimodalDataset(Dataset):
     def _preprocess_hist_images(self):
         self.data = preprocess_images(self.image_paths)
 
-    def _preprocess_rnaseq(self):
-        self.data = preprocess_rnaseq(self.rnaseq_paths)
+    def _preprocess_omic(self):
+        self.data = preprocess_omic(self.omic_paths)
 
     def __len__(self):
         return len(self.labels)
@@ -49,7 +49,7 @@ def preprocess_hist_images():
 
 
 
-def preprocess_rnaseq():
+def preprocess_omic():
 
     # normalization/transformation
 

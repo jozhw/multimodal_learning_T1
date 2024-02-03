@@ -11,7 +11,7 @@ class MultimodalNetwork(nn.Module):
         self.linear2 = nn.Linear(in_features=16,
                                  out_features=16)
 
-        # self.rnaseq_net = rnaseqNetwork()
+        # self.omic_net = omicNetwork()
         # self.wsi_net = wsiNetwork()
 
     def forward(self, **kwargs):
@@ -42,7 +42,7 @@ class wsiNetwork(nn.Module):
         pass
 
 
-class rnaseqNetwork(nn.Module):
+class omicNetwork(nn.Module):
     def __init__():
         pass
 
