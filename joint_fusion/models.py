@@ -2,10 +2,10 @@ import torch.nn as nn
 import torchvision.models as models
 
 class MultimodalNetwork(nn.Module):
-    def __init__(self, gene_input_dim, num_classes):
+    def __init__(self, wsi_model, rnaseq_model, combined_model):
         super(MultimodalNetwork, self).__init__()
         # Image modality sub-model: A pre-trained CNN without the final layer
-        self.cnn = models.resnet18(pretrained=True)
+        self.wsi_model = models.resnet18(pretrained=True)
         self.cnn.fc = nn.Identity()  # Remove the final fully connected layer
 
         # Gene expression modality sub-model: A simple feedforward network
@@ -34,4 +34,11 @@ class MultimodalNetwork(nn.Module):
         return output
 
 
+class wsiNetwork(nn.Module):
+    def __init__():
+        pass
+
+
+class rnaseqNetwork(nn.Module):
+    def __init__():
 

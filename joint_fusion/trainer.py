@@ -8,34 +8,71 @@ from torch.cuda.amp import autocast, GradScaler
 import numpy as np
 import datasets
 import models
+from train_test import train, test
+from pdb import set_trace
 
-image_paths = ["path/to/image1", "path/to/image2"]  
-gene_data = [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]  
-labels = [0, 1]  
+dataroot = '/lus/grand/projects/GeomicVar/tarak/multimodal_lucid/data/TCGA_GBMLGG/splits'
 
-def train(model, dataloader, optimizer):
-    transform = Compose([
-        Resize((256, 256)),
-        ToTensor(),
-        Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+opt = parse_args()
 
-dataset = MultimodalDataset(image_paths, gene_data, labels, transform=transform)
-dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
+ignore_missing_wsi = 1
+ignore_missing_rnaseq = 1
+use_vgg_features = 0
+use_rnaseq = '_rnaseq'  # pickle files with rnaseq data end with _rnaseq
 
-model = MultimodalNetwork(gene_input_dim=3, num_classes=2)  
+use_patch, roi_dir = ('_patch_', 'all_st_patches_512')
 
-criterion = nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+# set the path to the approriate pickle files
+data_path = '%s/splits/gbmlgg15cv_%s_%d_%d_%d%s.pkl' % (dataroot, roi_dir, ignore_missing_rnaseq, ignore_missing_wsi, use_vgg_features, use_rnaseq)
+print("Loading %s" % data_cv_path)
 
-for epoch in range(num_epochs):
-    for images, gene_expressions, labels in dataloader:
-        optimizer.zero_grad()
-        outputs = model(images, gene_expressions)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
-    print(f"Epoch {epoch+1}, Loss: {loss.item()}")
+# load the pickle file (contains data splits corresponding to 15 fold CV)
+data_cv = pickle.load(open(data_cv_path, 'rb'))
+data_cv_splits = data_cv['cv_splits']
+results = []
+
+for k, data in data_cv_splits.items():
+    print("************** SPLIT (%d/%d) **************" % (k, len(data_cv_splits.items())))
+    if os.path.exists(os.path.join(opt.checkpoints_dir, opt.exp_name, opt.model_name, '%s_%d_patch_pred_train.pkl' % (opt.model_name, k))):
+	    print("Train-Test Split already made.")
+	    continue
+
+    set_trace()
+    # train the model
+    model, optimizer, metric_logger = train(opt, data, device, k)
+
+    # get the training and test losses
+    loss_train, cindex_train, pvalue_train, surv_acc_train, grad_acc_train, pred_train = test(opt, model, data, 'train', device)
+    # loss_test, cindex_test, pvalue_test, surv_acc_test, grad_acc_test, pred_test = test(opt, model, data, 'test', device)
+
+    print("[Final] Apply model to training set: Loss: %.10f, Acc: %.4f" % (loss_train, grad_acc_train))
+    logging.info("[Final] Apply model to training set: Loss: %.10f, Acc: %.4f" % (loss_train, grad_acc_train))
+    print("[Final] Apply model to testing set: Loss: %.10f, Acc: %.4f" % (loss_test, grad_acc_test))
+    logging.info("[Final] Apply model to testing set: Loss: %.10f, Acc: %.4f" % (loss_test, grad_acc_test))
+    results.append(grad_acc_test)
+
+    if len(opt.gpu_ids) > 0 and torch.cuda.is_available():
+	    model_state_dict = model.module.cpu().state_dict()
+    else:
+	    model_state_dict = model.cpu().state_dict()
+	
+    torch.save({
+	    'split':k,
+	    'opt': opt,
+	    'epoch': opt.niter+opt.niter_decay,
+	    'data': data,
+	    'model_state_dict': model_state_dict,
+	    'optimizer_state_dict': optimizer.state_dict(),
+	    'metrics': metric_logger}, 
+	    os.path.join(opt.checkpoints_dir, opt.exp_name, opt.model_name, '%s_%d.pt' % (opt.model_name, k)))
+
+	# print()
+
+    pickle.dump(pred_train, open(os.path.join(opt.checkpoints_dir, opt.exp_name, opt.model_name, '%s_%d%spred_train.pkl' % (opt.model_name, k, use_patch)), 'wb'))
+    pickle.dump(pred_test, open(os.path.join(opt.checkpoints_dir, opt.exp_name, opt.model_name, '%s_%d%spred_test.pkl' % (opt.model_name, k, use_patch)), 'wb'))
 
 
+print('Split Results:', results)
+print("Average:", np.array(results).mean())
+pickle.dump(results, open(os.path.join(opt.checkpoints_dir, opt.exp_name, opt.model_name, '%s_results.pkl' % opt.model_name), 'wb'))
 
