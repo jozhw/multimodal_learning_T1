@@ -1,37 +1,40 @@
 import torch.nn as nn
 import torchvision.models as models
+from pdb import set_trace
 
 class MultimodalNetwork(nn.Module):
-    def __init__(self, wsi_model, rnaseq_model, combined_model):
+    def __init__(self, opt, cv_id):
         super(MultimodalNetwork, self).__init__()
-        # Image modality sub-model: A pre-trained CNN without the final layer
-        self.wsi_model = models.resnet18(pretrained=True)
-        self.cnn.fc = nn.Identity()  # Remove the final fully connected layer
+        self.linear1 = nn.Linear(in_features=16,
+                                 out_features=16)
+        self.relu1 = nn.ReLU()
+        self.linear2 = nn.Linear(in_features=16,
+                                 out_features=16)
 
-        # Gene expression modality sub-model: A simple feedforward network
-        self.gene_ffn = nn.Sequential(
-            nn.Linear(gene_input_dim, 512),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Dropout(0.5)
-        )
+        # self.rnaseq_net = rnaseqNetwork()
+        # self.wsi_net = wsiNetwork()
 
-        # Fusion and classification layers
-        self.classifier = nn.Sequential(
-            nn.Linear(256 + 512, 256),  # Assuming resnet18's penultimate features are 512-dimensional
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(256, num_classes)
-        )
+    def forward(self, **kwargs):
+        x = kwargs['x_path']
+        # Get the input dimension dynamically
+        input_dim = x.size(-1)
+        hidden_size = 16
+        output_dim = 16
 
-    def forward(self, image, gene_expression):
-        image_features = self.cnn(image)
-        gene_features = self.gene_ffn(gene_expression)
-        combined_features = torch.cat((image_features, gene_features), dim=1)
-        output = self.classifier(combined_features)
-        return output
+        self.linear1.in_features = input_dim
+        self.linear1.out_features = hidden_size
+        self.linear2.in_features = hidden_size
+        self.linear2.out_features = output_dim
+
+        # Pass input through linear and ReLU layers
+        x = self.linear1(x)
+        x = nn.ReLU()(x)
+        x = self.linear2(x)
+        # set_trace()
+        return x
+        # path_vec = kwargs['x_path']
+        # features = self.fusion(path_vec, omic_vec)
+        # return features
 
 
 class wsiNetwork(nn.Module):
@@ -41,4 +44,5 @@ class wsiNetwork(nn.Module):
 
 class rnaseqNetwork(nn.Module):
     def __init__():
+        pass
 

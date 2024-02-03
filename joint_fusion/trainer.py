@@ -9,37 +9,60 @@ import numpy as np
 import datasets
 import models
 from train_test import train, test
+import argparse
+import pickle
 from pdb import set_trace
+import os
 
-dataroot = '/lus/grand/projects/GeomicVar/tarak/multimodal_lucid/data/TCGA_GBMLGG/splits'
+# on Polaris
+# dataroot = '/lus/grand/projects/GeomicVar/tarak/multimodal_lucid/data/TCGA_GBMLGG/splits'
 
-opt = parse_args()
+# on Dell laptop (activate conda env 'pytorch' and use 'python3.10 trainer.py')
+dataroot = '/mnt/c/Users/tnandi/Downloads/multimodal_lucid/data_from_pathomic_fusion/data/TCGA_GBMLGG/splits/'
 
+parser = argparse.ArgumentParser()
+# parser.add_argument('--input_path', type=str, default='data/input.txt', help='Path to input data file')
+# parser.add_argument('--output_path', type=str, default='results/output.txt', help='Path to output results file')
+parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training')
+parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
+parser.add_argument('--lr_decay_iters', type=int, default=100, help='Learning rate decay steps')
+parser.add_argument('--epochs', type=int, default=10, help='Number of training epochs')
+parser.add_argument('--gpu_ids', type=str, default='0', help='gpu ids: e.g. 0  0,1,2, 0,2. use -1 for CPU')
+parser.add_argument('--input_modes', type=str, default='wsi', help='input_modes: wsi, rnaseq, wsi_rnaseq')
+
+opt = parser.parse_args()
+
+device = torch.device('cuda:{}'.format(opt.gpu_ids[0])) if opt.gpu_ids else torch.device('cpu')
+print("Using device:", device)
+
+# keep only the samples that have both WSI data and rnaseq data, and use VGG for the image feature creation
 ignore_missing_wsi = 1
 ignore_missing_rnaseq = 1
 use_vgg_features = 0
 use_rnaseq = '_rnaseq'  # pickle files with rnaseq data end with _rnaseq
 
-use_patch, roi_dir = ('_patch_', 'all_st_patches_512')
+# use_patch, roi_dir = ('_patch_', 'all_st_patches_512')
+use_patch, roi_dir = ('_patch_', 'all_st')
 
 # set the path to the approriate pickle files
 data_path = '%s/splits/gbmlgg15cv_%s_%d_%d_%d%s.pkl' % (dataroot, roi_dir, ignore_missing_rnaseq, ignore_missing_wsi, use_vgg_features, use_rnaseq)
-print("Loading %s" % data_cv_path)
+print("Loading %s" % data_path)
 
 # load the pickle file (contains data splits corresponding to 15 fold CV)
-data_cv = pickle.load(open(data_cv_path, 'rb'))
+data_cv = pickle.load(open(data_path, 'rb'))
 data_cv_splits = data_cv['cv_splits']
 results = []
 
-for k, data in data_cv_splits.items():
-    print("************** SPLIT (%d/%d) **************" % (k, len(data_cv_splits.items())))
-    if os.path.exists(os.path.join(opt.checkpoints_dir, opt.exp_name, opt.model_name, '%s_%d_patch_pred_train.pkl' % (opt.model_name, k))):
-	    print("Train-Test Split already made.")
-	    continue
+for cv_id, data in data_cv_splits.items():
+    print("************** SPLIT (%d/%d) **************" % (cv_id, len(data_cv_splits.items())))
+    # if os.path.exists(os.path.join(opt.checkpoints_dir, opt.exp_name, opt.model_name, '%s_%d_patch_pred_train.pkl' % (opt.model_name, k))):
+	#     print("Train-Test Split already made.")
+	#     continue
 
-    set_trace()
+    # set_trace()
     # train the model
-    model, optimizer, metric_logger = train(opt, data, device, k)
+    model, optimizer, metric_logger = train(opt, data, device, cv_id)
+    set_trace()
 
     # get the training and test losses
     loss_train, cindex_train, pvalue_train, surv_acc_train, grad_acc_train, pred_train = test(opt, model, data, 'train', device)
