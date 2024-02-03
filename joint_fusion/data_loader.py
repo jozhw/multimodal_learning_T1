@@ -11,8 +11,8 @@ from torch.utils.data.dataset import Dataset  # For custom datasets
 from torchvision import datasets, transforms
 
 
-def custom_dataloader(Dataset):
-    def __init__(self, opt, data, split, mode='wsi'):
+class custom_dataloader(Dataset):
+    def __init__(self, opt, data, split=None, mode='wsi'):
         self.X_wsi = data[split]['x_wsi']
         self.X_omic = data[split]['x_omic']
         self.grade = data[split]['grade']
