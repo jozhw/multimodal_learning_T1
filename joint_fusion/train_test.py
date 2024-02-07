@@ -57,8 +57,8 @@ def train(opt, data, device, cv_id):
 
     use_patch, roi_dir = ('_patch_', 'all_st_patches_512')
 
-    custom_data_loader = custom_dataloader(opt, data, split='train', mode=opt.input_modes)
-    train_loader = torch.utils.data.DataLoader(dataset=custom_data_loader, batch_size=opt.batch_size, shuffle=True, collate_fn=mixed_collate)
+    custom_dataset = custom_dataset(opt, data, split='train', mode=opt.input_modes)
+    train_loader = torch.utils.data.DataLoader(dataset=custom_dataset, batch_size=opt.batch_size, shuffle=True, collate_fn=mixed_collate)
 
     for epoch in tqdm(range(1, opt.num_epochs)):
 

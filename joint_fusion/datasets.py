@@ -1,59 +1,49 @@
-# load data from individual modalities
-# pre-process/transform them individually
-# create dataloaders
+import os
+
+import numpy as np
+import pandas as pd
+from pdb import set_trace
+from PIL import Image
+from sklearn import preprocessing
 
 import torch
-from torch.utils.data import Dataset, DataLoader
-from torchvision.io import read_image
-from torchvision.transforms import Compose, Resize, Normalize, ToTensor
+import torch.nn as nn
+from torch.utils.data.dataset import Dataset  # For custom datasets
+from torchvision import datasets, transforms
 
-class MultimodalDataset(Dataset):
-    def __init__(self, image_paths, gene_data, labels, transform=None):
-        """
-        image_paths: List of paths to image files
-        gene_data: A numpy array or tensor of gene expression data (samples x genes)
-        labels: A list or array of labels
-        transform: torchvision transforms for preprocessing images
-        """
-        self.image_paths = image_paths
-        self.gene_data = torch.tensor(gene_data, dtype=torch.float32)
-        self.labels = torch.tensor(labels, dtype=torch.long)
-        self.transform = transform
 
-    def _preprocess_hist_images(self):
-        self.data = preprocess_images(self.image_paths)
+class custom_dataset(Dataset):
+    def __init__(self, opt, data, split=None, mode='wsi'):
+        print("------------------- data[split].keys()----------------", data[split].keys())
+        self.X_wsi = data[split]['x_path']
+        self.X_omic = data[split]['x_omic']
+        # self.X_omic = self.X_omic
+        self.censor = data[split]['e']
+        self.survival_time = data[split]['t']
+        self.grade = data[split]['g'] # grade
 
-    def _preprocess_omic(self):
-        self.data = preprocess_omic(self.omic_paths)
+        self.transforms = transforms.Compose([
+                            transforms.RandomHorizontalFlip(0.5),
+                            transforms.RandomVerticalFlip(0.5),
+                            transforms.RandomCrop(opt.input_size_wsi),
+                            transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.05, hue=0.01),
+                            transforms.ToTensor(),
+                            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
+
+
+    def __getitem__(self, index):
+
+        censor = torch.tensor(self.censor[index]).type(torch.FloatTensor)
+        survival_time = torch.tensor(self.survival_time[index]).type(torch.FloatTensor)
+        grade = torch.tensor(self.grade[index]).type(torch.LongTensor)
+
+        X_wsi = Image.open(self.X_wsi[index]).convert('RGB')
+        X_omic = torch.tensor(self.X_omic[index]).type(torch.FloatTensor)
+        # set_trace()
+        return (self.transforms(X_wsi), X_omic, censor, survival_time, grade)
 
     def __len__(self):
-        return len(self.labels)
-
-    def __getitem__(self, idx):
-        image = read_image(self.image_paths[idx])
-        if self.transform:
-            image = self.transform(image)
-        gene_expression = self.gene_data[idx]
-        label = self.labels[idx]
-        return image, gene_expression, label
-
-def preprocess_hist_images():
-
-    # remove background
-
-    # extract patches
+        return len(self.X_wsi)
 
 
-    pass
-
-
-
-
-def preprocess_omic():
-
-    # normalization/transformation
-
-    # batch correction
-
-    pass
 
