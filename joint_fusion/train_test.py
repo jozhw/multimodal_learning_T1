@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from torch.utils.data import RandomSampler
 # import torch.optim.lr_scheduler as lr_scheduler
 
-from data_loader import custom_dataloader
+from datasets import CustomDataset
 from models import MultimodalNetwork
 from utils import mixed_collate
 
@@ -57,7 +57,7 @@ def train(opt, data, device, cv_id):
 
     use_patch, roi_dir = ('_patch_', 'all_st_patches_512')
 
-    custom_dataset = custom_dataset(opt, data, split='train', mode=opt.input_modes)
+    custom_dataset = CustomDataset(opt, data, split='train', mode=opt.input_modes)
     train_loader = torch.utils.data.DataLoader(dataset=custom_dataset, batch_size=opt.batch_size, shuffle=True, collate_fn=mixed_collate)
 
     for epoch in tqdm(range(1, opt.num_epochs)):

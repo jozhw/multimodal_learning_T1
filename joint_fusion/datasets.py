@@ -12,7 +12,7 @@ from torch.utils.data.dataset import Dataset  # For custom datasets
 from torchvision import datasets, transforms
 
 
-class custom_dataset(Dataset):
+class CustomDataset(Dataset):
     def __init__(self, opt, data, split=None, mode='wsi'):
         print("------------------- data[split].keys()----------------", data[split].keys())
         self.X_wsi = data[split]['x_path']
