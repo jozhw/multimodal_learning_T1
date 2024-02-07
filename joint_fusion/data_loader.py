@@ -18,6 +18,8 @@ class custom_dataloader(Dataset):
         self.X_wsi = data[split]['x_path']
         self.X_omic = data[split]['x_omic']
         # self.X_omic = self.X_omic
+        self.censor = data[split]['e']
+        self.survival_time = data[split]['t']
         self.grade = data[split]['g'] # grade
 
         self.transforms = transforms.Compose([
@@ -30,12 +32,15 @@ class custom_dataloader(Dataset):
 
 
     def __getitem__(self, index):
+
+        censor = torch.tensor(self.censor[index]).type(torch.FloatTensor)
+        survival_time = torch.tensor(self.survival_time[index]).type(torch.FloatTensor)
         grade = torch.tensor(self.grade[index]).type(torch.LongTensor)
 
         X_wsi = Image.open(self.X_wsi[index]).convert('RGB')
         X_omic = torch.tensor(self.X_omic[index]).type(torch.FloatTensor)
         # set_trace()
-        return (self.transforms(X_wsi), X_omic, grade)
+        return (self.transforms(X_wsi), X_omic, censor, survival_time, grade)
 
     def __len__(self):
         return len(self.X_wsi)

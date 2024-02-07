@@ -60,7 +60,6 @@ for cv_id, data in data_cv_splits.items():
 	#     print("Train-Test Split already made.")
 	#     continue
 
-    # set_trace()
     # train the model
     model, optimizer, metric_logger = train(opt, data, device, cv_id)
     set_trace()

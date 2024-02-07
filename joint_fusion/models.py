@@ -1,48 +1,65 @@
+import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.models as models
 from pdb import set_trace
 
+
+# make the output dimension a hyperparameter
+class WSINetwork(nn.Module):
+    def __init__(self, embedding_dim=128):
+        super(WSINetwork, self).__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Flatten(),
+            nn.Linear(32 * 256 * 256, embedding_dim),
+            nn.ReLU()
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class OmicNetwork(nn.Module):
+    def __init__(self, embedding_dim=128):
+        super(OmicNetwork, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(320, 512), # the molecular data has 320 features
+            nn.ReLU(),
+            nn.Linear(512, embedding_dim),
+            nn.ReLU()
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
 class MultimodalNetwork(nn.Module):
-    def __init__(self, opt, cv_id):
+    def __init__(self):
         super(MultimodalNetwork, self).__init__()
-        self.linear1 = nn.Linear(in_features=16,
-                                 out_features=16)
-        self.relu1 = nn.ReLU()
-        self.linear2 = nn.Linear(in_features=16,
-                                 out_features=16)
+        self.wsi_net = WSINetwork(embedding_dim=128)
+        self.omic_net = OmicNetwork(embedding_dim=128)
 
-        # self.omic_net = omicNetwork()
-        # self.wsi_net = wsiNetwork()
+        # downstream MLP for fused data
+        self.downstream_mlp = nn.Sequential(
+            nn.Linear(2048, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, 1)
+        )
 
-    def forward(self, **kwargs):
-        x = kwargs['x_path']
-        # Get the input dimension dynamically
-        input_dim = x.size(-1)
-        hidden_size = 16
-        output_dim = 16
+    def forward(self, x_wsi, x_omic):
+        wsi_embedding = self.wsi_net(x_wsi)
+        omic_embedding = self.omic_net(x_omic)
 
-        self.linear1.in_features = input_dim
-        self.linear1.out_features = hidden_size
-        self.linear2.in_features = hidden_size
-        self.linear2.out_features = output_dim
+        # concatenate embeddings
+        combined_embedding = torch.cat((wsi_embedding, omic_embedding), dim=1)
 
-        # Pass input through linear and ReLU layers
-        x = self.linear1(x)
-        x = nn.ReLU()(x)
-        x = self.linear2(x)
-        # set_trace()
-        return x
-        # path_vec = kwargs['x_path']
-        # features = self.fusion(path_vec, omic_vec)
-        # return features
+        # process combined embedding with downstream MLP
+        output = self.downstream_mlp(combined_embedding)
 
-
-class wsiNetwork(nn.Module):
-    def __init__():
-        pass
-
-
-class omicNetwork(nn.Module):
-    def __init__():
-        pass
-
+        return output
