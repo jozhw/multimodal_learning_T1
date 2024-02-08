@@ -23,7 +23,7 @@ dataroot = '/mnt/c/Users/tnandi/Downloads/multimodal_lucid/data_from_pathomic_fu
 parser = argparse.ArgumentParser()
 # parser.add_argument('--input_path', type=str, default='data/input.txt', help='Path to input data file')
 # parser.add_argument('--output_path', type=str, default='results/output.txt', help='Path to output results file')
-parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training')
+parser.add_argument('--batch_size', type=int, default=16, help='Batch size for training')
 parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
 parser.add_argument('--lr_decay_iters', type=int, default=100, help='Learning rate decay steps')
 parser.add_argument('--num_epochs', type=int, default=10, help='Number of training epochs')
@@ -54,11 +54,9 @@ data_cv = pickle.load(open(data_path, 'rb'))
 data_cv_splits = data_cv['cv_splits']
 results = []
 
+# Get predictions for each split (we will keep the best performing model)
 for cv_id, data in data_cv_splits.items():
     print("************** SPLIT (%d/%d) **************" % (cv_id, len(data_cv_splits.items())))
-    # if os.path.exists(os.path.join(opt.checkpoints_dir, opt.exp_name, opt.model_name, '%s_%d_patch_pred_train.pkl' % (opt.model_name, k))):
-	#     print("Train-Test Split already made.")
-	#     continue
 
     # train the model
     model, optimizer, metric_logger = train(opt, data, device, cv_id)
