@@ -17,13 +17,13 @@ and 1p/19q chromosome codeletion status. So, in addition to the gene expression 
 
 Data used:
 
-1. Histology Whole Slide Images (WSI) from TCGA <br />
+1. Histology data [Whole Slide Images (WSI)] <br />
 
 
-2. Tabular genomic features: gene expression (bulk RNA-seq), copy number variation and mutation data <br />
+2. Tabular molecular data: gene expression (bulk RNA-seq), copy number variation and mutation data <br />
 
 These data have been collected from https://drive.google.com/drive/folders/14TwYYsBeAnJ8ljkvU5YbIHHvFPltUVDr
 
 
 Method:
-Embeddings are generated from the WSI data and the tabular genomic features using a CNN and a MLP, respectively, that are fused to be used as input for a downstream MLP that has it's final node predicting the log-risk score (log of the hazard ratio) for the Cox log partial likelihood function representing the loss function. In the joint fusion approach, all the models are trained simultaneously using the loss function.
+Embeddings are generated from the WSI data and the tabular molecular features using a CNN and a MLP, respectively, that are fused to be used as input for a downstream MLP that has it's final node predicting the log-risk score (log of the hazard ratio) for the Cox log partial likelihood function representing the loss function. In the joint fusion approach, all the models are trained simultaneously using the loss function.
