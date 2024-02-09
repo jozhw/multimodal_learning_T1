@@ -27,3 +27,4 @@ These data have been collected from https://drive.google.com/drive/folders/14TwY
 
 Method:
 Embeddings are generated from the WSI data and the tabular molecular features using a CNN and a MLP, respectively, that are fused to be used as input for a downstream MLP that has it's final node predicting the log-risk score (log of the hazard ratio) for the Cox log partial likelihood function representing the loss function. In the joint fusion approach, all the models are trained simultaneously using the loss function.
+We are also exploring other methods for embedding generation, including attention based decoder models.
