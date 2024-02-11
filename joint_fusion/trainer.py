@@ -18,7 +18,6 @@ import os
 # torch.autograd.profiler.profile(enabled=True)
 from torch.profiler import profile, record_function, ProfilerActivity
 
-
 # on Polaris
 # dataroot = '/lus/grand/projects/GeomicVar/tarak/multimodal_lucid/data/TCGA_GBMLGG/splits'
 
@@ -37,6 +36,7 @@ parser.add_argument('--input_size_wsi', type=int, default=1024, help="input_size
 parser.add_argument('--embedding_dim_wsi', type=int, default=128, help="embedding dimension for WSI")
 parser.add_argument('--embedding_dim_omic', type=int, default=128, help="embedding dimension for omic")
 parser.add_argument('--input_modes', type=str, default="wsi_omic", help="qsi, omic, wsi_omic")
+parser.add_argument('--profile', type=str, default=True, help="whether to profile or not")
 
 opt = parser.parse_args()
 
@@ -47,7 +47,7 @@ print("Using device:", device)
 ignore_missing_hist_subtype = 0   # grades (samples with missing grades are fine as we are only doing survival prediction; grades are neither input features nor target)
 ignore_missing_mol_subtype = 1
 use_vgg_features = 0
-use_omic = '_rnaseq'  # pickle files with omic data end with _rnaseq
+use_omic = '_rnaseq'  # pickle files with the rnaseq data included end with _rnaseq
 # use_omic = ''
 
 # use_patch, roi_dir = ('_patch_', 'all_st_patches_512')
@@ -69,14 +69,20 @@ for cv_id, data in data_cv_splits.items():
     # train the model
     # set_trace()
     # model, optimizer, metric_logger = train_nn(opt, data, device, cv_id)
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                 record_shapes=True,
-                 profile_memory=True,
-                 use_cuda=True) as prof:
-        with record_function("model_train"):
-            model, optimizer = train_nn(opt, data, device, cv_id)
-    # torch.autograd.profiler.profile().export_chrome_trace("./profiling_results.json")
-    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+    if opt.profile:
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                     record_shapes=True,
+                     profile_memory=True,
+                     use_cuda=True) as prof:
+            with record_function("model_train"):
+                model, optimizer = train_nn(opt, data, device, cv_id)
+        # torch.autograd.profiler.profile().export_chrome_trace("./profiling_results.json")
+        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+        # print(prof.key_averages().table(sort_by="self_cpu_memory_usage", row_limit=10))
+        prof.export_chrome_trace("trace.json")
+
+    else:
+        model, optimizer = train_nn(opt, data, device, cv_id)
     # break
     set_trace()
 
