@@ -8,7 +8,7 @@ from torch.cuda.amp import autocast, GradScaler
 import numpy as np
 import datasets
 import models
-from train_test import train_nn, test
+from train_test import train, test
 import argparse
 import pickle
 from pdb import set_trace
@@ -23,17 +23,13 @@ dataroot = '/mnt/c/Users/tnandi/Downloads/multimodal_lucid/data_from_pathomic_fu
 parser = argparse.ArgumentParser()
 # parser.add_argument('--input_path', type=str, default='data/input.txt', help='Path to input data file')
 # parser.add_argument('--output_path', type=str, default='results/output.txt', help='Path to output results file')
-parser.add_argument('--batch_size', type=int, default=8, help='Batch size for training')
+parser.add_argument('--batch_size', type=int, default=16, help='Batch size for training')
 parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
 parser.add_argument('--lr_decay_iters', type=int, default=100, help='Learning rate decay steps')
 parser.add_argument('--num_epochs', type=int, default=10, help='Number of training epochs')
 parser.add_argument('--gpu_ids', type=str, default='0', help='gpu ids: e.g. 0  0,1,2, 0,2. use -1 for CPU')
 parser.add_argument('--input_modes', type=str, default='wsi', help='input_modes: wsi, omic, wsi_omic')
 parser.add_argument('--input_size_wsi', type=int, default=1024, help="input_size for path images")
-parser.add_argument('--embedding_dim_wsi', type=int, default=128, help="embedding dimension for WSI")
-parser.add_argument('--embedding_dim_omic', type=int, default=128, help="embedding dimension for omic")
-parser.add_argument('--only_wsi', type=str, default=False, help="use unimodal model only with WSI")
-parser.add_argument('--only_omic', type=str, default=False, help="use unimodal model only with omic")
 
 opt = parser.parse_args()
 
@@ -41,17 +37,16 @@ device = torch.device('cuda:{}'.format(opt.gpu_ids[0])) if opt.gpu_ids else torc
 print("Using device:", device)
 
 # keep only the samples that have both WSI data and omic data, and use VGG for the image feature creation
-ignore_missing_hist_subtype = 0   # grades (samples with missing grades are fine as we are only doing survival prediction; grades are neither input features nor target)
-ignore_missing_mol_subtype = 1
+ignore_missing_wsi = 1
+ignore_missing_omic = 1
 use_vgg_features = 0
 use_omic = '_rnaseq'  # pickle files with omic data end with _rnaseq
-# use_omic = ''
 
 # use_patch, roi_dir = ('_patch_', 'all_st_patches_512')
 use_patch, roi_dir = ('_patch_', 'all_st')
 
 # set the path to the approriate pickle files
-data_path = '%s/splits/gbmlgg15cv_%s_%d_%d_%d%s.pkl' % (dataroot, roi_dir, ignore_missing_mol_subtype, ignore_missing_hist_subtype, use_vgg_features, use_omic)
+data_path = '%s/splits/gbmlgg15cv_%s_%d_%d_%d%s.pkl' % (dataroot, roi_dir, ignore_missing_omic, ignore_missing_wsi, use_vgg_features, use_omic)
 print("Loading %s" % data_path)
 
 # load the pickle file (contains data splits corresponding to 15 fold CV)
@@ -64,8 +59,7 @@ for cv_id, data in data_cv_splits.items():
     print("************** SPLIT (%d/%d) **************" % (cv_id, len(data_cv_splits.items())))
 
     # train the model
-    # set_trace()
-    model, optimizer, metric_logger = train_nn(opt, data, device, cv_id)
+    model, optimizer, metric_logger = train(opt, data, device, cv_id)
     set_trace()
 
 #     # get the training and test losses

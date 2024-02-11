@@ -7,9 +7,8 @@ from pdb import set_trace
 
 # make the output(embedding) dimension a hyperparameter
 class WSINetwork(nn.Module):
-    def __init__(self, embedding_dim=128):
+    def __init__(self, embedding_dim):
         super(WSINetwork, self).__init__()
-
         self.embedding_dim = embedding_dim
 
         # self.net = nn.Sequential(
@@ -43,8 +42,9 @@ class WSINetwork(nn.Module):
 
 
 class OmicNetwork(nn.Module):
-    def __init__(self, embedding_dim=128):
+    def __init__(self, embedding_dim):
         super(OmicNetwork, self).__init__()
+        self.embedding_dim = embedding_dim
         self.net = nn.Sequential(
             nn.Linear(320, 512),  # the molecular/genomic data has 320 features
             nn.ReLU(),
@@ -57,14 +57,16 @@ class OmicNetwork(nn.Module):
 
 
 class MultimodalNetwork(nn.Module):
-    def __init__(self):
+    def __init__(self, embedding_dim_wsi, embedding_dim_omic, only_wsi=False, only_omic=False):
         super(MultimodalNetwork, self).__init__()
-        self.wsi_net = WSINetwork(embedding_dim=128)
-        self.omic_net = OmicNetwork(embedding_dim=128)
-        embedding_dim = self.wsi_net.embedding_dim
+        self.wsi_net = WSINetwork(embedding_dim_wsi)
+        self.omic_net = OmicNetwork(embedding_dim_omic)
+        self.only_wsi = only_wsi
+        self.only_omic = only_omic
+        embedding_dim = self.wsi_net.embedding_dim + self.omic_net.embedding_dim
         # downstream MLP for fused data
         self.fused_mlp = nn.Sequential(
-            nn.Linear(embedding_dim * 2, 1024),  # *2 for the 2 modalities
+            nn.Linear(embedding_dim, 1024),
             nn.ReLU(),
             nn.Linear(1024, 1)
         )
@@ -74,11 +76,19 @@ class MultimodalNetwork(nn.Module):
         omic_embedding = self.omic_net(x_omic)
 
         # concatenate embeddings
-        combined_embedding = torch.cat((wsi_embedding, omic_embedding), dim=1)
-        print("wsi_embedding.shape: ", wsi_embedding.shape)
-        print("omic_embedding.shape: ", omic_embedding.shape)
-        print("combined_embedding.shape: ", combined_embedding.shape)
-        # process combined embedding with downstream MLP
+        if self.only_wsi:
+            combined_embedding = wsi_embedding
+        elif self.only_omic:
+            combined_embedding = omic_embedding
+        else:
+            combined_embedding = torch.cat((wsi_embedding, omic_embedding), dim=1)
+
+
+        # print("wsi_embedding.shape: ", wsi_embedding.shape)
+        # print("omic_embedding.shape: ", omic_embedding.shape)
+        # print("combined_embedding.shape: ", combined_embedding.shape)
+
+        # use combined embedding with downstream MLP
         output = self.fused_mlp(combined_embedding)
 
         return output

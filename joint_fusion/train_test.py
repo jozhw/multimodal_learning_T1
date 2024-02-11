@@ -50,13 +50,15 @@ class CoxLoss(nn.Module):
         return cox_loss.mean()
 
 
-def train(opt, data, device, cv_id):
-    # first extract only the wsi data and the labeled grades
-    # set_trace()
-    model = MultimodalNetwork()  # opt, cv_id)
+def train_nn(opt, data, device, cv_id):
+    model = MultimodalNetwork(embedding_dim_wsi=opt.embedding_dim_wsi,
+                              embedding_dim_omic=opt.embedding_dim_omic,
+                              only_wsi=opt.only_wsi,
+                              only_omic=opt.only_omic)  # opt, cv_id)
     model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=opt.lr)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=opt.lr_decay_iters, gamma=0.1)
+    cox_loss = CoxLoss()
 
     print("WSINetwork Summary:")
     print_model_summary(model.wsi_net)
@@ -65,15 +67,11 @@ def train(opt, data, device, cv_id):
     print("\nMultimodalNetwork Summary:")
     print_model_summary(model)
 
-    cox_loss = CoxLoss()
-
     print("--------Model arch------------")
     print(model)
 
     print("--------WSI Model summary -----------")
     summary(model.wsi_net, input_size=(3, 1024, 1024))
-
-    use_patch, roi_dir = ('_patch_', 'all_st_patches_512')
 
     custom_dataset = CustomDataset(opt, data, split='train', mode=opt.input_modes)
     train_loader = torch.utils.data.DataLoader(dataset=custom_dataset, batch_size=opt.batch_size, shuffle=True,
@@ -82,17 +80,17 @@ def train(opt, data, device, cv_id):
     for epoch in tqdm(range(1, opt.num_epochs)):
         print("epoch: ", epoch, " out of ", opt.num_epochs)
 
-        model.train()
+        model.train() # set the model to train mode
         loss_epoch = 0
 
         for batch_idx, (x_wsi, x_omic, censor, survival_time, grade) in enumerate(train_loader):
+            print("batch_index: ", batch_idx, " out of ", np.ceil(len(custom_dataset) / opt.batch_size))
             x_wsi = x_wsi.to(device)
             x_omic = x_omic.to(device)
 
             censor = censor.to(device)
             survival_time = survival_time.to(device)
             # grade = grade.to(device)
-            # set_trace()
             optimizer.zero_grad()
 
             # model for survival outcome (uses Cox PH partial log likelihood as the loss function)
@@ -102,7 +100,8 @@ def train(opt, data, device, cv_id):
             # loss = F.nll_loss(predictions, grade)  # cross entropy for cancer grade classification
             loss = cox_loss(predictions.squeeze(), survival_time,
                             censor)  # Cox partial likelihood loss for survival outcome prediction
-            set_trace()
+            # set_trace()
+            print("loss: ", loss.data.item())
             loss_epoch += loss.data.item()
             loss.backward()
             optimizer.step()
@@ -112,7 +111,7 @@ def train(opt, data, device, cv_id):
             # grade_acc_epoch += predictions.eq(grade.view_as(predictions)).sum().item()
 
             scheduler.step()
-
+        print("epoch loss: ", loss_epoch)
     return model, optimizer
 
 
