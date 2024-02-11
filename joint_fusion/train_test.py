@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch.utils.data import RandomSampler
 # import torch.optim.lr_scheduler as lr_scheduler
 from torchsummary import summary
+from torch.cuda.amp import autocast, GradScaler
 
 from datasets import CustomDataset
 from models import MultimodalNetwork, print_model_summary
@@ -91,22 +92,38 @@ def train_nn(opt, data, device, cv_id):
             # grade = grade.to(device)
             optimizer.zero_grad()
 
-            # model for survival outcome (uses Cox PH partial log likelihood as the loss function)
-            # the model output should be considered as beta*X to be used in the Cox loss function
-            predictions = model(x_wsi=x_wsi, x_omic=x_omic)
+            if opt.use_mixed_precision:
+                scaler = GradScaler()
+                with autocast():
+                    predictions = model(x_wsi=x_wsi,
+                                        x_omic=x_omic)
+                    loss = cox_loss(predictions.squeeze(),
+                                    survival_time,
+                                    censor)
+                print("loss: ", loss.data.item())
+                loss_epoch += loss.data.item()
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                # model for survival outcome (uses Cox PH partial log likelihood as the loss function)
+                # the model output should be considered as beta*X to be used in the Cox loss function
+                predictions = model(x_wsi=x_wsi,
+                                    x_omic=x_omic)
 
-            # loss = F.nll_loss(predictions, grade)  # cross entropy for cancer grade classification
-            loss = cox_loss(predictions.squeeze(), survival_time,
-                            censor)  # Cox partial likelihood loss for survival outcome prediction
-            # set_trace()
-            print("loss: ", loss.data.item())
-            loss_epoch += loss.data.item()
-            loss.backward()
-            optimizer.step()
+                # loss = F.nll_loss(predictions, grade)  # cross entropy for cancer grade classification
+                loss = cox_loss(predictions.squeeze(),
+                                survival_time,
+                                censor)  # Cox partial likelihood loss for survival outcome prediction
+                # set_trace()
+                print("loss: ", loss.data.item())
+                loss_epoch += loss.data.item()
+                loss.backward()
+                optimizer.step()
 
-            # Get the primary grade class
-            # predictions = predictions.argmax(dim=1, keepdim=True)
-            # grade_acc_epoch += predictions.eq(grade.view_as(predictions)).sum().item()
+                # Get the primary grade class
+                # predictions = predictions.argmax(dim=1, keepdim=True)
+                # grade_acc_epoch += predictions.eq(grade.view_as(predictions)).sum().item()
 
             scheduler.step()
             break

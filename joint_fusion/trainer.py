@@ -14,6 +14,7 @@ import pickle
 from pdb import set_trace
 import os
 
+
 # for profiling
 # torch.autograd.profiler.profile(enabled=True)
 from torch.profiler import profile, record_function, ProfilerActivity
@@ -36,7 +37,8 @@ parser.add_argument('--input_size_wsi', type=int, default=1024, help="input_size
 parser.add_argument('--embedding_dim_wsi', type=int, default=128, help="embedding dimension for WSI")
 parser.add_argument('--embedding_dim_omic', type=int, default=128, help="embedding dimension for omic")
 parser.add_argument('--input_modes', type=str, default="wsi_omic", help="qsi, omic, wsi_omic")
-parser.add_argument('--profile', type=str, default=True, help="whether to profile or not")
+parser.add_argument('--profile', type=str, default=False, help="whether to profile or not")
+parser.add_argument('--use_mixed_precision', type=str, default=True, help="whether to use mixed precision calculations")
 
 opt = parser.parse_args()
 
@@ -69,6 +71,7 @@ for cv_id, data in data_cv_splits.items():
     # train the model
     # set_trace()
     # model, optimizer, metric_logger = train_nn(opt, data, device, cv_id)
+
     if opt.profile:
         with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
                      record_shapes=True,
@@ -80,6 +83,15 @@ for cv_id, data in data_cv_splits.items():
         print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
         # print(prof.key_averages().table(sort_by="self_cpu_memory_usage", row_limit=10))
         prof.export_chrome_trace("trace.json")
+
+    # with torch.profiler.profile(
+    #         schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
+    #         on_trace_ready=torch.profiler.tensorboard_trace_handler('./log/multimodal'),
+    #         record_shapes=True,
+    #         profile_memory=True,
+    #         with_stack=True
+    # ) as prof:
+
 
     else:
         model, optimizer = train_nn(opt, data, device, cv_id)
