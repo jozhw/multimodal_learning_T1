@@ -53,16 +53,16 @@ class OmicNetwork(nn.Module):
         )
 
     def forward(self, x):
+        print("+++++++++++++ Input shape within omic network: ", x.shape)
         return self.net(x)
 
 
 class MultimodalNetwork(nn.Module):
-    def __init__(self, embedding_dim_wsi, embedding_dim_omic, only_wsi=False, only_omic=False):
+    def __init__(self, embedding_dim_wsi, embedding_dim_omic, mode):
         super(MultimodalNetwork, self).__init__()
         self.wsi_net = WSINetwork(embedding_dim_wsi)
         self.omic_net = OmicNetwork(embedding_dim_omic)
-        self.only_wsi = only_wsi
-        self.only_omic = only_omic
+        self.mode = mode
         embedding_dim = self.wsi_net.embedding_dim + self.omic_net.embedding_dim
         # downstream MLP for fused data
         self.fused_mlp = nn.Sequential(
@@ -75,10 +75,11 @@ class MultimodalNetwork(nn.Module):
         wsi_embedding = self.wsi_net(x_wsi)
         omic_embedding = self.omic_net(x_omic)
 
+        print("input mode: ", self.mode)
         # concatenate embeddings
-        if self.only_wsi:
+        if self.mode == 'wsi':
             combined_embedding = wsi_embedding
-        elif self.only_omic:
+        elif self.mode == 'omic':
             combined_embedding = omic_embedding
         else:
             combined_embedding = torch.cat((wsi_embedding, omic_embedding), dim=1)

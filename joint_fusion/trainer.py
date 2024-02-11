@@ -14,6 +14,11 @@ import pickle
 from pdb import set_trace
 import os
 
+# for profiling
+# torch.autograd.profiler.profile(enabled=True)
+from torch.profiler import profile, record_function, ProfilerActivity
+
+
 # on Polaris
 # dataroot = '/lus/grand/projects/GeomicVar/tarak/multimodal_lucid/data/TCGA_GBMLGG/splits'
 
@@ -26,14 +31,12 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--batch_size', type=int, default=8, help='Batch size for training')
 parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
 parser.add_argument('--lr_decay_iters', type=int, default=100, help='Learning rate decay steps')
-parser.add_argument('--num_epochs', type=int, default=10, help='Number of training epochs')
+parser.add_argument('--num_epochs', type=int, default=2, help='Number of training epochs')
 parser.add_argument('--gpu_ids', type=str, default='0', help='gpu ids: e.g. 0  0,1,2, 0,2. use -1 for CPU')
-parser.add_argument('--input_modes', type=str, default='wsi', help='input_modes: wsi, omic, wsi_omic')
 parser.add_argument('--input_size_wsi', type=int, default=1024, help="input_size for path images")
 parser.add_argument('--embedding_dim_wsi', type=int, default=128, help="embedding dimension for WSI")
 parser.add_argument('--embedding_dim_omic', type=int, default=128, help="embedding dimension for omic")
-parser.add_argument('--only_wsi', type=str, default=False, help="use unimodal model only with WSI")
-parser.add_argument('--only_omic', type=str, default=False, help="use unimodal model only with omic")
+parser.add_argument('--input_modes', type=str, default="wsi_omic", help="qsi, omic, wsi_omic")
 
 opt = parser.parse_args()
 
@@ -65,7 +68,16 @@ for cv_id, data in data_cv_splits.items():
 
     # train the model
     # set_trace()
-    model, optimizer, metric_logger = train_nn(opt, data, device, cv_id)
+    # model, optimizer, metric_logger = train_nn(opt, data, device, cv_id)
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                 record_shapes=True,
+                 profile_memory=True,
+                 use_cuda=True) as prof:
+        with record_function("model_train"):
+            model, optimizer = train_nn(opt, data, device, cv_id)
+    # torch.autograd.profiler.profile().export_chrome_trace("./profiling_results.json")
+    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+    # break
     set_trace()
 
 #     # get the training and test losses

@@ -53,8 +53,7 @@ class CoxLoss(nn.Module):
 def train_nn(opt, data, device, cv_id):
     model = MultimodalNetwork(embedding_dim_wsi=opt.embedding_dim_wsi,
                               embedding_dim_omic=opt.embedding_dim_omic,
-                              only_wsi=opt.only_wsi,
-                              only_omic=opt.only_omic)  # opt, cv_id)
+                              mode=opt.input_modes)  # opt, cv_id)
     model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=opt.lr)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=opt.lr_decay_iters, gamma=0.1)
@@ -69,7 +68,6 @@ def train_nn(opt, data, device, cv_id):
 
     print("--------Model arch------------")
     print(model)
-
     print("--------WSI Model summary -----------")
     summary(model.wsi_net, input_size=(3, 1024, 1024))
 
@@ -80,7 +78,7 @@ def train_nn(opt, data, device, cv_id):
     for epoch in tqdm(range(1, opt.num_epochs)):
         print("epoch: ", epoch, " out of ", opt.num_epochs)
 
-        model.train() # set the model to train mode
+        model.train()  # set the model to train mode
         loss_epoch = 0
 
         for batch_idx, (x_wsi, x_omic, censor, survival_time, grade) in enumerate(train_loader):
@@ -111,6 +109,7 @@ def train_nn(opt, data, device, cv_id):
             # grade_acc_epoch += predictions.eq(grade.view_as(predictions)).sum().item()
 
             scheduler.step()
+            break
         print("epoch loss: ", loss_epoch)
     return model, optimizer
 
