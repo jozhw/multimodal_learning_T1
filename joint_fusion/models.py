@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
 from pdb import set_trace
+from torchvision.models.vision_transformer import vit_b_32
+from torchvision.models import ViT_B_32_Weights
 
 
 # make the output(embedding) dimension a hyperparameter
@@ -37,30 +39,36 @@ class WSINetwork(nn.Module):
         # )
 
         # 18 layer resnet
-        # self.resnet = models.resnet18(pretrained=False)
-
-        # remove the fully connected layer (classifier) and the final pooling layer
-        # extract the final set of features
-        # https://stackoverflow.com/questions/55083642/extract-features-from-last-hidden-layer-pytorch-resnet18
-        # self.resnet = nn.Sequential(*list(self.resnet.children())[:-2]) # is of shape [batch_size, 512, 32, 32]
-        # go from above to the embedding layer
-        # self.adaptive_pool = nn.AdaptiveAvgPool2d((1, 1))
-
-        resnet18 = models.resnet18(pretrained=False)
+        # can train the whole model or freeze certain layers
+        resnet18 = models.resnet18(pretrained=True)
         # remove the fully connected layer (classifier) and the final pooling layer
         # extract the final set of features
         # https://stackoverflow.com/questions/55083642/extract-features-from-last-hidden-layer-pytorch-resnet18
         layers = list(resnet18.children())[:-2]
         num_features_extracted = 512  # fixed for resnet18
 
+        # self.net = nn.Sequential(
+        #     *layers,
+        #     nn.AdaptiveAvgPool2d((1, 1)),
+        #     nn.Flatten(),
+        #     nn.Linear(num_features_extracted, embedding_dim),
+        #     nn.ReLU()
+        # )
+        # # set_trace()
+
+        # vision transformer vit_b_32 arch ('base' version with 32 x 32 patches)
+        vit = vit_b_32(weights=ViT_B_32_Weights)
+        layers = list(vit.children()) # get all the layers
+        vit_top = nn.Sequential(*layers[:-2]) # remove the normalization and the pooling layer
+        self.feature_extractor = nn.Sequential(*layers)
+        num_features = 768
+        # self.embedding_layer = nn.Linear(num_features, embedding_dim)
         self.net = nn.Sequential(
             *layers,
-            nn.AdaptiveAvgPool2d((1, 1)),
             nn.Flatten(),
-            nn.Linear(num_features_extracted, embedding_dim),
-            nn.ReLU()
+            nn.Linear(num_features, embedding_dim)
         )
-        # set_trace()
+        set_trace()
 
     def forward(self, x):
         print("+++++++++++++ Input shape within WSINetwork: ", x.shape)
