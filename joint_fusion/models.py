@@ -23,23 +23,48 @@ class WSINetwork(nn.Module):
         #     nn.ReLU()
         # )
 
+        # self.net = nn.Sequential(
+        #     nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1),
+        #     nn.ReLU(),
+        #     nn.MaxPool2d(kernel_size=2, stride=2),
+        #     nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1),
+        #     nn.ReLU(),
+        #     nn.MaxPool2d(kernel_size=2, stride=2),
+        #     nn.AdaptiveAvgPool2d((1, 1)),
+        #     nn.Flatten(),
+        #     nn.Linear(32, embedding_dim),
+        #     nn.ReLU()
+        # )
+
+        # 18 layer resnet
+        # self.resnet = models.resnet18(pretrained=False)
+
+        # remove the fully connected layer (classifier) and the final pooling layer
+        # extract the final set of features
+        # https://stackoverflow.com/questions/55083642/extract-features-from-last-hidden-layer-pytorch-resnet18
+        # self.resnet = nn.Sequential(*list(self.resnet.children())[:-2]) # is of shape [batch_size, 512, 32, 32]
+        # go from above to the embedding layer
+        # self.adaptive_pool = nn.AdaptiveAvgPool2d((1, 1))
+
+        resnet18 = models.resnet18(pretrained=False)
+        # remove the fully connected layer (classifier) and the final pooling layer
+        # extract the final set of features
+        # https://stackoverflow.com/questions/55083642/extract-features-from-last-hidden-layer-pytorch-resnet18
+        layers = list(resnet18.children())[:-2]
+        num_features_extracted = 512  # fixed for resnet18
+
         self.net = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
+            *layers,
             nn.AdaptiveAvgPool2d((1, 1)),
             nn.Flatten(),
-            nn.Linear(32, embedding_dim),
+            nn.Linear(num_features_extracted, embedding_dim),
             nn.ReLU()
         )
+        # set_trace()
 
     def forward(self, x):
         print("+++++++++++++ Input shape within WSINetwork: ", x.shape)
         return self.net(x)
-
 
 class OmicNetwork(nn.Module):
     def __init__(self, embedding_dim):
@@ -76,6 +101,8 @@ class MultimodalNetwork(nn.Module):
         omic_embedding = self.omic_net(x_omic)
 
         print("input mode: ", self.mode)
+        print("wsi_embedding.shape: ", wsi_embedding.shape)
+        print("omic_embedding.shape: ", omic_embedding.shape)
         # concatenate embeddings
         if self.mode == 'wsi':
             combined_embedding = wsi_embedding
@@ -84,9 +111,6 @@ class MultimodalNetwork(nn.Module):
         else:
             combined_embedding = torch.cat((wsi_embedding, omic_embedding), dim=1)
 
-
-        # print("wsi_embedding.shape: ", wsi_embedding.shape)
-        # print("omic_embedding.shape: ", omic_embedding.shape)
         # print("combined_embedding.shape: ", combined_embedding.shape)
 
         # use combined embedding with downstream MLP

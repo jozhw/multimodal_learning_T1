@@ -27,7 +27,7 @@ dataroot = '/mnt/c/Users/tnandi/Downloads/multimodal_lucid/data_from_pathomic_fu
 parser = argparse.ArgumentParser()
 # parser.add_argument('--input_path', type=str, default='data/input.txt', help='Path to input data file')
 # parser.add_argument('--output_path', type=str, default='results/output.txt', help='Path to output results file')
-parser.add_argument('--batch_size', type=int, default=16, help='Batch size for training')
+parser.add_argument('--batch_size', type=int, default=8, help='Batch size for training')
 parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
 parser.add_argument('--lr_decay_iters', type=int, default=100, help='Learning rate decay steps')
 parser.add_argument('--num_epochs', type=int, default=2, help='Number of training epochs')
