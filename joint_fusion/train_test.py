@@ -72,6 +72,11 @@ def train_nn(opt, data, device, cv_id):
     print("--------WSI Model summary -----------")
     summary(model.wsi_net, input_size=(3, 1024, 1024))
 
+    if opt.use_gradient_accumulation:
+        accumulation_steps = 10
+    if opt.use_mixed_precision:
+        scaler = GradScaler()
+
     custom_dataset = CustomDataset(opt, data, split='train', mode=opt.input_modes)
     train_loader = torch.utils.data.DataLoader(dataset=custom_dataset, batch_size=opt.batch_size, shuffle=True,
                                                collate_fn=mixed_collate)
@@ -90,18 +95,18 @@ def train_nn(opt, data, device, cv_id):
             censor = censor.to(device)
             survival_time = survival_time.to(device)
             # grade = grade.to(device)
-            optimizer.zero_grad()
 
+            optimizer.zero_grad()
             if opt.use_mixed_precision:
-                scaler = GradScaler()
-                with autocast():
+
+                with autocast(): # should wrap only the forward pass including the loss calculation
                     predictions = model(x_wsi=x_wsi,
                                         x_omic=x_omic)
                     loss = cox_loss(predictions.squeeze(),
                                     survival_time,
                                     censor)
-                print("loss: ", loss.data.item())
-                loss_epoch += loss.data.item()
+                    print("loss: ", loss.data.item())
+                    loss_epoch += loss.data.item()
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
@@ -110,12 +115,10 @@ def train_nn(opt, data, device, cv_id):
                 # the model output should be considered as beta*X to be used in the Cox loss function
                 predictions = model(x_wsi=x_wsi,
                                     x_omic=x_omic)
-
                 # loss = F.nll_loss(predictions, grade)  # cross entropy for cancer grade classification
                 loss = cox_loss(predictions.squeeze(),
                                 survival_time,
                                 censor)  # Cox partial likelihood loss for survival outcome prediction
-                # set_trace()
                 print("loss: ", loss.data.item())
                 loss_epoch += loss.data.item()
                 loss.backward()
@@ -126,7 +129,7 @@ def train_nn(opt, data, device, cv_id):
                 # grade_acc_epoch += predictions.eq(grade.view_as(predictions)).sum().item()
 
             scheduler.step()
-            break
+            # break
         print("epoch loss: ", loss_epoch)
     return model, optimizer
 

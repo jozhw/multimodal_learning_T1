@@ -14,7 +14,6 @@ import pickle
 from pdb import set_trace
 import os
 
-
 # for profiling
 # torch.autograd.profiler.profile(enabled=True)
 from torch.profiler import profile, record_function, ProfilerActivity
@@ -28,7 +27,7 @@ dataroot = '/mnt/c/Users/tnandi/Downloads/multimodal_lucid/data_from_pathomic_fu
 parser = argparse.ArgumentParser()
 # parser.add_argument('--input_path', type=str, default='data/input.txt', help='Path to input data file')
 # parser.add_argument('--output_path', type=str, default='results/output.txt', help='Path to output results file')
-parser.add_argument('--batch_size', type=int, default=8, help='Batch size for training')
+parser.add_argument('--batch_size', type=int, default=16, help='Batch size for training')
 parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
 parser.add_argument('--lr_decay_iters', type=int, default=100, help='Learning rate decay steps')
 parser.add_argument('--num_epochs', type=int, default=2, help='Number of training epochs')
@@ -36,17 +35,19 @@ parser.add_argument('--gpu_ids', type=str, default='0', help='gpu ids: e.g. 0  0
 parser.add_argument('--input_size_wsi', type=int, default=1024, help="input_size for path images")
 parser.add_argument('--embedding_dim_wsi', type=int, default=128, help="embedding dimension for WSI")
 parser.add_argument('--embedding_dim_omic', type=int, default=128, help="embedding dimension for omic")
-parser.add_argument('--input_modes', type=str, default="wsi_omic", help="qsi, omic, wsi_omic")
+parser.add_argument('--input_modes', type=str, default="wsi_omic", help="wsi, omic, wsi_omic")
 parser.add_argument('--profile', type=str, default=False, help="whether to profile or not")
 parser.add_argument('--use_mixed_precision', type=str, default=True, help="whether to use mixed precision calculations")
+parser.add_argument('--use_gradient_accumulation', type=str, default=False, help="whether to use gradient accumulation")
 
 opt = parser.parse_args()
 
 device = torch.device('cuda:{}'.format(opt.gpu_ids[0])) if opt.gpu_ids else torch.device('cpu')
 print("Using device:", device)
+torch.backends.cudnn.benchmark = True  # A bool that, if True, causes cuDNN to benchmark multiple convolution algorithms and select the fastest.
 
 # keep only the samples that have both WSI data and omic data, and use VGG for the image feature creation
-ignore_missing_hist_subtype = 0   # grades (samples with missing grades are fine as we are only doing survival prediction; grades are neither input features nor target)
+ignore_missing_hist_subtype = 0  # grades (samples with missing grades are fine as we are only doing survival prediction; grades are neither input features nor target)
 ignore_missing_mol_subtype = 1
 use_vgg_features = 0
 use_omic = '_rnaseq'  # pickle files with the rnaseq data included end with _rnaseq
@@ -56,7 +57,8 @@ use_omic = '_rnaseq'  # pickle files with the rnaseq data included end with _rna
 use_patch, roi_dir = ('_patch_', 'all_st')
 
 # set the path to the approriate pickle files
-data_path = '%s/splits/gbmlgg15cv_%s_%d_%d_%d%s.pkl' % (dataroot, roi_dir, ignore_missing_mol_subtype, ignore_missing_hist_subtype, use_vgg_features, use_omic)
+data_path = '%s/splits/gbmlgg15cv_%s_%d_%d_%d%s.pkl' % (
+dataroot, roi_dir, ignore_missing_mol_subtype, ignore_missing_hist_subtype, use_vgg_features, use_omic)
 print("Loading %s" % data_path)
 
 # load the pickle file (contains data splits corresponding to 15 fold CV)
@@ -92,11 +94,10 @@ for cv_id, data in data_cv_splits.items():
     #         with_stack=True
     # ) as prof:
 
-
     else:
         model, optimizer = train_nn(opt, data, device, cv_id)
     # break
-    set_trace()
+    # set_trace()
 
 #     # get the training and test losses
 #     loss_train, cindex_train, pvalue_train, surv_acc_train, grad_acc_train, pred_train = test(opt, model, data, 'train', device)
