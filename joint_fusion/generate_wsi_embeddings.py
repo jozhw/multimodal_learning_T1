@@ -1,5 +1,6 @@
 # code to train models, or use pretrained models to generate WSI embeddings
 import os
+import csv
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
@@ -10,6 +11,15 @@ from torchvision.transforms import Resize, Normalize, ToTensor, Compose
 from pdb import set_trace
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
+batch_size = 16
+
+def extract_tcga_id(filename):
+    parts = filename.split(
+        "-")  # sample png file name: TCGA-02-0011-01Z-00-DX1.7CF44982-AE5A-47A5-8D07-E526522DC094_1.png
+    tcga_id = "-".join(parts[:3])
+    return tcga_id
+
+
 # create a custom dataset
 class CustomDataset(Dataset):
     def __init__(self, image_dir, transform=None):
@@ -23,12 +33,13 @@ class CustomDataset(Dataset):
     def __getitem__(self, idx):
         img_path = os.path.join(self.image_dir, self.images[idx])
         image = Image.open(img_path).convert('RGB')
+        tcga_id = extract_tcga_id(self.images[idx])
 
         if self.transform:
             image = self.transform(image)
 
-        
-        return image
+        return image, tcga_id, self.images[idx]  # the last element is the png file name
+
 
 transform = Compose([
     Resize((224, 224)),  # resize image to 224x224 for the model
@@ -36,7 +47,7 @@ transform = Compose([
     # normalization parameters for lunit DINO from https://github.com/lunit-io/benchmark-ssl-pathology/releases/tag/pretrained-weights
     # mean: [ 0.70322989, 0.53606487, 0.66096631 ]
     # std: [ 0.21716536, 0.26081574, 0.20723464 ]
-    Normalize(mean=[ 0.70322989, 0.53606487, 0.66096631 ], std=[ 0.21716536, 0.26081574, 0.20723464 ]),
+    Normalize(mean=[0.70322989, 0.53606487, 0.66096631], std=[0.21716536, 0.26081574, 0.20723464]),
 ])
 
 dataset = CustomDataset(
@@ -44,8 +55,8 @@ dataset = CustomDataset(
     transform=transform
 )
 
-# Create the dataloader
-dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
+# create the dataloader
+dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False) # can set shuffle to False for inference
 
 
 # Use the pretrained Lunit-DINO model for WSI feature extraction (trained on histopathology images)
@@ -79,19 +90,38 @@ def vit_small(pretrained, progress, key, **kwargs):
 model = vit_small(pretrained=True, progress=False, key="DINO_p16", patch_size=16)
 model = model.to(device)
 total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-print(f"Total number of trainable parameters in the model: {total_params/1e6}M")
+print(f"Total number of trainable parameters in the model: {total_params / 1e6}M")
 
 total_images_processed = 0
 total_images = len(dataset)
-set_trace()
+# set_trace()
 # Generate embeddings using the above model
 model.eval()
+embeddings_list = []
+tcga_ids_list = []
+png_filenames_list = []
 with torch.no_grad():
-    for images in dataloader:
+    for images, tcga_ids, png_filenames in dataloader:
         batch_size = images.shape[0]
         total_images_processed += batch_size
-        print(f"Processing {batch_size} images in this batch. Total processed: {total_images_processed}/{total_images}.")
+        print(
+            f"Processing {batch_size} images in this batch. Total processed: {total_images_processed}/{total_images}.")
+        print("TCGA IDs in this batch: ", tcga_ids)
+        print("PNG files in this batch: ", png_filenames)
         images = images.to(device)
         outputs = model(images)
-        set_trace()
+        embeddings_list.extend(outputs.cpu().numpy())
+        tcga_ids_list.extend(tcga_ids)
+        png_filenames_list.extend(png_filenames)
 
+        # if total_images_processed > 16:
+        #     break
+
+
+# save the embeddings alowngiwth the tcga ids in a file
+embeddings_file = "./lunit-DINO-embeddings-GBMLGG.csv"
+with open(embeddings_file, 'w', newline='') as f:
+    writer = csv.writer(f)
+    writer.writerow(['png_filename', 'TCGA_ID', 'embedding'])
+    for fname, tcga_id, embedding in zip(png_filenames_list, tcga_ids_list, embeddings_list):
+        writer.writerow([fname, tcga_id, embedding.tolist()])
