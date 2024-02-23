@@ -1,12 +1,14 @@
 import cv2
 import numpy as np
 import os
+from multiprocessing import Pool
 import shutil
 from pdb import set_trace
 import matplotlib.pyplot as plt
 import matplotlib
 matplotlib.use('Agg')
 
+# use the wsi_env conda env with python3.10 remove_background.py
 
 def process_images(source_dir, dest_dir, tissue_threshold=0.4):
     """
@@ -57,10 +59,10 @@ def process_images(source_dir, dest_dir, tissue_threshold=0.4):
         tissue_pct = tissue_pixel_count / gray_image.size
 
         # check if the image has sufficient fraction of tissue compared to the background
-        print("++++ filename +++: ", filename)
-        print("tissue_pixel_count: ", tissue_pixel_count)
-        print("total_pixel_count: ", gray_image.size)
-        print("tissue_pct:", tissue_pct)
+        # print("++++ filename +++: ", filename)
+        # print("tissue_pixel_count: ", tissue_pixel_count)
+        # print("total_pixel_count: ", gray_image.size)
+        # print("tissue_pct:", tissue_pct)
         if tissue_pct > tissue_threshold:
             dest_path = os.path.join(dest_dir, filename)
             # shutil.move(file_path, dest_path)
@@ -71,6 +73,16 @@ def process_images(source_dir, dest_dir, tissue_threshold=0.4):
 
 if __name__ == "__main__":
     base_dir = "/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/preprocessing/TCGA_WSI/"
-    source_directory = "TCGA-78-7166-01Z-00-DX1.d19ad2d9-b006-4a13-ba54-2fec234c2373.svs_mpp-0.5_crop108-181_files/0/"
-    destination_directory = "TCGA-78-7166-01Z-00-DX1.d19ad2d9-b006-4a13-ba54-2fec234c2373.svs_mpp-0.5_crop108-181_files/0_filtered/"
-    process_images(base_dir + source_directory, base_dir + destination_directory)
+    source_dirs = [d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d))]
+    tcga_dirs = [d for d in source_dirs if d.startswith("TCGA")]
+    num_processes = os.cpu_count()
+
+    # with Pool(processes=num_processes) as pool:
+    #     pool.map()
+
+    for tcga_dir in tcga_dirs:
+        print("Processing TCGA ID: ", tcga_dir)
+        source_directory = tcga_dir + "/0/"
+        destination_directory = tcga_dir + "/0_filtered/"
+        # set_trace()
+        process_images(source_directory, destination_directory)
