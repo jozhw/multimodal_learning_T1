@@ -8,21 +8,16 @@ data resource.
 Task:
 
 The objective is to develop a multimodal model to predict cancer patient survival outcome (i.e., time to death) using matched WSI and molecular data from the TCGA database.
-
-Currently, we are using data corresponding to Low grade glioma (LGG) (WHO grades II and III), Glioblastoma (GBM) (WHO grade IV), and Kidney clear cell renal cell carcinoma (KIRC). TCGA contains paired gene expression (bulk RNA-seq) and diagnostic whole slide images (WSI) with ground-truth survival outcome and histologic grade labels.
-
-WHO currently classifies diffuse gliomas based on morphological and molecular characteristics: glial cell type (astrocytoma, oligodendroglioma), IDH1 gene mutation status
-and 1p/19q chromosome codeletion status. So, in addition to the gene expression data, these molecular features will also be used as inputs for model training for the LGG and GBM cases.
-
+Currently, we are using data from the lung adenocarcinoma samples from the TCGA-LUAD database 
 
 Data used:
 
 1. Histology data [Whole Slide Images (WSI)] <br />
 
 
-2. Tabular molecular data: gene expression (bulk RNA-seq), copy number variation and mutation data <br />
+2. Tabular molecular data: gene expression (bulk RNA-seq) <br />
 
-These data have been collected from https://drive.google.com/drive/folders/14TwYYsBeAnJ8ljkvU5YbIHHvFPltUVDr
+[//]: # (These data have been collected from https://drive.google.com/drive/folders/14TwYYsBeAnJ8ljkvU5YbIHHvFPltUVDr)
 
 
 Method:
