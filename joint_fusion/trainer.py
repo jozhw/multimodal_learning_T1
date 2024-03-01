@@ -15,6 +15,7 @@ import pickle
 from pdb import set_trace
 import os
 import ast
+from collections import Counter
 
 # for profiling
 # torch.autograd.profiler.profile(enabled=True)
@@ -57,9 +58,28 @@ torch.backends.cudnn.benchmark = True  # A bool that, if True, causes cuDNN to b
 data_rnaseq_all_genes_df = pd.read_csv(opt.input_path + 'combined_rnaseq_TCGA-LUAD.tsv', delimiter='\t')
 # keep only the protein coding genes
 data_rnaseq_df = data_rnaseq_all_genes_df[data_rnaseq_all_genes_df['gene_type'] == 'protein_coding']
-# for some of the samples, there may be more than one rnaseq dataset (those with -01A- are from the primary tumor while those with -11A- are from tissue adjacent to the tumor (so, normal?)
-# in such cases, we will keep only the tumor sample
+# for some of the samples, there may be more than one rnaseq dataset (those with -01A- or -01B-are from the primary tumor while those with -11A- are from tissue adjacent to the tumor (so, normal?)
+# https://docs.gdc.cancer.gov/Encyclopedia/pages/images/TCGA-TCGAbarcode-080518-1750-4378.pdf
+# in such cases, we will keep only one tumor sample (-01A-)
 
+# Remove columns that have -11A- within their names
+filtered_columns = ['gene_id', 'gene_name', 'gene_type'] + [col for col in data_rnaseq_df.columns if '-01A-' in col]
+data_rnaseq_df = data_rnaseq_df[filtered_columns]
+
+# rename the columns by keeping only the minimal part of the TCGA ID, e.g.,  TCGA-44-2655
+column_mapping = {
+    col: '-'.join(col.split('-')[:3]) if 'TCGA' in col else col
+    for col in data_rnaseq_df.columns
+}
+data_rnaseq_df = data_rnaseq_df.rename(columns=column_mapping)
+data_rnaseq_df = data_rnaseq_df.loc[:, ~data_rnaseq_df.columns.duplicated()]
+
+column_counts = Counter(data_rnaseq_df.columns)
+non_unique_columns = [col for col, count in column_counts.items() if count > 1]
+print("Non-unique column names:", non_unique_columns)
+
+
+set_trace()
 
 # get the corresponding clinical data
 data_clinical_df = pd.read_csv(opt.input_path + 'combined_clinical_TCGA-LUAD.tsv', delimiter='\t')
