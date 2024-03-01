@@ -41,11 +41,10 @@ entry_submitter_ids = metadata_rnaseq['entity_submitter_id'].tolist()
 
 # Get the gene IDs and gene names from a single rnaseq file
 df_single = pd.read_csv(file_paths[0], sep='\t', header=1, skiprows=[2, 3, 4, 5])
-gene_ids = df_single['gene_id']
-gene_names = df_single['gene_name']
 gene_df = {
-    'gene_id': gene_ids,
-    'gene_name': gene_names
+    'gene_id': df_single['gene_id'],
+    'gene_name': df_single['gene_name'],
+    'gene_type': df_single['gene_type']
 }
 gene_columns_df = pd.DataFrame(gene_df)
 
@@ -57,7 +56,7 @@ concatenated_rnaseq_df = pd.concat(df_list, axis=1)
 concatenated_rnaseq_with_gene_ids_df = pd.concat([gene_columns_df, concatenated_rnaseq_df], axis=1)
 output_file = 'combined_rnaseq_TCGA-LUAD.tsv'
 # set_trace()
-concatenated_rnaseq_df.to_csv(output_file, sep='\t', index=False)
+concatenated_rnaseq_with_gene_ids_df.to_csv(output_file, sep='\t', index=False)
 
 # for data in metadata['
 
