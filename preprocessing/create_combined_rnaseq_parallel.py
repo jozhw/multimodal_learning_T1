@@ -28,6 +28,8 @@ print("Do repeats exist? ", repeats_exist)
 
 def read_process_file(full_path, entry_submitter_id):
     df_file = pd.read_csv(full_path, sep='\t', header=1, skiprows=[2, 3, 4, 5])
+    # print(df_file)
+    # print(df_file['gene_name'][1234])
     # return df_file[['tpm_unstranded']] if 'tpm_unstranded' in df_file else pd.DataFrame()
     return df_file[['tpm_unstranded']].rename(columns={'tpm_unstranded': entry_submitter_id})
 
@@ -37,12 +39,24 @@ entry_submitter_ids = metadata_rnaseq['entity_submitter_id'].tolist()
 # file_paths = metadata_rnaseq['full_path'].iloc[:10].tolist()  # to debug using 10 samples
 # set_trace()
 
+# Get the gene IDs and gene names from a single rnaseq file
+df_single = pd.read_csv(file_paths[0], sep='\t', header=1, skiprows=[2, 3, 4, 5])
+gene_ids = df_single['gene_id']
+gene_names = df_single['gene_name']
+gene_df = {
+    'gene_id': gene_ids,
+    'gene_name': gene_names
+}
+gene_columns_df = pd.DataFrame(gene_df)
+
 print("Creating combined df")
 with ProcessPoolExecutor() as executor:
     df_list = list(executor.map(read_process_file, file_paths, entry_submitter_ids))
 
 concatenated_rnaseq_df = pd.concat(df_list, axis=1)
+concatenated_rnaseq_with_gene_ids_df = pd.concat([gene_columns_df, concatenated_rnaseq_df], axis=1)
 output_file = 'combined_rnaseq_TCGA-LUAD.tsv'
+# set_trace()
 concatenated_rnaseq_df.to_csv(output_file, sep='\t', index=False)
 
 # for data in metadata['
