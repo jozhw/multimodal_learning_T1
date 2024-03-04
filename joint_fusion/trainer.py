@@ -16,6 +16,7 @@ from pdb import set_trace
 import os
 import ast
 from collections import Counter
+from data_mapping import create_data_mapping
 
 # for profiling
 # torch.autograd.profiler.profile(enabled=True)
@@ -52,65 +53,9 @@ device = torch.device('cuda:{}'.format(opt.gpu_ids[0])) if opt.gpu_ids else torc
 print("Using device:", device)
 torch.backends.cudnn.benchmark = True  # A bool that, if True, causes cuDNN to benchmark multiple convolution algorithms and select the fastest.
 
-# create the data (Note: the dataset and dataloader are created within train_test.py)
+# create data mappings
+create_data_mapping(opt)
 
-# get the rnaseq data
-data_rnaseq_all_genes_df = pd.read_csv(opt.input_path + 'combined_rnaseq_TCGA-LUAD.tsv', delimiter='\t')
-# keep only the protein coding genes
-data_rnaseq_df = data_rnaseq_all_genes_df[data_rnaseq_all_genes_df['gene_type'] == 'protein_coding']
-# for some of the samples, there may be more than one rnaseq dataset (those with -01A- or -01B-are from the primary tumor while those with -11A- are from tissue adjacent to the tumor (so, normal?)
-# https://docs.gdc.cancer.gov/Encyclopedia/pages/images/TCGA-TCGAbarcode-080518-1750-4378.pdf
-# in such cases, we will keep only one tumor sample (-01A-)
-
-# Remove columns that have -11A- within their names
-filtered_columns = ['gene_id', 'gene_name', 'gene_type'] + [col for col in data_rnaseq_df.columns if '-01A-' in col]
-data_rnaseq_df = data_rnaseq_df[filtered_columns]
-
-# rename the columns by keeping only the minimal part of the TCGA ID, e.g.,  TCGA-44-2655
-column_mapping = {
-    col: '-'.join(col.split('-')[:3]) if 'TCGA' in col else col
-    for col in data_rnaseq_df.columns
-}
-data_rnaseq_df = data_rnaseq_df.rename(columns=column_mapping)
-data_rnaseq_df = data_rnaseq_df.loc[:, ~data_rnaseq_df.columns.duplicated()]
-
-column_counts = Counter(data_rnaseq_df.columns)
-non_unique_columns = [col for col, count in column_counts.items() if count > 1]
-print("Non-unique column names:", non_unique_columns)
-
-
-set_trace()
-
-# get the corresponding clinical data
-data_clinical_df = pd.read_csv(opt.input_path + 'combined_clinical_TCGA-LUAD.tsv', delimiter='\t')
-# extract 'days_to_death' and 'vital_status' into lists for each column
-days_to_death_list = []
-vital_status_list = []
-for col in data_clinical_df.columns:
-    print(data_clinical_df[col])
-    # print(col)
-    val = data_clinical_df[col].values[0]
-    val = val.replace('nan', 'None')
-    try:
-        val_list = ast.literal_eval(val)
-    except ValueError as e:
-        print(f"Error processing column {col}: {e}")
-        continue
-    print(val_list)
-    # replace None ('nan') with 1e10
-    # if val_list[0] is None:
-    #     val_list[0] = 1e10
-
-    print(val_list)
-    # set_trace()
-    days_to_death = val_list[0]
-    vital_status = val_list[1]
-    days_to_death_list.append(days_to_death)
-    vital_status_list.append(vital_status)
-
-set_trace()
-
-# create dictionary with WSI (paths to the tiles), rnaseq and clinical data
 
 
 
@@ -124,7 +69,7 @@ if opt.profile:
                  profile_memory=True,
                  use_cuda=True) as prof:
         with record_function("model_train"):
-            model, optimizer = train_nn(opt, data, device, cv_id)
+            model, optimizer = train_nn(opt, data, device)
     # torch.autograd.profiler.profile().export_chrome_trace("./profiling_results.json")
     print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
     # print(prof.key_averages().table(sort_by="self_cpu_memory_usage", row_limit=10))
