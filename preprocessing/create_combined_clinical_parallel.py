@@ -51,7 +51,7 @@ with ProcessPoolExecutor() as executor:
 
 # set_trace()
 concatenated_clinical_df = pd.concat(df_list, axis=1)
-output_file = 'combined_clinical_TCGA-LUAD.tsv'
+output_file = 'combined_clinical_TCGA-LUAD.csv'
 concatenated_clinical_df.to_csv(output_file, sep='\t', index=False)
 
 # for data in metadata['

@@ -54,12 +54,28 @@ with ProcessPoolExecutor() as executor:
 
 concatenated_rnaseq_df = pd.concat(df_list, axis=1)
 concatenated_rnaseq_with_gene_ids_df = pd.concat([gene_columns_df, concatenated_rnaseq_df], axis=1)
-output_file = 'combined_rnaseq_TCGA-LUAD.tsv'
+output_file = 'combined_rnaseq_TCGA-LUAD.csv'
 # set_trace()
-concatenated_rnaseq_with_gene_ids_df.to_csv(output_file, sep='\t', index=False)
+# concatenated_rnaseq_with_gene_ids_df.to_csv(output_file, sep='\t', index=False)
+# set_trace()
 
-# for data in metadata['
+# keep only the protein coding genes
+data_rnaseq_df = concatenated_rnaseq_with_gene_ids_df[concatenated_rnaseq_with_gene_ids_df['gene_type'] == 'protein_coding']
+# for some of the samples, there may be more than one rnaseq dataset (those with -01A- or -01B-are from the primary tumor while those with -11A- are from tissue adjacent to the tumor (so, normal?)
+# https://docs.gdc.cancer.gov/Encyclopedia/pages/images/TCGA-TCGAbarcode-080518-1750-4378.pdf
+# in such cases, we will keep only one tumor sample (-01A-)
+# Remove columns that have -11A- within their names
+filtered_columns = ['gene_id', 'gene_name', 'gene_type'] + [col for col in data_rnaseq_df.columns if '-01A-' in col]
+data_rnaseq_df = data_rnaseq_df[filtered_columns]
 
+# rename the columns by keeping only the minimal part of the TCGA ID, e.g.,  TCGA-44-2655
+column_mapping = {
+    col: '-'.join(col.split('-')[:3]) if 'TCGA' in col else col
+    for col in data_rnaseq_df.columns
+}
+data_rnaseq_df = data_rnaseq_df.rename(columns=column_mapping)
+data_rnaseq_df = data_rnaseq_df.loc[:, ~data_rnaseq_df.columns.duplicated()]
+data_rnaseq_df.to_csv(output_file, sep='\t', index=False)
 set_trace()
 
 # tree = ET.parse(
