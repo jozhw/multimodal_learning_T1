@@ -31,9 +31,10 @@ def read_process_file(full_path, entry_submitter_id):
     df_file = pd.read_xml(full_path, xpath='//luad:patient | //luad:admin', namespaces=namespaces)
     print(full_path)
     print(df_file['days_to_death'])
+    print(df_file['days_to_last_followup'])
     print(df_file['vital_status'])
     # print(df_file['patient_withdrawal'])
-    combined = df_file.apply(lambda row: [row['days_to_death'], row['vital_status']], axis=1)
+    combined = df_file.apply(lambda row: [row['days_to_death'], row['days_to_last_followup'], row['vital_status']], axis=1)
     # print(df_file.columns)
     # return df_file[['days_to_death']].rename(columns={'days_to_death': entry_submitter_id})
     return pd.DataFrame({entry_submitter_id: combined})
@@ -57,21 +58,4 @@ concatenated_clinical_df.to_csv(output_file, sep='\t', index=False)
 
 set_trace()
 
-# tree = ET.parse(
-#     '/mnt/c/Users/tnandi/Downloads/TCGA-LUAD_clinical.tar/00e01b05-d939-49e6-b808-e1bab0d6773b/nationwidechildrens.org_clinical.TCGA-J2-8192.xml')
-# root = tree.getroot()
-#
-# data = []
-#
-# for child in root:
-#     row = {}
-#     for subchild in child:
-#         row[subchild.tag] = subchild.text
-#     data.append(row)
-#
-# df = pd.DataFrame(data)
-#
-# # df.set_index('id', inplace=True)
-#
-# print(df)
-# set_trace()
+
