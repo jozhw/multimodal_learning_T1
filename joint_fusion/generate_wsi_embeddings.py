@@ -11,7 +11,8 @@ from torchvision.transforms import Resize, Normalize, ToTensor, Compose
 from pdb import set_trace
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-batch_size = 16
+batch_size = 256
+
 
 def extract_tcga_id(filename):
     parts = filename.split(
@@ -25,7 +26,10 @@ class CustomDataset(Dataset):
     def __init__(self, image_dir, transform=None):
         self.image_dir = image_dir
         self.transform = transform
-        self.images = os.listdir(image_dir)
+        self.images = os.listdir(self.image_dir)
+        # self.images = [os.listdir(os.path.join(self.image_dir, dir)) for dir in os.listdir(self.image_dir)]
+        # self.images = [item for sublist in self.images for item in sublist]  # list of all tiles from all samples
+        # set_trace()
 
     def __len__(self):
         return len(self.images)
@@ -38,7 +42,7 @@ class CustomDataset(Dataset):
         if self.transform:
             image = self.transform(image)
 
-        return image, tcga_id, self.images[idx]  # the last element is the png file name
+        return image, tcga_id, self.images[idx]
 
 
 transform = Compose([
@@ -51,15 +55,15 @@ transform = Compose([
 ])
 
 dataset = CustomDataset(
-    image_dir='/mnt/c/Users/tnandi/Downloads/multimodal_lucid/data_from_pathomic_fusion/data/TCGA_GBMLGG/TCGA_GBMLGG/TCGA_GBMLGG/all_st',
+    image_dir='/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/preprocessing/TCGA_WSI/batch_corrected/processed_svs/tiles/256px_9.9x/combined_tiles/',
     transform=transform
 )
 
 # create the dataloader
-dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False) # can set shuffle to False for inference
+dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)  # can set shuffle to False for inference
 
 
-# Use the pretrained Lunit-DINO model for WSI feature extraction (trained on histopathology images)
+# Use the pretrained Lunit-DINO model (Kang 2023) for WSI feature extraction (trained on histopathology images)
 # Lunit-DINO uses the ViT-S architecture with DINO for SSL
 
 def get_pretrained_url(key):
@@ -117,11 +121,10 @@ with torch.no_grad():
         # if total_images_processed > 16:
         #     break
 
-
 # save the embeddings alowngiwth the tcga ids in a file
-embeddings_file = "./lunit-DINO-embeddings-GBMLGG.csv"
+embeddings_file = "./lunit-DINO-embeddings-LUAD.csv"
 with open(embeddings_file, 'w', newline='') as f:
     writer = csv.writer(f)
-    writer.writerow(['png_filename', 'TCGA_ID', 'embedding'])
+    writer.writerow(['tilename', 'TCGA_ID', 'embedding'])
     for fname, tcga_id, embedding in zip(png_filenames_list, tcga_ids_list, embeddings_list):
         writer.writerow([fname, tcga_id, embedding.tolist()])
