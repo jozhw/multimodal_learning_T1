@@ -3,6 +3,7 @@ import torch
 from torch import nn, optim
 import copy
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data import TensorDataset, DataLoader
 from torchsummary import summary
 from torch.nn import functional as F
 import pandas as pd
@@ -18,10 +19,14 @@ else:
     print("Running on CPU")
 
 # Read the batch corrected TPM data for all samples
-rnaseq_df = pd.read_csv(
-    "/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/preprocessing/combined_rnaseq_TCGA-LUAD.csv",
-    delimiter='\t')
+# rnaseq_df = pd.read_csv(
+#     "/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/preprocessing/combined_rnaseq_TCGA-LUAD.csv" , delimiter='\t'
+# )
+rnaseq_df=pd.read_csv(
+    "/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/preprocessing/batchcorrected_combined_rnaseq_TCGA-LUAD.tsv", delimiter='\t'
+)
 
+set_trace()
 print("Are all the gene_ids unique: ", rnaseq_df.shape[0] == len(rnaseq_df['gene_id'].unique()))
 print("Are all the gene_names unique: ", rnaseq_df.shape[0] == len(rnaseq_df['gene_name'].unique()))
 
@@ -50,13 +55,13 @@ X_train, X_remaining = train_test_split(X_scaled, test_size=0.2, random_state=42
 # Split the remaining data into validation (10%) and test (10%)
 X_val, X_test = train_test_split(X_remaining, test_size=0.5, random_state=42)
 
-train_dataset = torch.utils.data.TensorDataset(torch.tensor(X_train, dtype=torch.float).to(device))
-val_dataset = torch.utils.data.TensorDataset(torch.tensor(X_val, dtype=torch.float).to(device))
-test_dataset = torch.utils.data.TensorDataset(torch.tensor(X_test, dtype=torch.float).to(device))
+train_dataset = TensorDataset(torch.tensor(X_train, dtype=torch.float).to(device))
+val_dataset = TensorDataset(torch.tensor(X_val, dtype=torch.float).to(device))
+test_dataset = TensorDataset(torch.tensor(X_test, dtype=torch.float).to(device))
 
-train_loader = torch.utils.data.DataLoader(dataset=train_dataset, batch_size=train_batch_size, shuffle=True)
-val_loader = torch.utils.data.DataLoader(dataset=val_dataset, batch_size=val_batch_size, shuffle=True)
-test_loader = torch.utils.data.DataLoader(dataset=test_dataset, batch_size=test_batch_size, shuffle=True)
+train_loader = DataLoader(dataset=train_dataset, batch_size=train_batch_size, shuffle=True)
+val_loader = DataLoader(dataset=val_dataset, batch_size=val_batch_size, shuffle=True)
+test_loader = DataLoader(dataset=test_dataset, batch_size=test_batch_size, shuffle=True)
 
 
 # to view in pdb: batch = next(iter(train_loader))
