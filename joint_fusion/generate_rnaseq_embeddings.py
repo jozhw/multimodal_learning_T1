@@ -1,4 +1,6 @@
 # Implement a MLP based VAE to create lower dimensional embeddings of the RNASeq data
+# use 'wandb sweep sweep_config.yaml' followed by 'wandb agent <username>/<project_name>/<sweep_id>' [just follow the instructions after 'wandb sweep'] for HPO runs with wandb
+
 import torch
 from torch import nn, optim
 import copy
@@ -10,7 +12,11 @@ import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 import numpy as np
+import wandb
 from pdb import set_trace
+
+wandb.init(project="rnaseq_vae", entity="tnnandi")
+config = wandb.config
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 if device.type == 'cuda':
@@ -46,10 +52,12 @@ print("Are all the gene_names unique: ", rnaseq_df.shape[0] == len(rnaseq_df['ge
 # model parameters
 # use rnacdm's parameters
 input_dim = rnaseq_df.shape[0]  # number of genes (~ 20K)
-intermediate_dim = 512
+# config.intermediate_dim = 512
+intermediate_dim = config.intermediate_dim
+lr = config.learning_rate
 latent_dim = 256
 beta = 0 #0.005 #0.01   # 0: equivalent to standard autoencoder; 1: equiavlent to standard VAE
-lr = 1e-3
+# lr = 1e-3
 train_batch_size = 128
 val_batch_size = 8
 test_batch_size = 8
@@ -149,6 +157,9 @@ for epoch in range(num_epochs):
         optimizer.step()
         train_loss += loss.item()
 
+        wandb.log({"epoch": epoch, "train_loss": train_loss, "reconstruction_loss": reconstruction_loss.item(),
+                   "kl_div_loss": kl_divergence_loss.item()})
+
     if epoch % 100 == 0:
         # validation and print losses
         current_lr = optimizer.param_groups[0]['lr']
@@ -172,5 +183,6 @@ for epoch in range(num_epochs):
 
     # print(f'epoch {epoch}, train loss: {train_loss}, val loss: {val_loss}')
 
+wandb.finish()
 
 set_trace()
