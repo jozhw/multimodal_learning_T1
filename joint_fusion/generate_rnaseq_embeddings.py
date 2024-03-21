@@ -48,7 +48,7 @@ print("Are all the gene_names unique: ", rnaseq_df.shape[0] == len(rnaseq_df['ge
 input_dim = rnaseq_df.shape[0]  # number of genes (~ 20K)
 intermediate_dim = 512
 latent_dim = 256
-beta = 0.005 #0.01
+beta = 0 #0.005 #0.01   # 0: equivalent to standard autoencoder; 1: equiavlent to standard VAE
 lr = 1e-3
 train_batch_size = 128
 val_batch_size = 8
@@ -128,9 +128,12 @@ model = model.to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs)
 
+if torch.cuda.device_count() > 1:
+    print(f"using {torch.cuda.device_count()} GPUs")
+    model = nn.DataParallel(model)
+
 
 for epoch in range(num_epochs):
-
     model.train()
     train_loss = 0.0
     for data in train_loader:
