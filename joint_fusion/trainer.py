@@ -11,21 +11,19 @@ import datasets
 import models
 from train_test import train_nn, test
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import pickle
 from pdb import set_trace
 import os
 import ast
 from collections import Counter
-from data_mapping import create_data_mapping
+# from data_mapping import create_data_mapping
 
 # for profiling
 # torch.autograd.profiler.profile(enabled=True)
 from torch.profiler import profile, record_function, ProfilerActivity
 
-# on Polaris
-# dataroot = '/lus/grand/projects/GeomicVar/tarak/multimodal_lucid/data/TCGA_GBMLGG/splits'
-
-# on Dell laptop (activate conda env 'pytorch' and use 'python3.10 trainer.py')
+# on Dell laptop (activate conda env 'pytorch_py3p10' and use 'python trainer.py')
 dataroot = '/mnt/c/Users/tnandi/Downloads/multimodal_lucid/data_from_pathomic_fusion/data/TCGA_GBMLGG/splits/'
 
 parser = argparse.ArgumentParser()
@@ -41,8 +39,8 @@ parser.add_argument('--gpu_ids', type=str, default='0', help='gpu ids: e.g. 0  0
 parser.add_argument('--input_size_wsi', type=int, default=1024, help="input_size for path images")
 parser.add_argument('--embedding_dim_wsi', type=int, default=128, help="embedding dimension for WSI")
 parser.add_argument('--embedding_dim_omic', type=int, default=128, help="embedding dimension for omic")
-parser.add_argument('--input_modes', type=str, default="wsi_omic", help="wsi, omic, wsi_omic")
-parser.add_argument('--fusion_type', type=str, default="joint", help="early, late, joint")
+parser.add_argument('--input_modes', type=str, default="omic", help="wsi, omic, wsi_omic")
+parser.add_argument('--fusion_type', type=str, default="early", help="early, late, joint")
 parser.add_argument('--profile', type=str, default=False, help="whether to profile or not")
 parser.add_argument('--use_mixed_precision', type=str, default=True, help="whether to use mixed precision calculations")
 parser.add_argument('--use_gradient_accumulation', type=str, default=False, help="whether to use gradient accumulation")
@@ -54,6 +52,16 @@ print("Using device:", device)
 torch.backends.cudnn.benchmark = True  # A bool that, if True, causes cuDNN to benchmark multiple convolution algorithms and select the fastest.
 
 # create data mappings
+# read the file containing gene expression and tile image locations for the TCGA-LUAD samples (mapped_data_16March)
+mapping_df = pd.read_csv(opt.input_path + "mapped_data_21March.csv")
+
+# The rnaseq data are saved as string representations of dictionary, not actual dictionary object. Need to convert
+print("Converting the rnaseq data to proper dicts (may take a min)")
+# mapping_df['rnaseq_data'] = mapping_df['rnaseq_data'].map(ast.literal_eval)
+# mapping_df['rnaseq_data'] = ast.literal_eval(mapping_df['rnaseq_data'])
+mapping_df['rnaseq_data'] = mapping_df['rnaseq_data'].apply(eval)
+print("Conversion over")
+
 create_data_mapping(opt)
 
 
