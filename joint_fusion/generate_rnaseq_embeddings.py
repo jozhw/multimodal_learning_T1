@@ -26,7 +26,20 @@ rnaseq_df=pd.read_csv(
     "/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/preprocessing/batchcorrected_combined_rnaseq_TCGA-LUAD.tsv", delimiter='\t'
 )
 
-set_trace()
+# Remove the code below when using shortened TCGA IDs when creating the combined RNASeq file
+# rename the columns by keeping only the minimal part of the TCGA ID, e.g.,  TCGA-44-2655
+column_mapping = {
+    col: '-'.join(col.split('.')[:3]) if 'TCGA' in col else col
+    for col in rnaseq_df.columns
+}
+rnaseq_df = rnaseq_df.rename(columns=column_mapping)
+duplicated_columns = rnaseq_df.columns[rnaseq_df.columns.duplicated()]
+print("duplicated columns: ", duplicated_columns)
+
+# Remove duplicated columns
+rnaseq_df = rnaseq_df.loc[:, ~rnaseq_df.columns.duplicated()]
+
+# set_trace()
 print("Are all the gene_ids unique: ", rnaseq_df.shape[0] == len(rnaseq_df['gene_id'].unique()))
 print("Are all the gene_names unique: ", rnaseq_df.shape[0] == len(rnaseq_df['gene_name'].unique()))
 
