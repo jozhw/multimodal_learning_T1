@@ -1,5 +1,6 @@
 import pandas as pd
 import torch
+from pdb import set_trace
 from torch import nn
 import torch.nn.functional as F
 from torch.utils.data import random_split, DataLoader
@@ -7,18 +8,16 @@ from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR
 from torch.cuda.amp import autocast, GradScaler
 import numpy as np
-import datasets
-import models
-from train_test import train_nn, test
+# import datasets
+# from models import
+from train_test import train_nn
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import pickle
-from pdb import set_trace
 import os
 import ast
 from collections import Counter
 # from data_mapping import create_data_mapping
-
 # for profiling
 # torch.autograd.profiler.profile(enabled=True)
 from torch.profiler import profile, record_function, ProfilerActivity
@@ -30,17 +29,20 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--input_path', type=str,
                     default='/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/preprocessing/',
                     help='Path to input data files')
+parser.add_argument('--input_wsi_path', type=str,
+                    default='/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/preprocessing/TCGA_WSI/batch_corrected/processed_svs/tiles/256px_9.9x/combined_tiles/',
+                    help='Path to input WSI tiles')
 # parser.add_argument('--output_path', type=str, default='results/output.txt', help='Path to output results file')
-parser.add_argument('--batch_size', type=int, default=8, help='Batch size for training')
+parser.add_argument('--batch_size', type=int, default=1, help='Batch size for training')
 parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
 parser.add_argument('--lr_decay_iters', type=int, default=100, help='Learning rate decay steps')
 parser.add_argument('--num_epochs', type=int, default=2, help='Number of training epochs')
 parser.add_argument('--gpu_ids', type=str, default='0', help='gpu ids: e.g. 0  0,1,2, 0,2. use -1 for CPU')
-parser.add_argument('--input_size_wsi', type=int, default=1024, help="input_size for path images")
+parser.add_argument('--input_size_wsi', type=int, default=256, help="input_size for path images")
 parser.add_argument('--embedding_dim_wsi', type=int, default=128, help="embedding dimension for WSI")
 parser.add_argument('--embedding_dim_omic', type=int, default=128, help="embedding dimension for omic")
 parser.add_argument('--input_modes', type=str, default="omic", help="wsi, omic, wsi_omic")
-parser.add_argument('--fusion_type', type=str, default="early", help="early, late, joint")
+parser.add_argument('--fusion_type', type=str, default="unimodal", help="early, late, joint, unimodal")
 parser.add_argument('--profile', type=str, default=False, help="whether to profile or not")
 parser.add_argument('--use_mixed_precision', type=str, default=True, help="whether to use mixed precision calculations")
 parser.add_argument('--use_gradient_accumulation', type=str, default=False, help="whether to use gradient accumulation")
@@ -54,23 +56,19 @@ torch.backends.cudnn.benchmark = True  # A bool that, if True, causes cuDNN to b
 # create data mappings
 # read the file containing gene expression and tile image locations for the TCGA-LUAD samples (mapped_data_16March)
 mapping_df = pd.read_csv(opt.input_path + "mapped_data_21March.csv")
-
 # The rnaseq data are saved as string representations of dictionary, not actual dictionary object. Need to convert
 print("Converting the rnaseq data to proper dicts (may take a min)")
 # mapping_df['rnaseq_data'] = mapping_df['rnaseq_data'].map(ast.literal_eval)
 # mapping_df['rnaseq_data'] = ast.literal_eval(mapping_df['rnaseq_data'])
 mapping_df['rnaseq_data'] = mapping_df['rnaseq_data'].apply(eval)
+mapping_df['tiles'] = mapping_df['tiles'].apply(ast.literal_eval)  # convert strings to lists
 print("Conversion over")
-
-create_data_mapping(opt)
-
-
-
+# keep only rows that have both wsi and rnaseq data
+ids_with_wsi = mapping_df[mapping_df['tiles'].map(len) > 0].index.tolist()
+mapping_df = mapping_df.loc[ids_with_wsi]
+print(mapping_df)
 
 # train the model
-# set_trace()
-# model, optimizer, metric_logger = train_nn(opt, data, device, cv_id)
-
 if opt.profile:
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
                  record_shapes=True,
@@ -92,6 +90,6 @@ if opt.profile:
 # ) as prof:
 
 else:
-    model, optimizer = train_nn(opt, data, device)
+    model, optimizer = train_nn(opt, mapping_df, device)
 # break
 # set_trace()
