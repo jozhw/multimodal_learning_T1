@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from generate_rnaseq_embeddings import get_omic_embeddings
 import torchvision.models as models
 from pdb import set_trace
 from torchvision.models.vision_transformer import vit_b_32
@@ -58,8 +59,8 @@ class WSINetwork(nn.Module):
 
         # vision transformer vit_b_32 arch ('base' version with 32 x 32 patches)
         vit = vit_b_32(weights=ViT_B_32_Weights)
-        layers = list(vit.children()) # get all the layers
-        vit_top = nn.Sequential(*layers[:-2]) # remove the normalization and the pooling layer
+        layers = list(vit.children())  # get all the layers
+        vit_top = nn.Sequential(*layers[:-2])  # remove the normalization and the pooling layer
         self.feature_extractor = nn.Sequential(*layers)
         num_features = 768
         # self.embedding_layer = nn.Linear(num_features, embedding_dim)
@@ -68,18 +69,18 @@ class WSINetwork(nn.Module):
             nn.Flatten(),
             nn.Linear(num_features, embedding_dim)
         )
-        set_trace()
 
     def forward(self, x):
         print("+++++++++++++ Input shape within WSINetwork: ", x.shape)
         return self.net(x)
+
 
 class OmicNetwork(nn.Module):
     def __init__(self, embedding_dim):
         super(OmicNetwork, self).__init__()
         self.embedding_dim = embedding_dim
         self.net = nn.Sequential(
-            nn.Linear(320, 512),  # the molecular/genomic data has 320 features
+            nn.Linear(320, 512),
             nn.ReLU(),
             nn.Linear(512, embedding_dim),
             nn.ReLU()
@@ -91,43 +92,89 @@ class OmicNetwork(nn.Module):
 
 
 class MultimodalNetwork(nn.Module):
-    def __init__(self, embedding_dim_wsi, embedding_dim_omic, mode):
+    def __init__(self, embedding_dim_wsi, embedding_dim_omic, mode, fusion_type):
         super(MultimodalNetwork, self).__init__()
-        self.wsi_net = WSINetwork(embedding_dim_wsi)
-        self.omic_net = OmicNetwork(embedding_dim_omic)
-        self.mode = mode
-        embedding_dim = self.wsi_net.embedding_dim + self.omic_net.embedding_dim
-        # downstream MLP for fused data
+        self.mode = mode  # wsi_omic, wsi or omic
+        self.fusion_type = fusion_type
+        if self.mode is not 'wsi_omic':
+            self.fusion_type = None
+
+        if self.fusion_type is not None:
+            if self.mode == 'wsi_omic':
+                self.wsi_net = WSINetwork(embedding_dim_wsi)
+                self.omic_net = OmicNetwork(embedding_dim_omic)
+                embedding_dim = self.wsi_net.embedding_dim + self.omic_net.embedding_dim
+            elif self.mode == 'wsi':
+                self.wsi_net = WSINetwork(embedding_dim_wsi)
+                self.omic_net = None
+                embedding_dim = self.wsi_net.embedding_dim
+            elif self.mode == 'omic':
+                self.wsi_net = None
+                self.omic_net = OmicNetwork(embedding_dim_omic)
+                embedding_dim = self.omic_net.embedding_dim
+
+        embedding_dim = embedding_dim_omic
+        print("Embedding dimension based on which the dimension of the input of the downstream MLP is set: ", embedding_dim)
+        # downstream MLP for fused data (directly tied to the Cox loss)
         self.fused_mlp = nn.Sequential(
-            nn.Linear(embedding_dim, 1024),
+            nn.Linear(embedding_dim, 256),
             nn.ReLU(),
-            nn.Linear(1024, 1)
+            nn.Linear(256, 1)
         )
 
+        self.stored_omic_embedding = None
+
+    # def get_omic_embedding(self):
+    #     # get the embeddings from a stored file (obtained from the latent space of a trained VAE)
+    #     omic_embeddings =
+
     def forward(self, x_wsi, x_omic):
-        wsi_embedding = self.wsi_net(x_wsi)
-        omic_embedding = self.omic_net(x_omic)
+        if self.fusion_type == 'joint':
+            wsi_embedding = self.wsi_net(x_wsi)
+            omic_embedding = self.omic_net(x_omic)
+            print("wsi_embedding.shape: ", wsi_embedding.shape)
+            print("omic_embedding.shape: ", omic_embedding.shape)
+
+        elif self.fusion_type == 'early':
+            wsi_embedding = get_wsi_embedding(x_wsi)  # can get from pretrained foundation models
+            omic_embedding = get_omic_embeddings()  # can get from a simple VAE based encoder
+            print("wsi_embedding.shape: ", wsi_embedding.shape)
+            print("omic_embedding.shape: ", omic_embedding.shape)
+
+        elif self.fusion_type is None:  # unimodal case
+            print("This is a unimodal case")
+            if self.mode == 'wsi':
+                wsi_embedding = get_wsi_embedding(x_wsi)
+                print("wsi_embedding.shape: ", wsi_embedding.shape)
+            elif self.mode == 'omic':
+                if self.stored_omic_embedding is None and x_omic is not None: # to avoid calling this function for every forward pass
+                    self.stored_omic_embedding = get_omic_embeddings(x_omic)
+                    self.stored_omic_embedding = torch.tensor(self.stored_omic_embedding, dtype=torch.float32).to(x_wsi[0].device)
+                    print("omic_embedding.shape (should be [batch_size, embedding_dim]): ", self.stored_omic_embedding.shape)
+                omic_embedding = self.stored_omic_embedding # reuse the stored embeddings for early fusion
 
         print("input mode: ", self.mode)
-        print("wsi_embedding.shape: ", wsi_embedding.shape)
-        print("omic_embedding.shape: ", omic_embedding.shape)
+
         # concatenate embeddings
         if self.mode == 'wsi':
             combined_embedding = wsi_embedding
         elif self.mode == 'omic':
             combined_embedding = omic_embedding
-        else:
+        elif self.mode == 'wsi_omic':
             combined_embedding = torch.cat((wsi_embedding, omic_embedding), dim=1)
 
-        # print("combined_embedding.shape: ", combined_embedding.shape)
-
-        # use combined embedding with downstream MLP
+        print("combined_embedding.shape: ", combined_embedding.shape)
+        # set_trace()
+        # use combined embedding with downstream MLP for getting the output that enters the loss function
         output = self.fused_mlp(combined_embedding)
 
         return output
 
 
 def print_model_summary(model):
+    if model is None:
+        print("model is NoneType")
+        return
     total_params = sum(p.numel() for p in model.parameters())
     print("NOTE: these do not account for the memory required for storing the optimizer states and the activations")
     print(f"Total Parameters (million): {total_params / 1e6}")
