@@ -28,7 +28,7 @@ Embeddings are generated from the WSI data and the tabular molecular features us
 We are also exploring other methods for embedding generation, including attention based encoder models.
 
 - **Embedding generation from WSI data** (at the tile level)
-    - The original WSIs are too large to be used with standard CNN based models. Hence, they are split into smaller non-overlapping tiles (of 256 x 256 resolution) that are fed to a [pretrained histology foundation model](https://lunit-io.github.io/research/publications/pathology_ssl/) that generates 384 dimensional embedding (a hyperparameter that need to be tuned for the best model performance). The model has been trained on 20994
+    - The original WSIs are too large to be used with standard CNN based models. Hence, they are split into smaller non-overlapping tiles (of 256 x 256 resolution) that are fed to a [pretrained histology foundation model](https://lunit-io.github.io/research/publications/pathology_ssl/) that generates 384 dimensional embedding (a hyperparameter that needs to be tuned for the best model performance). The model has been trained on 20994
 WSIs from the TCGA dataset, and 15672 from the TULIP dataset, utilizing a self supervised learning framework (DINO:
 Knowledge distillation with no labels) using vision transformers
 - **Embedding generation from the gene expression data**
