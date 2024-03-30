@@ -11,15 +11,14 @@ Code for multimodal model training using multiple data fusion techniques for LUC
 
 ## Task
 
-The objective is to develop a multimodal model to predict event times for cancer cases using matched WSI and molecular data from the TCGA database.
-Currently, we are using data from the lung adenocarcinoma samples from the TCGA-LUAD database 
+The objective is to develop a deep learning framework to predict cancer-related times to events using matched multimodal samples. Currently, we are using whole slide image (WSI) and tabular gene expression (bulk RNASeq) data from the lung adenocarcinoma samples from the TCGA database (TCGA-LUAD). The code is being developed in a modular framework so that it can be easily extended to handle more input data modalities when the need arises. 
 
 ## Data used:
 
 1. Histology data [Whole Slide Images (WSI)] <br />
 
 
-2. Tabular molecular data: gene expression (bulk RNA-seq) <br />
+2. Tabular gene expression (bulk RNA-seq) data <br />
 
 [//]: # (These data have been collected from https://drive.google.com/drive/folders/14TwYYsBeAnJ8ljkvU5YbIHHvFPltUVDr)
 
