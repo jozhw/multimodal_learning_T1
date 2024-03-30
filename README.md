@@ -27,10 +27,13 @@ The objective is to develop a deep learning framework to predict cancer-related 
 Embeddings are generated from the WSI data and the tabular molecular features using a CNN and a MLP, respectively, that are fused to be used as input for a downstream MLP that has its final node predicting the log-risk score (log of the hazard ratio) for the Cox log partial likelihood function representing the loss function. In the joint fusion approach, all the models are trained simultaneously using the loss function.
 We are also exploring other methods for embedding generation, including attention based encoder models.
 
-1. Embedding generation from WSI data (at the tile level)
-2. Embedding generation from the gene expression data
-3. Fusing embeddings from all modalities for downstream MLP training for cancer-specific time to event prediction
-4. Loss function and model training
+- Embedding generation from WSI data (at the tile level)
+    - A 384 dimensional embedding (a hyperparameter that need to be tuned for the best model performance) is currently being generated from the histology images using a [pretrained histology foundation model](https://lunit-io.github.io/research/publications/pathology_ssl/). The model has been trained on 20994
+WSIs from the TCGA dataset, and 15672 from the TULIP dataset, utilizing a self supervised learning framework (DINO:
+Knowledge distillation with no labels) using vision transformers
+- Embedding generation from the gene expression data
+- Fusing embeddings from all modalities for downstream MLP training for cancer-specific time to event prediction
+- Loss function and model training
 
 ## Running the code
 
@@ -59,4 +62,7 @@ python trainer.py --input_path --input_wsi_path --batch_size --lr --lr_decay_ite
 | --use_gradient_accumulation | whether to use gradient accumulation               | type=str, default=False                                                               |
 
 
-## Code structure
+## Code structure:
+
+1. [joint-fusion/trainer.py](https://github.com/DOE-LUCID/multimodal_learning_T1/blob/main/joint_fusion/trainer.py): The driver code that uses the WSI and gene expression mapping information
+
