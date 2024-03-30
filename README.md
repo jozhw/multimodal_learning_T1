@@ -27,18 +27,18 @@ The objective is to develop a deep learning framework to predict cancer-related 
 Embeddings are generated from the WSI data and the tabular molecular features using a CNN and a MLP, respectively, that are fused to be used as input for a downstream MLP that has its final node predicting the log-risk score (log of the hazard ratio) for the Cox log partial likelihood function representing the loss function. In the joint fusion approach, all the models are trained simultaneously using the loss function.
 We are also exploring other methods for embedding generation, including attention based encoder models.
 
-- Embedding generation from WSI data (at the tile level)
+- **Embedding generation from WSI data** (at the tile level)
     - The original WSIs are too large to be used with standard CNN based models. Hence, they are split into smaller non-overlapping tiles (of 256 x 256 resolution) that are fed to a [pretrained histology foundation model](https://lunit-io.github.io/research/publications/pathology_ssl/) that generates 384 dimensional embedding (a hyperparameter that need to be tuned for the best model performance). The model has been trained on 20994
 WSIs from the TCGA dataset, and 15672 from the TULIP dataset, utilizing a self supervised learning framework (DINO:
 Knowledge distillation with no labels) using vision transformers
-- Embedding generation from the gene expression data
+- **Embedding generation from the gene expression data**
     - The original gene expression count data, owing to its very high dimensionality (≈ 20K) is not suitable for directly being
 ingested by a neural network. We generate lower dimensional embeddings for the gene expression data from the latent space
 of a trained VAE
-- Fusing embeddings from all modalities for downstream MLP training for cancer-specific time to event prediction
-- Loss function and model training
+- **Fusing embeddings from all modalities** for downstream MLP training for cancer-specific time to event prediction
+- **Loss function and model training**
     - The Cox proportional hazards model is used to relate survival time (or time to death for the uncensored events) with the predictor variables (covariates). The model assumes that the hazard function (the instantaneous rate of occurrence of the event) for any individual can be expressed as the product of an unknown baseline hazard function and an exponential function of linear combinations of predictor variables.
-    - The goal of survival prediction model is to predict the likelihood that a patient $i$ will survive till a certain time $t$, for a set of covariates <!--$\textbf{X}_i$ ($X$ is written in bold to clarify that it is a vector, and the subscript $i$ is for the patient ID), the hazard function $h(t|\boldsymbol{X_i})$ is defined as $h(t|X_i) = h_0(t)e^{\boldsymbol{\beta}^\top \boldsymbol{X}_i}$ -->
+    - The goal of survival prediction model is to predict the likelihood that a patient $i$ will survive till a certain time $t$, for a set of covariates $\boldsymbol{X_i}$ ($X$ is written in bold to clarify that it is a vector, and the subscript $i$ is for the patient ID). The hazard function $h(t|\boldsymbol{X_i})$ is defined as $h(t|X_i) = h_0(t)e^{\boldsymbol{\beta}^\top \boldsymbol{X_i}}$ 
 where $h_0$ is the baseline hazard function, and $\boldsymbol{\beta}$ is the vector of coefficients for the covariates, that is assumed to be the same for all patients. To calculate the model parameters $\boldsymbol{\beta}$, the negative log likelihood (NLL) of $h(t|\boldsymbol{X_i})$ is minimized in Cox regression $$L(\mathbf{\beta}) = \sum_{i \in E} \left[ \mathbf{\beta}^\top \mathbf{X_i} - \log \left( \sum_{j \in \Omega_i} \exp(\mathbf{\beta}^\top \mathbf{X}_j) \right) \right]$$, where the outer summation is done over the set of individuals for whom the event of interest (for this case, death) has been observed, and the inner summation is over all individuals in the risk set $\Omega_i$ at the time of event for individual $i$.
     - The output node of the final MLP (that uses the fused embeddings as the input) is allowed to predict $\boldsymbol{\beta}^\top \boldsymbol{X_i}$, i.e., the log risk of the event for individual $i$ based on their covariates. In Eq \ref{eq:loss_function}, this output is denoted by $f_\theta(\boldsymbol{X_i})$ in the loss function
       $$L(\boldsymbol{\theta}) = \sum_{i \in E} \left[ f_\theta(\boldsymbol{X_i}) - \log \left( \sum_{j \in \Omega_i} \exp(f_\theta(\boldsymbol{X_j})) \right) \right]$$
