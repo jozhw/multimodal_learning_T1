@@ -35,4 +35,29 @@ We are also exploring other methods for embedding generation, including attentio
 
 ## Running the code
 
+``` sh
+python trainer.py --input_path --input_wsi_path --batch_size --lr --lr_decay_iters --num_epochs --gpu_ids --input_size_wsi --embedding_dim_wsi --embedding_dim_omic --input_modes --fusion_type --profile --use_mixed_precision --use_gradient_accumulation
+
+```
+
+
+| Input Arguments      | Explanation                                             | Type and Default Value                                                               |
+|----------------------|---------------------------------------------------------|--------------------------------------------------------------------------------------|
+| --input_path         | Path to input data files                               | type=str, default='/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/preprocessing/' |
+| --input_wsi_path     | Path to input WSI tiles                                | type=str, default='/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/preprocessing/TCGA_WSI/batch_corrected/processed_svs/tiles/256px_9.9x/combined_tiles/' |
+| --batch_size         | Batch size for training                                | type=int, default=4                                                                   |
+| --lr                 | Learning rate                                          | type=float, default=0.001                                                             |
+| --lr_decay_iters     | Learning rate decay steps                              | type=int, default=100                                                                 |
+| --num_epochs         | Number of training epochs                              | type=int, default=2                                                                   |
+| --gpu_ids            | gpu ids: e.g. 0  0,1,2, 0,2. use -1 for CPU            | type=str, default='0'                                                                 |
+| --input_size_wsi     | input_size for path images                             | type=int, default=256                                                                 |
+| --embedding_dim_wsi  | embedding dimension for WSI                            | type=int, default=128                                                                 |
+| --embedding_dim_omic | embedding dimension for omic                           | type=int, default=256                                                                 |
+| --input_modes        | wsi, omic, wsi_omic                                    | type=str, default="wsi"                                                               |
+| --fusion_type        | early, late, joint, unimodal                           | type=str, default="unimodal"                                                          |
+| --profile            | whether to profile or not                              | type=str, default=False                                                               |
+| --use_mixed_precision| whether to use mixed precision calculations            | type=str, default=False                                                               |
+| --use_gradient_accumulation | whether to use gradient accumulation               | type=str, default=False                                                               |
+
+
 ## Code structure
