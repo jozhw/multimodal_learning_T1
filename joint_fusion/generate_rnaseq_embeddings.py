@@ -28,6 +28,9 @@ rnaseq_df = pd.read_csv(
     "/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/preprocessing/batchcorrected_combined_rnaseq_TCGA-LUAD.tsv",
     delimiter='\t'
 )
+
+checkpoint_dir = "./checkpoints"
+os.makedirs(checkpoint_dir, exist_ok=True)
 # Remove the code below when using shortened TCGA IDs when creating the combined RNASeq file
 # rename the columns by keeping only the minimal part of the TCGA ID, e.g.,  TCGA-44-2655
 column_mapping = {
@@ -44,12 +47,11 @@ rnaseq_df = rnaseq_df.loc[:, ~rnaseq_df.columns.duplicated()]
 print("Are all the gene_ids unique: ", rnaseq_df.shape[0] == len(rnaseq_df['gene_id'].unique()))
 print("Are all the gene_names unique: ", rnaseq_df.shape[0] == len(rnaseq_df['gene_name'].unique()))
 
-checkpoint_dir = "./checkpoints_new/"
-os.makedirs(checkpoint_dir, exist_ok=True)
+######################### HYPERPARAMETERS ############################
 input_dim = rnaseq_df.shape[0]  # number of genes (~ 20K)
 intermediate_dim = 512
 lr = 1e-4
-latent_dim = 256
+latent_dim = 256 # get from the input opt
 beta = 0.005  # 0.01   # 0: equivalent to standard autoencoder; 1: equiavlent to standard VAE
 
 
@@ -107,13 +109,14 @@ def loss_function(recon_x, x, mean, log_var):
 
 # function to take a trained VAE and generate embeddings for a new rnaseq dataset
 # essentially, just pass the input through the encoder network
+# for early fusion, these embeddings should be loaded only once (before training of the downstream MLP starts)
 def get_omic_embeddings(x_omic):
     print("In get_omic_embeddings()")
     # work directly on the tensor on the device
     # (CHANGE) actually, need to use the mean and std from the training data
     x_omic_log = torch.log1p(x_omic)
-    mean = x_omic_log.mean(dim=0, keepdim=True)
-    std = x_omic_log.std(dim=0, keepdim=True)
+    mean = x_omic_log.mean(dim=1, keepdim=True)
+    std = x_omic_log.std(dim=1, keepdim=True)
     x_omic_scaled = (x_omic_log - mean) / (std + 1e-6)
 
     # model = BetaVAE(input_dim=input_dim, latent_dim=latent_dim, intermediate_dim=intermediate_dim, beta=beta)
@@ -133,11 +136,9 @@ def get_omic_embeddings(x_omic):
             input = data[0].to(device)
             mean, _ = model.encode(input)
             embeddings.append(mean.cpu().numpy())
-
-    set_trace()
     # Concatenate all batch embeddings into a single numpy array
     embeddings = np.concatenate(embeddings, axis=0)
-
+    # set_trace()
     return embeddings
 
 
@@ -145,7 +146,7 @@ def main():
     restart_training = False
     wandb.init(project="rnaseq_vae", entity="tnnandi")
     config = wandb.config
-    config = None
+    config = None # remove this when using the sweep_config.yaml file
 
     train_batch_size = 128
     val_batch_size = 8
@@ -157,7 +158,7 @@ def main():
 
     # log transform to handle zero values
     X_log = np.log1p(X)
-    scaler = StandardScaler()
+    scaler = StandardScaler() # save the scaling parameters to be used during inference
     # transpose so samples are rows
     X_scaled = scaler.fit_transform(X_log.T)
 

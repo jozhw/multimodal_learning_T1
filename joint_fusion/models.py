@@ -2,11 +2,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from generate_rnaseq_embeddings import get_omic_embeddings
+from generate_wsi_embeddings import WSIEncoder
 import torchvision.models as models
 from pdb import set_trace
 from torchvision.models.vision_transformer import vit_b_32
 from torchvision.models import ViT_B_32_Weights
-
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # make the output(embedding) dimension a hyperparameter
 class WSINetwork(nn.Module):
@@ -94,26 +95,28 @@ class OmicNetwork(nn.Module):
 class MultimodalNetwork(nn.Module):
     def __init__(self, embedding_dim_wsi, embedding_dim_omic, mode, fusion_type):
         super(MultimodalNetwork, self).__init__()
+
         self.mode = mode  # wsi_omic, wsi or omic
         self.fusion_type = fusion_type
-        if self.mode is not 'wsi_omic':
+        self.wsi_encoder = WSIEncoder() # use for early fusion using the pretrained foundation model for generating tile embeddings
+        if self.mode != 'wsi_omic':
             self.fusion_type = None
+        print(f"Initializing with mode={mode}, fusion_type={fusion_type}")
+        # if self.fusion_type is not None: # not unimodal
+        if self.mode == 'wsi_omic':
+            self.wsi_net = WSINetwork(embedding_dim_wsi)
+            self.omic_net = OmicNetwork(embedding_dim_omic)
+            embedding_dim = self.wsi_net.embedding_dim + self.omic_net.embedding_dim
+        elif self.mode == 'wsi':
+            self.wsi_net = WSINetwork(embedding_dim_wsi)
+            self.omic_net = None
+            embedding_dim = self.wsi_net.embedding_dim
+        elif self.mode == 'omic':
+            self.wsi_net = None
+            self.omic_net = OmicNetwork(embedding_dim_omic)
+            embedding_dim = self.omic_net.embedding_dim
 
-        if self.fusion_type is not None:
-            if self.mode == 'wsi_omic':
-                self.wsi_net = WSINetwork(embedding_dim_wsi)
-                self.omic_net = OmicNetwork(embedding_dim_omic)
-                embedding_dim = self.wsi_net.embedding_dim + self.omic_net.embedding_dim
-            elif self.mode == 'wsi':
-                self.wsi_net = WSINetwork(embedding_dim_wsi)
-                self.omic_net = None
-                embedding_dim = self.wsi_net.embedding_dim
-            elif self.mode == 'omic':
-                self.wsi_net = None
-                self.omic_net = OmicNetwork(embedding_dim_omic)
-                embedding_dim = self.omic_net.embedding_dim
-
-        embedding_dim = embedding_dim_omic
+        # embedding_dim = embedding_dim_omic
         print("Embedding dimension based on which the dimension of the input of the downstream MLP is set: ", embedding_dim)
         # downstream MLP for fused data (directly tied to the Cox loss)
         self.fused_mlp = nn.Sequential(
@@ -136,16 +139,16 @@ class MultimodalNetwork(nn.Module):
             print("omic_embedding.shape: ", omic_embedding.shape)
 
         elif self.fusion_type == 'early':
-            wsi_embedding = get_wsi_embedding(x_wsi)  # can get from pretrained foundation models
-            omic_embedding = get_omic_embeddings()  # can get from a simple VAE based encoder
+            wsi_embedding = self.wsi_encoder.get_wsi_embeddings(x_wsi)  # get from pretrained foundation models; x_wsi contain data from all tiles
+            omic_embedding = get_omic_embeddings(x_omic)  # get from a simple VAE based encoder
             print("wsi_embedding.shape: ", wsi_embedding.shape)
             print("omic_embedding.shape: ", omic_embedding.shape)
 
         elif self.fusion_type is None:  # unimodal case
             print("This is a unimodal case")
             if self.mode == 'wsi':
-                wsi_embedding = get_wsi_embedding(x_wsi)
-                print("wsi_embedding.shape: ", wsi_embedding.shape)
+                wsi_embedding = self.wsi_encoder.get_wsi_embeddings(x_wsi) # x_wsi contain data from all tiles
+                print("wsi_embedding.shape (should be [batch_size, embedding_dim]): ", wsi_embedding.shape)
             elif self.mode == 'omic':
                 if self.stored_omic_embedding is None and x_omic is not None: # to avoid calling this function for every forward pass
                     self.stored_omic_embedding = get_omic_embeddings(x_omic)
@@ -161,10 +164,12 @@ class MultimodalNetwork(nn.Module):
         elif self.mode == 'omic':
             combined_embedding = omic_embedding
         elif self.mode == 'wsi_omic':
-            combined_embedding = torch.cat((wsi_embedding, omic_embedding), dim=1)
+            wsi_embedding_tensor = torch.tensor(wsi_embedding)
+            omic_embedding_tensor = torch.tensor(omic_embedding)
+            combined_embedding = torch.cat((wsi_embedding_tensor, omic_embedding_tensor), dim=1)
 
+        combined_embedding = torch.tensor(combined_embedding).to(device)
         print("combined_embedding.shape: ", combined_embedding.shape)
-        # set_trace()
         # use combined embedding with downstream MLP for getting the output that enters the loss function
         output = self.fused_mlp(combined_embedding)
 

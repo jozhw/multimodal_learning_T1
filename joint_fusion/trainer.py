@@ -33,18 +33,18 @@ parser.add_argument('--input_wsi_path', type=str,
                     default='/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/preprocessing/TCGA_WSI/batch_corrected/processed_svs/tiles/256px_9.9x/combined_tiles/',
                     help='Path to input WSI tiles')
 # parser.add_argument('--output_path', type=str, default='results/output.txt', help='Path to output results file')
-parser.add_argument('--batch_size', type=int, default=1, help='Batch size for training')
+parser.add_argument('--batch_size', type=int, default=4, help='Batch size for training')
 parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
 parser.add_argument('--lr_decay_iters', type=int, default=100, help='Learning rate decay steps')
 parser.add_argument('--num_epochs', type=int, default=2, help='Number of training epochs')
 parser.add_argument('--gpu_ids', type=str, default='0', help='gpu ids: e.g. 0  0,1,2, 0,2. use -1 for CPU')
 parser.add_argument('--input_size_wsi', type=int, default=256, help="input_size for path images")
-parser.add_argument('--embedding_dim_wsi', type=int, default=128, help="embedding dimension for WSI")
-parser.add_argument('--embedding_dim_omic', type=int, default=128, help="embedding dimension for omic")
-parser.add_argument('--input_modes', type=str, default="omic", help="wsi, omic, wsi_omic")
-parser.add_argument('--fusion_type', type=str, default="unimodal", help="early, late, joint, unimodal")
+parser.add_argument('--embedding_dim_wsi', type=int, default=384, help="embedding dimension for WSI")
+parser.add_argument('--embedding_dim_omic', type=int, default=256, help="embedding dimension for omic")
+parser.add_argument('--input_mode', type=str, default="wsi", help="wsi, omic, wsi_omic")
+parser.add_argument('--fusion_type', type=str, default="early", help="early, late, joint, unimodal")
 parser.add_argument('--profile', type=str, default=False, help="whether to profile or not")
-parser.add_argument('--use_mixed_precision', type=str, default=True, help="whether to use mixed precision calculations")
+parser.add_argument('--use_mixed_precision', type=str, default=False, help="whether to use mixed precision calculations")
 parser.add_argument('--use_gradient_accumulation', type=str, default=False, help="whether to use gradient accumulation")
 
 opt = parser.parse_args()
@@ -58,16 +58,24 @@ torch.backends.cudnn.benchmark = True  # A bool that, if True, causes cuDNN to b
 mapping_df = pd.read_csv(opt.input_path + "mapped_data_21March.csv")
 # The rnaseq data are saved as string representations of dictionary, not actual dictionary object. Need to convert
 print("Converting the rnaseq data to proper dicts (may take a min)")
-# mapping_df['rnaseq_data'] = mapping_df['rnaseq_data'].map(ast.literal_eval)
-# mapping_df['rnaseq_data'] = ast.literal_eval(mapping_df['rnaseq_data'])
 mapping_df['rnaseq_data'] = mapping_df['rnaseq_data'].apply(eval)
+# mapping_df['rnaseq_data'] = mapping_df['rnaseq_data'].apply(ast.literal_eval)
+print("Conversion ongoing")
 mapping_df['tiles'] = mapping_df['tiles'].apply(ast.literal_eval)  # convert strings to lists
 print("Conversion over")
 # keep only rows that have both wsi and rnaseq data
 ids_with_wsi = mapping_df[mapping_df['tiles'].map(len) > 0].index.tolist()
 mapping_df = mapping_df.loc[ids_with_wsi]
+# remove rows where the number of tiles is different from the standard (to avoid length mismatch issues during batching)
+mask = mapping_df['tiles'].apply(len) == 400
+mapping_df = mapping_df[mask]
+# check if there are empty (or unexpected number of) rnaseq entries
+# check why this is happening
+rnaseq_dict_sizes = mapping_df['rnaseq_data'].apply(lambda x: len(x))
+print("rnaseq_dict_sizes.value_counts(): ", rnaseq_dict_sizes.value_counts())
+mapping_df = mapping_df[mapping_df['rnaseq_data'].apply(lambda x: len(x) > 0)]
 print(mapping_df)
-
+# set_trace()
 # train the model
 if opt.profile:
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
