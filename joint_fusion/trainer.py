@@ -23,9 +23,12 @@ from collections import Counter
 from torch.profiler import profile, record_function, ProfilerActivity
 
 # on Dell laptop (activate conda env 'pytorch_py3p10' and use 'python trainer.py')
-dataroot = '/mnt/c/Users/tnandi/Downloads/multimodal_lucid/data_from_pathomic_fusion/data/TCGA_GBMLGG/splits/'
 
 parser = argparse.ArgumentParser()
+parser.add_argument('--create_new_data_mapping', type=str, default=True, help="whether to create new data mapping or use existing one")
+parser.add_argument('--input_mapping_data_path', type=str,
+                    default='/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/joint_fusion/',
+                    help='Path to input mapping data file')
 parser.add_argument('--input_path', type=str,
                     default='/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/preprocessing/',
                     help='Path to input data files')
@@ -53,29 +56,45 @@ device = torch.device('cuda:{}'.format(opt.gpu_ids[0])) if opt.gpu_ids else torc
 print("Using device:", device)
 torch.backends.cudnn.benchmark = True  # A bool that, if True, causes cuDNN to benchmark multiple convolution algorithms and select the fastest.
 
-# create data mappings
-# read the file containing gene expression and tile image locations for the TCGA-LUAD samples (mapped_data_16March)
-mapping_df = pd.read_csv(opt.input_path + "mapped_data_21March.csv")
-# The rnaseq data are saved as string representations of dictionary, not actual dictionary object. Need to convert
-print("Converting the rnaseq data to proper dicts (may take a min)")
-mapping_df['rnaseq_data'] = mapping_df['rnaseq_data'].apply(eval)
-# mapping_df['rnaseq_data'] = mapping_df['rnaseq_data'].apply(ast.literal_eval)
-print("Conversion ongoing")
-mapping_df['tiles'] = mapping_df['tiles'].apply(ast.literal_eval)  # convert strings to lists
-print("Conversion over")
-# keep only rows that have both wsi and rnaseq data
-ids_with_wsi = mapping_df[mapping_df['tiles'].map(len) > 0].index.tolist()
-mapping_df = mapping_df.loc[ids_with_wsi]
-# remove rows where the number of tiles is different from the standard (to avoid length mismatch issues during batching)
-mask = mapping_df['tiles'].apply(len) == 400
-mapping_df = mapping_df[mask]
-# check if there are empty (or unexpected number of) rnaseq entries
-# check why this is happening
-rnaseq_dict_sizes = mapping_df['rnaseq_data'].apply(lambda x: len(x))
-print("rnaseq_dict_sizes.value_counts(): ", rnaseq_dict_sizes.value_counts())
-mapping_df = mapping_df[mapping_df['rnaseq_data'].apply(lambda x: len(x) > 0)]
-print(mapping_df)
+if opt.create_new_data_mapping:
+    # create data mappings
+    # read the file containing gene expression and tile image locations for the TCGA-LUAD samples (mapped_data_16March)
+    # mapping_df = pd.read_csv(opt.input_path + "mapped_data_21March.csv")
+    mapping_df = pd.read_json(opt.input_path + "mapped_data.json")
+    # set_trace()
+    # The rnaseq data are saved as string representations of dictionary, not actual dictionary object. Need to convert
+    ### The below is not required if the input mapping file is json
+    # print("Converting the rnaseq data to proper dicts (may take a min)")
+    # mapping_df['rnaseq_data'] = mapping_df['rnaseq_data'].apply(eval)
+    # # mapping_df['rnaseq_data'] = mapping_df['rnaseq_data'].apply(ast.literal_eval)
+    # print("Conversion ongoing")
+    # mapping_df['tiles'] = mapping_df['tiles'].apply(ast.literal_eval)  # convert strings to lists
+    # print("Conversion over")
+
+    # keep only rows that have both wsi and rnaseq data
+    ids_with_wsi = mapping_df[mapping_df['tiles'].map(len) > 0].index.tolist()
+    mapping_df = mapping_df.loc[ids_with_wsi]
+
+    # remove rows where the number of tiles is different from the standard (to avoid length mismatch issues during batching)
+    mask = mapping_df['tiles'].apply(len) == 400
+    mapping_df = mapping_df[mask]
+
+    # check if there are empty (or unexpected number of) rnaseq entries
+    # check why this is happening
+    rnaseq_dict_sizes = mapping_df['rnaseq_data'].apply(lambda x: len(x))
+    print("rnaseq_dict_sizes.value_counts(): ", rnaseq_dict_sizes.value_counts())
+    mapping_df = mapping_df[mapping_df['rnaseq_data'].apply(lambda x: len(x) > 0)]
+    print(mapping_df)
+
+    # save the df for using later, or for KM plots
+    # mapping_df.to_csv('mapping_df.csv', index=False)
+    mapping_df.to_json('mapping_df.json', orient='records', lines=True)
+else:
+    mapping_df = pd.read_json(opt.input_mapping_data_path + "mapping_df.json", lines=True)
+
+
 # set_trace()
+
 # train the model
 if opt.profile:
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
