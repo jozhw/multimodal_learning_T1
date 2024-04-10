@@ -20,24 +20,29 @@ import os
 from pdb import set_trace
 
 
-class CoxLoss(nn.Module):
+class CoxLossOld(nn.Module):
     def __init__(self):
-        super(CoxLoss, self).__init__()
+        super(CoxLossOld, self).__init__()
 
     def forward(self, log_risks, times, censor):
         """
         :param log_risks: predictions from the NN
-        :param time_to_death: observed survival time
-        :param event_occurred: censor data, event (death) indicators (1/0)
+        :param times: observed survival times (i.e. times to death) for the batch
+        :param censor: censor data, event (death) indicators (1/0)
         :return: Cox loss (scalar)
+        : NOTE: There's an issue with how the risk-set (inner sum in term 2) is calculated here
+
         """
         sorted_times, sorted_indices = torch.sort(times, descending=True)
         sorted_log_risks = log_risks[sorted_indices]
         sorted_censor = censor[sorted_indices]
 
-        sorted_log_risks = sorted_log_risks - torch.max(sorted_log_risks)  # to avoid overflow
+        # sorted_log_risks = sorted_log_risks - torch.max(sorted_log_risks)  # to avoid overflow
         # Cox partial likelihood loss = log risk for each individual - cumulative risk (i.e., sum of risks of all at-risk individuals)
         # batching will prevent including all at-risk samples in the second term
+        # if within a batch all samples are censored,  it will lead to a sum over an empty set for the second term
+        # a small number is added to the term inside the log in the second term to handle such cases.
+
         cox_loss = sorted_log_risks - torch.log(torch.cumsum(torch.exp(sorted_log_risks), dim=0) + 1e-15)
         cox_loss = - cox_loss * sorted_censor
         # check the shape of sorted_log_risks
@@ -50,6 +55,50 @@ class CoxLoss(nn.Module):
         # cox_loss /= torch.sum(events)  # should this be done?
 
         return cox_loss.mean()
+
+class CoxLoss(nn.Module):
+    def __init__(self):
+        super(CoxLoss, self).__init__()
+
+    def forward(self, log_risks, times, censor):
+        """
+        :param log_risks: predictions from the NN
+        :param times: observed survival times (i.e. times to death) for the batch
+        :param censor: censor data, event (death) indicators (1/0)
+        :return: Cox loss (scalar)
+        """
+        sorted_times, sorted_indices = torch.sort(times, descending=True)
+        sorted_log_risks = log_risks[sorted_indices]
+        sorted_censor = censor[sorted_indices]
+
+        # precompute for using within the inner sum of term 2 in Cox loss
+        exp_sorted_log_risks  = torch.exp(sorted_log_risks)
+
+        # initialize all samples to be at-risk (will update it below)
+        at_risk_mask = torch.ones_like(sorted_times, dtype=torch.bool)
+
+        losses = []
+        for time_index in range(len(sorted_times)):
+            # include only the uncensored samples
+            if sorted_censor[time_index] == 1:
+                at_risk_sum = torch.sum(exp_sorted_log_risks[at_risk_mask]) # all are at-risk for the first sample (after arranged in descending order)
+                loss = sorted_log_risks[time_index] - torch.log(at_risk_sum + 1e-15)
+                losses.append(loss)
+
+            at_risk_mask[time_index] = False # the i'th sample is no more in the risk-set as the event has already occurred for it
+
+        # if no uncensored samples are in the mini-batch return 0
+        if not losses:
+            return torch.tensor(0.0, requires_grad=True)
+
+        cox_loss = -torch.mean(torch.stack(losses))
+        return cox_loss
+
+
+
+
+
+
 
 
 def train_nn(opt, mapping_df, device):
@@ -65,17 +114,17 @@ def train_nn(opt, mapping_df, device):
     print(f"Model mode: {model.mode}, fusion_type: {model.fusion_type}")
     # set_trace()
     # if model.wsi_net is not None:
-    print("WSINetwork Summary:")
+    print("##############  WSINetwork Summary  ##################")
     print_model_summary(model.wsi_net)
 
     # if model.omic_net is not None:
-    print("\nOmicNetwork Summary:")
+    print("\n ##############  OmicNetwork Summary  ##############")
     print_model_summary(model.omic_net)
 
-    print("\nMultimodalNetwork Summary:")
+    print("\n ##############  MultimodalNetwork Summary ##############")
     print_model_summary(model)
 
-    print("--------Model arch------------")
+    # print("--------Model arch------------")
     # print(model)
     # print("--------WSI Model summary -----------")
     # if model.wsi_net is not None:
@@ -91,7 +140,7 @@ def train_nn(opt, mapping_df, device):
                                                batch_size=opt.batch_size,
                                                shuffle=True,)
                                                # collate_fn=mixed_collate)
-    for epoch in tqdm(range(1, opt.num_epochs)):
+    for epoch in tqdm(range(1, opt.num_epochs+1)):
         print("epoch: ", epoch, " out of ", opt.num_epochs)
         model.train()
         loss_epoch = 0
@@ -104,17 +153,19 @@ def train_nn(opt, mapping_df, device):
             days_to_death = days_to_death.to(device)
             days_to_last_followup = days_to_last_followup.to(device)
             event_occurred = event_occurred.to(device)
+            # set_trace()
+            print("Days to death: ", days_to_death)
+            print("event occurred: ", event_occurred)
 
             optimizer.zero_grad()
             if opt.use_mixed_precision:
-
                 with autocast():  # should wrap only the forward pass including the loss calculation
                     predictions = model(x_wsi=x_wsi,  # list of tensors (one for each tile)
                                         x_omic=x_omic)
                     loss = cox_loss(predictions.squeeze(),
                                     days_to_death,
                                     event_occurred)
-                    print("loss: ", loss.data.item())
+                    print("\n loss: ", loss.data.item())
                     loss_epoch += loss.data.item()
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -122,17 +173,19 @@ def train_nn(opt, mapping_df, device):
             else:
                 # model for survival outcome (uses Cox PH partial log likelihood as the loss function)
                 # the model output should be considered as beta*X to be used in the Cox loss function
+
                 # for early fusion, the model class should use the inputs from here by the generated embeddings
-                # set_trace()
                 predictions = model(x_wsi=x_wsi,  # list of tensors (one for each tile)
                                     x_omic=x_omic)
+                print("Predictions: ", predictions.squeeze())
+                print("\n True days to event: ", days_to_death)
                 # set_trace()
                 # loss = F.nll_loss(predictions, grade)  # cross entropy for cancer grade classification
-                loss = cox_loss(predictions.squeeze(),
+                loss = cox_loss(predictions.squeeze(),   # predictions are not survival outcomes, rather beta*X
                                 days_to_death,
                                 event_occurred)  # Cox partial likelihood loss for survival outcome prediction
-                set_trace()
-                print("loss: ", loss.data.item())
+                # set_trace()
+                print("\n loss: ", loss.data.item())
                 loss_epoch += loss.data.item()
                 loss.backward()
                 optimizer.step()
