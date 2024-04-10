@@ -13,12 +13,14 @@ tiles_dir = base_dir + 'TCGA_WSI/batch_corrected/processed_svs/tiles/256px_9.9x/
 # path to the csv file containing the clinical data
 # input_csv_path = '/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/preprocessing/combined_clinical_TCGA-LUAD.csv'
 data_clinical_df = pd.read_csv(base_dir + 'combined_clinical_TCGA-LUAD.csv', delimiter='\t') # contains [time_to_death, time_to_last_followup, dead/alive status] for all LUAD samples
-data_rnaseq_df = pd.read_csv(base_dir + 'combined_rnaseq_TCGA-LUAD.csv', delimiter='\t') # contains TPM for all protein coding genes for all LUAD samples
+# data_rnaseq_df = pd.read_csv(base_dir + 'combined_rnaseq_TCGA-LUAD.csv', delimiter='\t') # contains TPM for all protein coding genes for all LUAD samples
+
+data_rnaseq_df = pd.read_csv(base_dir + 'batchcorrected_combined_rnaseq_TCGA-LUAD.tsv', delimiter='\t') # ue the batch corrected rnaseq samples
 
 # csv file with the mapped data
-output_csv_path = base_dir + './mapped_data.csv'
+output_csv_path = base_dir + './mapped_data_9april.csv'
 # json file with the mapped data
-output_json_path = base_dir + './mapped_data.json'
+output_json_path = base_dir + './mapped_data_9april.json'
 
 png_files_dict = {}
 
@@ -81,12 +83,18 @@ print("Do gene_id have repeats: ", data_rnaseq_df['gene_id'].duplicated().any())
 
 data_rnaseq_df = data_rnaseq_df.set_index('gene_id')
 
-rnaseq_transposed = data_rnaseq_df.drop(columns=['gene_name', 'gene_type']).T
+rnaseq_transposed_df = data_rnaseq_df.drop(columns=['gene_name', 'gene_type']).T
+# change the index of rnaseq_transposed_df to be consistent with those of combined_df (and remove repetitions; one TCGA sample may have > 1 rnaseq sample)
+new_indices = ['TCGA-' + index.split('.')[1] + '-' + index.split('.')[2] for index in rnaseq_transposed_df.index]
+rnaseq_transposed_df.index = new_indices
+rnaseq_transposed_df = rnaseq_transposed_df[~rnaseq_transposed_df.index.duplicated(keep='first')]
+
+
 combined_df['rnaseq_data'] = [{} for _ in range(len(combined_df))]
 for tcga_id in combined_df.index:
-    if tcga_id in rnaseq_transposed.index:
+    if tcga_id in rnaseq_transposed_df.index:
         # create a dictionary for each row with gene_id: expression_value
-        combined_df.at[tcga_id, 'rnaseq_data'] = rnaseq_transposed.loc[tcga_id].to_dict()
+        combined_df.at[tcga_id, 'rnaseq_data'] = rnaseq_transposed_df.loc[tcga_id].to_dict()
 
 # combined_df['rnaseq_data'] = None
 # for tcga_id in combined_df.index:
@@ -95,7 +103,7 @@ for tcga_id in combined_df.index:
 #     else:
 #         combined_df.at[tcga_id, 'rnaseq_data'] = {}
 
-# set_trace()
+set_trace()
 combined_df.to_csv(output_csv_path)
 combined_df.to_json(output_json_path)
 print(f"filtered data has been written to {output_csv_path} and {output_json_path}.")
