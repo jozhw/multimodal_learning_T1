@@ -132,6 +132,7 @@ class MultimodalNetwork(nn.Module):
     #     omic_embeddings =
 
     def forward(self, x_wsi, x_omic):
+        print("fusion type: ", self.fusion_type)
         if self.fusion_type == 'joint':
             wsi_embedding = self.wsi_net(x_wsi)
             omic_embedding = self.omic_net(x_omic)

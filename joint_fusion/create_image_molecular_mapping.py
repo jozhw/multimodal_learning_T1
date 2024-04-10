@@ -2,6 +2,7 @@ import csv
 import os
 import pandas as pd
 import ast
+import numpy as np
 from pdb import set_trace
 
 # code to create a csv file containing the TCGA ID, the corresponding TCGA WSI image file names, and clinical data (dead/alive, time to death/time to last followup)
@@ -103,9 +104,15 @@ for tcga_id in combined_df.index:
 #     else:
 #         combined_df.at[tcga_id, 'rnaseq_data'] = {}
 
-set_trace()
+print("Does the rnaseq data have any nan: ", combined_df['rnaseq_data'].apply(lambda d: any(np.isnan(v) for v in d.values())).any())
+
+# find indices without rnaseq data
+indices_without_rnaseq_data = combined_df[combined_df['rnaseq_data'].apply(lambda d: not d)].index.tolist()
+# remove the above indices from combined_df
+combined_df = combined_df[combined_df['rnaseq_data'].apply(lambda d: bool(d))]
+
 combined_df.to_csv(output_csv_path)
-combined_df.to_json(output_json_path)
+combined_df.to_json(output_json_path, orient='index')
 print(f"filtered data has been written to {output_csv_path} and {output_json_path}.")
 
 set_trace()

@@ -134,16 +134,18 @@ def train_nn(opt, mapping_df, device):
         accumulation_steps = 10
     if opt.use_mixed_precision:
         scaler = GradScaler()
-
-    custom_dataset = CustomDataset(opt, mapping_df, split='train', mode=opt.input_mode)
+    # custom_dataset = CustomDataset(opt, mapping_df, split='train', mode=opt.input_mode)
+    custom_dataset = CustomDataset(opt, mapping_df, mode=opt.input_mode)
     train_loader = torch.utils.data.DataLoader(dataset=custom_dataset,
                                                batch_size=opt.batch_size,
                                                shuffle=True,)
                                                # collate_fn=mixed_collate)
+    print("train loader created")
     for epoch in tqdm(range(1, opt.num_epochs+1)):
         print("epoch: ", epoch, " out of ", opt.num_epochs)
         model.train()
         loss_epoch = 0
+        print("reached here")
         for batch_idx, (days_to_death, days_to_last_followup, event_occurred, x_wsi, x_omic) in enumerate(train_loader):
             # x_wsi is a list of tensors (one tensor for each tile)
             print("batch_index: ", batch_idx, " out of ", np.ceil(len(custom_dataset) / opt.batch_size))
@@ -153,7 +155,6 @@ def train_nn(opt, mapping_df, device):
             days_to_death = days_to_death.to(device)
             days_to_last_followup = days_to_last_followup.to(device)
             event_occurred = event_occurred.to(device)
-            # set_trace()
             print("Days to death: ", days_to_death)
             print("event occurred: ", event_occurred)
 
@@ -171,6 +172,7 @@ def train_nn(opt, mapping_df, device):
                 scaler.step(optimizer)
                 scaler.update()
             else:
+                print(" Not using mixed precision")
                 # model for survival outcome (uses Cox PH partial log likelihood as the loss function)
                 # the model output should be considered as beta*X to be used in the Cox loss function
 
