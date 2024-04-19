@@ -27,13 +27,16 @@ from torch.profiler import profile, record_function, ProfilerActivity
 parser = argparse.ArgumentParser()
 parser.add_argument('--create_new_data_mapping', type=str, default=True, help="whether to create new data mapping or use existing one")
 parser.add_argument('--input_mapping_data_path', type=str,
-                    default='/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/joint_fusion/',
+                    default='/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/joint_fusion/', # on laptop
+                    # default='/lus/eagle/clone/g2/projects/GeomicVar/tarak/multimodal_learning_T1/joint_fusion/', # on Polaris
                     help='Path to input mapping data file')
 parser.add_argument('--input_path', type=str,
-                    default='/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/preprocessing/',
+                    default='/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/preprocessing/', # on laptop
+                    # default='/lus/eagle/clone/g2/projects/GeomicVar/tarak/multimodal_learning_T1/preprocessing/', # on Polaris
                     help='Path to input data files')
 parser.add_argument('--input_wsi_path', type=str,
-                    default='/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/preprocessing/TCGA_WSI/batch_corrected/processed_svs/tiles/256px_9.9x/combined_tiles/',
+                    default='/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/preprocessing/TCGA_WSI/batch_corrected/processed_svs/tiles/256px_9.9x/combined_tiles/', # on laptop
+                    # default='/lus/eagle/clone/g2/projects/GeomicVar/tarak/multimodal_learning_T1/preprocessing/TCGA_WSI/batch_corrected/processed_svs/tiles/256px_9.9x/combined_tiles/', # on Polaris
                     help='Path to input WSI tiles')
 # parser.add_argument('--output_path', type=str, default='results/output.txt', help='Path to output results file')
 parser.add_argument('--batch_size', type=int, default=8, help='Batch size for training')

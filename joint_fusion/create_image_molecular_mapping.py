@@ -7,9 +7,11 @@ from pdb import set_trace
 
 # code to create a csv file containing the TCGA ID, the corresponding TCGA WSI image file names, and clinical data (dead/alive, time to death/time to last followup)
 
-base_dir = '/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/preprocessing/'
+base_dir = '/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/preprocessing/' # for laptop
+base_dir = '/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/preprocessing' # for Polaris
 # path to the directory containing the tiles
-tiles_dir = base_dir + 'TCGA_WSI/batch_corrected/processed_svs/tiles/256px_9.9x/' # contains stain corrected tiles for around 100 TCGA-LUAD samples
+tiles_dir = base_dir + 'TCGA_WSI/batch_corrected/processed_svs/tiles/256px_9.9x/' # laptop: contains stain corrected tiles for around 100 TCGA-LUAD samples
+tiles_dir = base_dir + 'TCGA_WSI/LUAD_all/svs_files/FFPE_tiles/tiles/256px_9.9x/' # Polaris: contains uncorrected tiles for 418 samples
 
 # path to the csv file containing the clinical data
 # input_csv_path = '/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/preprocessing/combined_clinical_TCGA-LUAD.csv'
