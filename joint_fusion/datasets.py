@@ -20,6 +20,7 @@ class CustomDataset(Dataset):
             transforms.RandomHorizontalFlip(0.5),
             transforms.RandomVerticalFlip(0.5),
             transforms.RandomCrop(opt.input_size_wsi),
+            # transforms.RandomCrop(256), #hardcoded
             transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.05, hue=0.01),
             transforms.ToTensor(),
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
