@@ -7,7 +7,9 @@ import torch
 from torch import nn, optim
 import copy
 import os
+import argparse
 import joblib
+import json
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import TensorDataset, DataLoader
 from torchsummary import summary
@@ -16,6 +18,8 @@ import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 import numpy as np
+from datetime import datetime
+from datasets import CustomDataset
 import wandb
 from pdb import set_trace
 
@@ -25,33 +29,34 @@ if device.type == 'cuda':
 else:
     print("Running on CPU")
 
-# rnaseq_df = pd.read_csv(
-#     "/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/preprocessing/batchcorrected_combined_rnaseq_TCGA-LUAD.tsv",
-#     delimiter='\t'
-# )
-#
-# checkpoint_dir = "./checkpoints"
-# os.makedirs(checkpoint_dir, exist_ok=True)
-# # Remove the code below when using shortened TCGA IDs when creating the combined RNASeq file
-# # rename the columns by keeping only the minimal part of the TCGA ID, e.g.,  TCGA-44-2655
-# column_mapping = {
-#     col: '-'.join(col.split('.')[:3]) if 'TCGA' in col else col
-#     for col in rnaseq_df.columns
-# }
-# rnaseq_df = rnaseq_df.rename(columns=column_mapping)
-# duplicated_columns = rnaseq_df.columns[rnaseq_df.columns.duplicated()]
-# print("duplicated columns: ", duplicated_columns)
-#
-# # Remove duplicated columns
-# rnaseq_df = rnaseq_df.loc[:, ~rnaseq_df.columns.duplicated()]
+# df containing the samples with both WSI and rnaseq data (generated vy trainer.py)
+mapping_df = pd.read_json(
+    "./mapping_df.json",
+    orient='index')
 
+######################### VAE HYPERPARAMETERS ############################
+lengths = mapping_df['rnaseq_data'].apply(lambda x: len(x))
+lengths_equal = lengths.all()
+if lengths_equal:
+    print("all tcga samples have the same number of genes")
+else:
+    print("WARNING: all tcga samples DO NOT have the same number of genes ")
 
-# set_trace()
+input_dim = lengths.iloc[0]  # number of genes (~ 20K)
+intermediate_dim = 512
+lr = 1e-4
+latent_dim = 256  # get from the input opt
+beta = 0.005  # 0.01   # 0: equivalent to standard autoencoder; 1: equivalent to standard VAE
+
+train_batch_size = 128
+val_batch_size = 8
+test_batch_size = 8
+num_epochs = 200000
 
 class BetaVAE(nn.Module):
     def __init__(self, input_dim=None, latent_dim=None, intermediate_dim=None, beta=None, config=None):
         super(BetaVAE, self).__init__()
-        if config: #during training with HPO using wandb (read parameters from the sweep_config.yaml file)
+        if config:  # during training with HPO using wandb (read parameters from the sweep_config.yaml file)
             self.input_dim = config.input_dim
             self.latent_dim = config.latent_dim
             self.intermediate_dim = config.intermediate_dim
@@ -103,25 +108,31 @@ def loss_function(recon_x, x, mean, log_var):
 # function to take a trained VAE and generate embeddings for a new rnaseq dataset
 # essentially, just pass the input through the encoder network
 # for early fusion, these embeddings should be loaded only once (before training of the downstream MLP starts)
-def get_omic_embeddings(x_omic):
+def get_omic_embeddings(x_omic, checkpoint_dir=None):
     print("In get_omic_embeddings()")
     # work directly on the tensor on the device
-    # (CHANGE) actually, need to use the mean and std from the training data
     x_omic_log = torch.log1p(x_omic)
-    # mean = x_omic_log.mean(dim=1, keepdim=True)
-    # std = x_omic_log.std(dim=1, keepdim=True)
-    scaler = joblib.load('scaler.save')
+    scaler = joblib.load(os.path.join(checkpoint_dir, 'scaler.save'))
     mean = scaler.mean_
     std = scaler.scale_
     x_omic_scaled = (x_omic_log - mean) / (std + 1e-6)
+    # set_trace()
+    model = BetaVAE(input_dim=input_dim,
+                    latent_dim=latent_dim,
+                    intermediate_dim=intermediate_dim,
+                    beta=beta)
+    # model = BetaVAE()
 
-    # model = BetaVAE(input_dim=input_dim, latent_dim=latent_dim, intermediate_dim=intermediate_dim, beta=beta)
-    model = BetaVAE()
     checkpoints = [file for file in os.listdir(checkpoint_dir) if file.endswith('.pth')]
-    latest_checkpoint = max(checkpoints, key=lambda x: os.path.getctime(os.path.join(checkpoint_dir, x)))
+    # latest_checkpoint = max(checkpoints, key=lambda x: os.path.getctime(os.path.join(checkpoint_dir, x)))
+    latest_checkpoint = 'checkpoint_epoch_30000.pth'
     checkpoint_path = os.path.join(checkpoint_dir, latest_checkpoint)
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    # set_trace()
+    # for some reason 'module' gets added to the names of the model parameters, so adjusting the state dictionary to remove 'module.' prefix
+    new_state_dict = {key.replace("module.", ""): value for key, value in checkpoint['model_state_dict'].items()}
+    # model.load_state_dict(checkpoint['model_state_dict'])
+    model.load_state_dict(new_state_dict)
     print(f"loaded checkpoint from {checkpoint_path}")
     model.to(device)
     model.eval()
@@ -142,25 +153,38 @@ def main():
     restart_training = False
     wandb.init(project="rnaseq_vae", entity="tnnandi")
     config = wandb.config
-    config = None # remove this when using the sweep_config.yaml file
+    config = None  # remove this when using the sweep_config.yaml file
 
-    # For obtaining the trained VAE, use the samples in the TCGA-LUAD database except those for which we are using the WSI samples now (these will be used as the test set)
+    rnaseq_df = pd.read_json(
+        './rnaseq_df.json',  # contains gene ids as indices, and the tcga ids as columns
+        orient='index')
+
+    tcga_ids = rnaseq_df.columns.to_numpy()
     X = rnaseq_df.values
-    # omit gene_id, gene_name, gene_type
-    # X = rnaseq_df.iloc[:, 3:].values
-
     # log transform to handle zero values
     X_log = np.log1p(X)
-    scaler = StandardScaler() # save the scaling parameters to be used during inference
+    scaler = StandardScaler()  # save the scaling parameters to be used during inference
     # transpose so samples are rows
     X_scaled = scaler.fit_transform(X_log.T)
 
     # save scaler to file
-    joblib.dump(scaler, 'scaler.save')
+    joblib.dump(scaler, os.path.join(checkpoint_dir, 'scaler.save'))
+    # split the data and TCGA IDs into training and remaining parts
+    X_train, X_remaining, tcga_ids_train, tcga_ids_remaining = train_test_split(X_scaled, tcga_ids, test_size=0.2,
+                                                                                random_state=42)
 
-    X_train, X_remaining = train_test_split(X_scaled, test_size=0.2, random_state=42)
-    # Split the remaining data into validation (10%) and test (10%)
-    X_val, X_test = train_test_split(X_remaining, test_size=0.5, random_state=42)
+    # split the remaining data and TCGA IDs into validation and test parts
+    X_val, X_test, tcga_ids_val, tcga_ids_test = train_test_split(X_remaining, tcga_ids_remaining, test_size=0.5,
+                                                                  random_state=42)
+
+    # save TCGA IDs to files
+    np.save(os.path.join(checkpoint_dir, 'tcga_ids_train.npy'), tcga_ids_train)
+    np.save(os.path.join(checkpoint_dir, 'tcga_ids_val.npy'), tcga_ids_val)
+    np.save(os.path.join(checkpoint_dir, 'tcga_ids_test.npy'), tcga_ids_test)
+
+    np.savetxt(os.path.join(checkpoint_dir, 'tcga_ids_train.csv'), tcga_ids_train, delimiter=",", fmt='%s')
+    np.savetxt(os.path.join(checkpoint_dir, 'tcga_ids_val.csv'), tcga_ids_val, delimiter=",", fmt='%s')
+    np.savetxt(os.path.join(checkpoint_dir, 'tcga_ids_test.csv'), tcga_ids_test, delimiter=",", fmt='%s')
 
     train_dataset = TensorDataset(torch.tensor(X_train, dtype=torch.float).to(device))
     val_dataset = TensorDataset(torch.tensor(X_val, dtype=torch.float).to(device))
@@ -256,45 +280,51 @@ def main():
     wandb.finish()
 
 
+# for both training and inference when run directly
 if __name__ == "__main__":
-    mapping_df = pd.read_json(
-        '/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/joint_fusion/' + "mapping_df.json",
-        orient='index')
-    # mapping_vae_training_df = pd.read_json(
-    #     '/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/joint_fusion/' + 'mapping_vae_training_df.json',
-    #     orient='index')
-    rnaseq_df = pd.read_json(
-        '/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/joint_fusion/' + 'rnaseq_df.json',
-        orient='index')
+    training = False
+    inference = True
 
-    # common_indices = mapping_vae_training_df.index.intersection(mapping_df.index)
-    common_tcga_ids = set(rnaseq_df.columns).intersection(set(mapping_df.index))
-    if len(common_tcga_ids) > 0:
-        print("There are common indices between the rnaseq train data and the overall test data")
-        print(common_tcga_ids)  # print the common indices
-    else:
-        print("There are no common indices between the rnaseq train data and the overall test data")
-    #
-    # # (VAE training data) df containing rnaseq data for samples for which WSI samples are not being used
-    # rnaseq_df = pd.DataFrame(mapping_vae_training_df['rnaseq_data'].to_list(), index=mapping_vae_training_df.index).transpose()
-    #
-    # rnaseq_df.reset_index(inplace=True)
-    # rnaseq_df.rename(columns={'index': 'gene_id'}, inplace=True)
-    # print("Are all the gene_ids unique: ", rnaseq_df.shape[0] == len(rnaseq_df['gene_id'].unique()))
-    # print("Are all the gene_names unique: ", rnaseq_df.shape[0] == len(rnaseq_df['gene_name'].unique()))
+    if training:
+        current_time = datetime.now()
+        checkpoint_dir = "checkpoint_" + current_time.strftime("%Y-%m-%d-%H-%M-%S")
+        os.makedirs(checkpoint_dir, exist_ok=True)
 
-    ######################### VAE HYPERPARAMETERS ############################
-    input_dim = rnaseq_df.shape[0]  # number of genes (~ 20K)
-    intermediate_dim = 512
-    lr = 1e-4
-    latent_dim = 256  # get from the input opt
-    beta = 0.005  # 0.01   # 0: equivalent to standard autoencoder; 1: equivalent to standard VAE
+        main()
 
-    train_batch_size = 128
-    val_batch_size = 8
-    test_batch_size = 8
-    num_epochs = 200000
+    elif inference:
+        checkpoint_dir = "checkpoint_2024-04-20-08-43-52"
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--input_wsi_path', type=str,
+                            # default='/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/preprocessing/TCGA_WSI/batch_corrected/processed_svs/tiles/256px_9.9x/combined_tiles/', # on laptop
+                            default='/lus/eagle/clone/g2/projects/GeomicVar/tarak/multimodal_learning_T1/preprocessing/TCGA_WSI/LUAD_all/svs_files/FFPE_tiles/tiles/256px_9.9x/combined_tiles/',
+                            # on Polaris
+                            help='Path to input WSI tiles')
+        parser.add_argument('--input_size_wsi', type=int, default=256, help="input_size for path images")
+        opt = parser.parse_args()
 
-    main()
+        custom_dataset = CustomDataset(opt, mapping_df, mode='omic')
+        train_loader = torch.utils.data.DataLoader(dataset=custom_dataset,
+                                                   batch_size=1,
+                                                   shuffle=False, )
+
+        # Initialize an empty dictionary to store TCGA IDs and embeddings
+        patient_embeddings = {}
+
+        for batch_idx, (tcga_id, days_to_death, days_to_last_followup, event_occurred, x_wsi, x_omic) in enumerate(
+                train_loader):
+            tcga_id = tcga_id[0]  # # Assuming tcga_id is a batch of size 1
+            print(f"TCGA ID: {tcga_id}, batch_idx: {batch_idx}, out of {len(custom_dataset)}")
+            embeddings = get_omic_embeddings(x_omic, checkpoint_dir=checkpoint_dir)
+            # save the embeddings in a file for using in early fusion
+            embeddings_list = embeddings.tolist() if isinstance(embeddings, np.ndarray) else embeddings
+            patient_embeddings[tcga_id] = embeddings_list
+            set_trace()
+            # if batch_idx == 5:
+            #     break
+
+        filename = "./rnaseq_embeddings.json"
+        with open(filename, 'w') as file:
+            json.dump(patient_embeddings, file)
 
 # set_trace()
