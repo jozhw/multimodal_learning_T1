@@ -125,7 +125,7 @@ def get_omic_embeddings(x_omic, checkpoint_dir=None):
 
     checkpoints = [file for file in os.listdir(checkpoint_dir) if file.endswith('.pth')]
     # latest_checkpoint = max(checkpoints, key=lambda x: os.path.getctime(os.path.join(checkpoint_dir, x)))
-    latest_checkpoint = 'checkpoint_epoch_30000.pth'
+    latest_checkpoint = 'checkpoint_epoch_80000.pth'
     checkpoint_path = os.path.join(checkpoint_dir, latest_checkpoint)
     checkpoint = torch.load(checkpoint_path, map_location=device)
     # set_trace()
@@ -319,11 +319,12 @@ if __name__ == "__main__":
             # save the embeddings in a file for using in early fusion
             embeddings_list = embeddings.tolist() if isinstance(embeddings, np.ndarray) else embeddings
             patient_embeddings[tcga_id] = embeddings_list
-            set_trace()
+
             # if batch_idx == 5:
             #     break
 
-        filename = "./rnaseq_embeddings.json"
+        set_trace()
+        filename = "./rnaseq_embeddings_80K.json"
         with open(filename, 'w') as file:
             json.dump(patient_embeddings, file)
 
