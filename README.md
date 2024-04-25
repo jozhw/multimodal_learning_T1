@@ -35,7 +35,7 @@ Knowledge distillation with no labels) using vision transformers
     - The original gene expression count data, owing to its very high dimensionality (≈ 20K) is not suitable for directly being
 ingested by a neural network. We generate lower dimensional embeddings for the gene expression data from the latent space
 of a trained VAE
-- **Fusing embeddings from all modalities** for downstream MLP training for cancer-specific time to event prediction
+- **Fusing embeddings from all modalities** for downstream MLP/GBM training for cancer-specific time to event prediction
 - **Loss function and model training**
     - The Cox proportional hazards model is used to relate survival time (or time to death for the uncensored events) with the predictor variables (covariates). The model assumes that the hazard function (the instantaneous rate of occurrence of the event) for any individual can be expressed as the product of an unknown baseline hazard function and an exponential function of linear combinations of predictor variables.
     - The goal of survival prediction model is to predict the likelihood that a patient $i$ will survive till a certain time $t$, for a set of covariates $\boldsymbol{X_i}$ ($X$ is written in bold to clarify that it is a vector, and the subscript $i$ is for the patient ID). The hazard function $h(t|\boldsymbol{X_i})$ is defined as $h(t|X_i) = h_0(t)e^{\boldsymbol{\beta}^\top \boldsymbol{X_i}}$ 
@@ -79,4 +79,4 @@ python trainer.py --input_path --input_wsi_path --batch_size --lr --lr_decay_ite
 4. [joint-fusion/create_image_molecular_mapping.py](https://github.com/DOE-LUCID/multimodal_learning_T1/blob/main/joint_fusion/create_image_molecular_mapping.py): Creates a file/dataframe containing matched WSI, gene expression, and clinical data for the TCGA samples.
 5. [joint-fusion/generate_rnaseq_embeddings.py](https://github.com/DOE-LUCID/multimodal_learning_T1/blob/main/joint_fusion/generate_rnaseq_embeddings.py): Generates RNASeq embeddings using a VAE. The VAE can be trained using this script directly, or the trained VAE can be used to generate embeddings for new samples.
 6. [joint-fusion/generate_wsi_embeddings.py](https://github.com/DOE-LUCID/multimodal_learning_T1/blob/main/joint_fusion/generate_wsi_embeddings.py): Generates WSI embeddings using a pretrained histology foundation model. Separate networks will be implemented later that can be trained over local data. 
-
+7. [early_fusion_poc.py](https://github.com/DOE-LUCID/multimodal_learning_T1/blob/main/early_fusion_poc.py): Code for carrying out training of a GBM with the Cox-PH partial likelihood as the loss function. It uses early fusion using existing embeddings generated for the two modalities.
