@@ -13,12 +13,12 @@ from torch.cuda.amp import autocast, GradScaler
 from datasets import CustomDataset
 from models import MultimodalNetwork, print_model_summary
 from utils import mixed_collate
-
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 import pdb
 import pickle
 import os
 from pdb import set_trace
-
+torch.autograd.set_detect_anomaly(True)
 
 class CoxLossOld(nn.Module):
     def __init__(self):
@@ -81,11 +81,13 @@ class CoxLoss(nn.Module):
         for time_index in range(len(sorted_times)):
             # include only the uncensored samples
             if sorted_censor[time_index] == 1:
+                at_risk_mask = torch.arange(len(sorted_times)) <= time_index
+                at_risk_mask = at_risk_mask.to(device)
                 at_risk_sum = torch.sum(exp_sorted_log_risks[at_risk_mask]) # all are at-risk for the first sample (after arranged in descending order)
                 loss = sorted_log_risks[time_index] - torch.log(at_risk_sum + 1e-15)
                 losses.append(loss)
 
-            at_risk_mask[time_index] = False # the i'th sample is no more in the risk-set as the event has already occurred for it
+            # at_risk_mask[time_index] = False # the i'th sample is no more in the risk-set as the event has already occurred for it
 
         # if no uncensored samples are in the mini-batch return 0
         if not losses:
@@ -93,12 +95,6 @@ class CoxLoss(nn.Module):
 
         cox_loss = -torch.mean(torch.stack(losses))
         return cox_loss
-
-
-
-
-
-
 
 
 def train_nn(opt, mapping_df, device):
@@ -134,19 +130,25 @@ def train_nn(opt, mapping_df, device):
         accumulation_steps = 10
     if opt.use_mixed_precision:
         scaler = GradScaler()
+
+    # the mapping_df below should be split into 'train', 'validation', and 'test', with only the former 2 used for training
     # custom_dataset = CustomDataset(opt, mapping_df, split='train', mode=opt.input_mode)
     custom_dataset = CustomDataset(opt, mapping_df, mode=opt.input_mode)
+    # set_trace()
     train_loader = torch.utils.data.DataLoader(dataset=custom_dataset,
                                                batch_size=opt.batch_size,
                                                shuffle=True,)
                                                # collate_fn=mixed_collate)
-    print("train loader created")
+
+    # # use a separate train_loader for early fusion that should only handle the embeddings read from the files
+    # if opt.fusion_type == 'early':
+
     for epoch in tqdm(range(1, opt.num_epochs+1)):
         print("epoch: ", epoch, " out of ", opt.num_epochs)
         model.train()
         loss_epoch = 0
-        print("reached here")
-        for batch_idx, (days_to_death, days_to_last_followup, event_occurred, x_wsi, x_omic) in enumerate(train_loader):
+
+        for batch_idx, (tcga_id, days_to_death, days_to_last_followup, event_occurred, x_wsi, x_omic) in enumerate(train_loader):
             # x_wsi is a list of tensors (one tensor for each tile)
             print("batch_index: ", batch_idx, " out of ", np.ceil(len(custom_dataset) / opt.batch_size))
             x_wsi = [x.to(device) for x in x_wsi]
@@ -177,13 +179,16 @@ def train_nn(opt, mapping_df, device):
                 # the model output should be considered as beta*X to be used in the Cox loss function
 
                 # for early fusion, the model class should use the inputs from here by the generated embeddings
-                predictions = model(x_wsi=x_wsi,  # list of tensors (one for each tile)
-                                    x_omic=x_omic)
+                predictions = model(opt,
+                                    tcga_id,
+                                    x_wsi=x_wsi,  # list of tensors (one for each tile)
+                                    x_omic=x_omic,
+                                    )
                 print("Predictions: ", predictions.squeeze())
                 print("\n True days to event: ", days_to_death)
                 # set_trace()
                 # loss = F.nll_loss(predictions, grade)  # cross entropy for cancer grade classification
-                loss = cox_loss(predictions.squeeze(),   # predictions are not survival outcomes, rather beta*X
+                loss = cox_loss(predictions.squeeze(),   # predictions are not survival outcomes, rather log-risk scores beta*X
                                 days_to_death,
                                 event_occurred)  # Cox partial likelihood loss for survival outcome prediction
                 # set_trace()
