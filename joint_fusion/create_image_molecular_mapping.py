@@ -8,10 +8,11 @@ from pdb import set_trace
 # code to create a csv file containing the TCGA ID, the corresponding TCGA WSI image file names, and clinical data (dead/alive, time to death/time to last followup)
 
 base_dir = '/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/preprocessing/' # for laptop
-base_dir = '/lus/eagle/clone/g2/projects/GeomicVar/tarak/multimodal_learning_T1/preprocessing/' # for Polaris
-# path to the directory containing the tiles
+# base_dir = '/lus/eagle/clone/g2/projects/GeomicVar/tarak/multimodal_learning_T1/preprocessing/' # for Polaris
+
+# path to the directory containing the tiles/lus/eagle/clone/g2/
 tiles_dir = base_dir + 'TCGA_WSI/batch_corrected/processed_svs/tiles/256px_9.9x/' # laptop: contains stain corrected tiles for around 100 TCGA-LUAD samples
-tiles_dir = base_dir + 'TCGA_WSI/LUAD_all/svs_files/FFPE_tiles/tiles/256px_9.9x/' # Polaris: contains uncorrected tiles for 418 samples
+# tiles_dir = base_dir + 'TCGA_WSI/LUAD_all/svs_files/FFPE_tiles_otsu_B/tiles/256px_9.9x/' # tiles on Polaris (with otsu's threshold;not stain corrected for 449 samples)
 
 # path to the csv file containing the clinical data
 # input_csv_path = '/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/preprocessing/combined_clinical_TCGA-LUAD.csv'
@@ -21,23 +22,28 @@ data_clinical_df = pd.read_csv(base_dir + 'combined_clinical_TCGA-LUAD.csv', del
 data_rnaseq_df = pd.read_csv(base_dir + 'batchcorrected_combined_rnaseq_TCGA-LUAD.tsv', delimiter='\t') # ue the batch corrected rnaseq samples
 
 # csv file with the mapped data
-output_csv_path = base_dir + './mapped_data_9april.csv'
+output_csv_path = base_dir + './mapped_data_8may.csv'
 # json file with the mapped data
-output_json_path = base_dir + './mapped_data_9april.json'
+output_json_path = base_dir + './mapped_data_8may.json'
 
 png_files_dict = {}
 
+# Get the list of the extracted tiles (in png/jpg format) for each sample
+count_tcga_wsi = 0
 for tile_dir in os.listdir(tiles_dir):
-    for filename in os.listdir(tiles_dir + tile_dir):
-        if filename.endswith('.png') or filename.endswith('.jpg'):
-            tcga_id = filename.split('-')[0] + '-' + filename.split('-')[1] + '-' + filename.split('-')[2] #+ '-' + filename.split('-')[3]
-            png_file_name = filename #.rsplit('.', 1)[0]
-            # Note: there may be multiple WSIs for a single patient, so that needs to be accounted for
-            if tcga_id in png_files_dict:
-                png_files_dict[tcga_id].append(png_file_name)
-            else:
-                png_files_dict[tcga_id] = [png_file_name]
+    if "TCGA" in tile_dir:
+        count_tcga_wsi += 1
+        for filename in os.listdir(tiles_dir + tile_dir):
+            if filename.endswith('.png') or filename.endswith('.jpg'):
+                tcga_id = filename.split('-')[0] + '-' + filename.split('-')[1] + '-' + filename.split('-')[2] #+ '-' + filename.split('-')[3]
+                png_file_name = filename #.rsplit('.', 1)[0]
+                # Note: there may be multiple WSIs for a single patient, so that needs to be accounted for
+                if tcga_id in png_files_dict:
+                    png_files_dict[tcga_id].append(png_file_name)
+                else:
+                    png_files_dict[tcga_id] = [png_file_name]
 
+# check where 1 sample is missing (count_tcga_wsi = 449 whereas total number of WSIs = 450)
 # set_trace()
 clinical_data_dict = {}
 
@@ -78,15 +84,40 @@ combined_df = data_clinical_df.copy()
 combined_df['tiles'] = [[] for _ in range(len(combined_df))]
 
 for idx in combined_df.index:
+    print(idx)
     combined_df.at[idx, 'tiles'] = png_files_dict.get(idx, [])
+
+
 
 # add another columns (that is essentially a dictionary) for the rnaseq data
 print("Do gene_name have repeats: ", data_rnaseq_df['gene_name'].duplicated().any())
 print("Do gene_id have repeats: ", data_rnaseq_df['gene_id'].duplicated().any())
 
 data_rnaseq_df = data_rnaseq_df.set_index('gene_id')
+# set_trace()
+# remove housekeeping genes
+# list of housekeeping genes obtained from https://www.tau.ac.il/~elieis/HKG/
+housekeeping_genes_df = pd.read_csv('../preprocessing/housekeeping_genes.txt', sep='\t', header=None, names=['gene_name', 'accession'])
+housekeeping_genes = housekeeping_genes_df['gene_name'].str.strip().tolist() # 3804 genes
+housekeeping_genes_rows = data_rnaseq_df[data_rnaseq_df['gene_name'].isin(housekeeping_genes)] # of the 3804 housekeeping genes, 3526 are protein-coding genes
+data_rnaseq_df = data_rnaseq_df[~data_rnaseq_df['gene_name'].isin(housekeeping_genes)]
+
 
 rnaseq_transposed_df = data_rnaseq_df.drop(columns=['gene_name', 'gene_type']).T
+
+# remove lowly expressed genes
+# define the TPM threshold
+tpm_threshold = 1
+lowly_expressed_genes = rnaseq_transposed_df.columns[(rnaseq_transposed_df <= tpm_threshold).all(axis=0)]
+lowly_expressed_genes_list = lowly_expressed_genes.tolist()
+rnaseq_transposed_df_filtered = rnaseq_transposed_df.loc[:, (rnaseq_transposed_df > tpm_threshold).any(axis=0)]
+# 14800 genes remain for tpm_threshold = 1,
+
+set_trace()
+
+
+
+
 # change the index of rnaseq_transposed_df to be consistent with those of combined_df (and remove repetitions; one TCGA sample may have > 1 rnaseq sample)
 new_indices = ['TCGA-' + index.split('.')[1] + '-' + index.split('.')[2] for index in rnaseq_transposed_df.index]
 rnaseq_transposed_df.index = new_indices
@@ -112,6 +143,20 @@ print("Does the rnaseq data have any nan: ", combined_df['rnaseq_data'].apply(la
 indices_without_rnaseq_data = combined_df[combined_df['rnaseq_data'].apply(lambda d: not d)].index.tolist()
 # remove the above indices from combined_df
 combined_df = combined_df[combined_df['rnaseq_data'].apply(lambda d: bool(d))]
+
+# print("Number of rows where WSI list is empty: ", combined_df['tiles'].apply(len).eq(0).sum())
+print("Number of rows where WSI list is not empty: ", combined_df['tiles'].apply(len).ne(0).sum())
+# # check for duplicated rows based on the 'tiles' column
+# duplicated_tiles = combined_df.duplicated(subset=['tiles'])
+#
+# if duplicated_tiles.any():
+#     print("There are repeating rows in the 'tiles' column.")
+#     duplicated_rows = combined_df[combined_df.duplicated(subset=['tiles'], keep=False)]
+#     print("Duplicated rows:")
+#     print(duplicated_rows)
+# else:
+#     print("No repeating rows found in the 'tiles' column.")
+set_trace()
 
 combined_df.to_csv(output_csv_path)
 combined_df.to_json(output_json_path, orient='index')
