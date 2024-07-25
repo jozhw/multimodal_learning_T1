@@ -5,6 +5,7 @@ import csv
 import numpy as np
 import pandas as pd
 import torch
+import json
 from torch.utils.data import Dataset, DataLoader, TensorDataset
 from datasets import CustomDataset
 from torchvision import transforms
@@ -55,6 +56,8 @@ transform = Compose([
 # Lunit-DINO uses the ViT-S architecture with DINO for SSL
 # Refer to Caron et al. (2021), "Emerging Properties in Self-Supervised Vision Transformers" for DINO implementation
 
+
+# Note: change torch cache directory to a non-home location [export TORCH_HOME=./torch_cache/]
 def get_pretrained_url(key):
     URL_PREFIX = "https://github.com/lunit-io/benchmark-ssl-pathology/releases/download/pretrained-weights"
     model_zoo_registry = {
@@ -63,31 +66,6 @@ def get_pretrained_url(key):
     }
     pretrained_url = f"{URL_PREFIX}/{model_zoo_registry.get(key)}"
     return pretrained_url
-
-
-def get_wsi_embeddings(self, x_wsi):
-    # 'x_wsi' contain data from all tiles (list of tensors residing on the gpu)
-    # len(x_wsi) = number of tiles per WSI
-    # should get embeddings for each tile and average them to get embeddings at the patient level
-    dataset = CustomDatasetWSI(x_wsi, transform=transform)
-    tile_loader = DataLoader(dataset, batch_size=1, shuffle=False)
-    embeddings = []
-    # forward pass through the pretrained model to obtain the embeddings
-    with torch.no_grad():
-        # loop over all tiles within a WSI and get the averaged embedding
-        for tiles in tile_loader:
-            # set_trace()
-            tiles = tiles.to(device)
-            features = self.model(
-                tiles.squeeze(0))  # get rid of the leading dim; the model expects [batch_size, n_channels, h, w]
-            embeddings.append(features.cpu().numpy())
-    embeddings_array = np.array(embeddings)
-    # Concatenate all tile embeddings into a single numpy array
-    averaged_embeddings = np.mean(embeddings_array, axis=0)
-    # # embeddings = np.concatenate(embeddings, axis=0)
-    # embeddings = np.mean(np.vstack(embeddings), axis=1)
-    return averaged_embeddings
-
 
 class WSIEncoder:
     def __init__(self, pretrained=True, progress=False, key="DINO_p16", patch_size=16):
@@ -108,28 +86,7 @@ class WSIEncoder:
         return model
 
 
-# if this code is run directly, just generate the embeddings (one embedding for each TCGA sample) and save as a dictionary
-if __name__ == "__main__":
-
-    # df containing the samples with both WSI and rnaseq data (generated vy trainer.py)
-    mapping_df = pd.read_json(
-        "./mapping_df.json",
-        orient='index')
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--input_wsi_path', type=str,
-                        # default='/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/preprocessing/TCGA_WSI/batch_corrected/processed_svs/tiles/256px_9.9x/combined_tiles/', # on laptop
-                        default='/lus/eagle/clone/g2/projects/GeomicVar/tarak/multimodal_learning_T1/preprocessing/TCGA_WSI/batch_corrected/processed_svs/tiles/256px_9.9x/combined_tiles/',
-                        # on Polaris
-                        help='Path to input WSI tiles')
-    parser.add_argument('--input_size_wsi', type=int, default=256, help="input_size for path images")
-    opt = parser.parse_args()
-
-    custom_dataset = CustomDataset(opt, mapping_df, mode='wsi')
-    train_loader = torch.utils.data.DataLoader(dataset=custom_dataset,
-                                               batch_size=1,
-                                               shuffle=False,)
-
-    for batch_idx, (days_to_death, days_to_last_followup, event_occurred, x_wsi, x_omic) in enumerate(train_loader):
+    def get_wsi_embeddings(self, x_wsi):
         # 'x_wsi' contain data from all tiles (list of tensors residing on the gpu)
         # len(x_wsi) = number of tiles per WSI
         # should get embeddings for each tile and average them to get embeddings at the patient level
@@ -150,5 +107,72 @@ if __name__ == "__main__":
         averaged_embeddings = np.mean(embeddings_array, axis=0)
         # # embeddings = np.concatenate(embeddings, axis=0)
         # embeddings = np.mean(np.vstack(embeddings), axis=1)
-        # return averaged_embeddings
-        # main()
+        return averaged_embeddings
+
+
+# if this code is run directly, just generate the embeddings (one embedding for each TCGA sample) and save as a dictionary
+# Generates embeddings for all samples, and not only for the training dataset (the train/validation/test is done later at the prediction stage)
+if __name__ == "__main__":
+
+    # df containing the samples with both WSI and rnaseq data (generated vy trainer.py)
+    mapping_df = pd.read_json(
+        "./mapping_df.json",
+        orient='index')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--input_wsi_path', type=str,
+                        # default='/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/preprocessing/TCGA_WSI/batch_corrected/processed_svs/tiles/256px_9.9x/combined_tiles/', # on laptop
+                        # default='/lus/eagle/clone/g2/projects/GeomicVar/tarak/multimodal_learning_T1/preprocessing/TCGA_WSI/LUAD_all/svs_files/FFPE_tiles_otsu_B/tiles/256px_9.9x/combined_tiles/',
+                        default='/lus/eagle/clone/g2/projects/GeomicVar/tarak/multimodal_learning_T1/preprocessing/TCGA_WSI/LUAD_all/svs_files/FFPE_tiles_single_sample_per_patient_13july/tiles/256px_9.9x/combined/',
+                        # on Polaris
+                        # Use 'find TCGA-* -type f -print0 | xargs -0 -I {} cp {} combined/' within the tiles directory to create 'combined' to prevent errors due to large number of files (it takes a while)
+                        help='Path to input WSI tiles')
+    parser.add_argument('--input_size_wsi', type=int, default=256, help="input_size for path images")
+    opt = parser.parse_args()
+
+    custom_dataset = CustomDataset(opt, mapping_df, mode='wsi')
+    train_loader = torch.utils.data.DataLoader(dataset=custom_dataset,
+                                               batch_size=1,
+                                               shuffle=False, )
+
+    encoder = WSIEncoder()
+
+    # Initialize an empty dictionary to store TCGA IDs and embeddings
+    patient_embeddings = {}
+    # set_trace()
+    for batch_idx, (tcga_id, days_to_death, days_to_last_followup, event_occurred, x_wsi, x_omic) in enumerate(train_loader):
+        tcga_id = tcga_id[0] # # Assuming tcga_id is a batch of size 1
+        print(f"TCGA ID: {tcga_id}, batch_idx: {batch_idx}, out of {len(custom_dataset)}")
+        embeddings = encoder.get_wsi_embeddings(x_wsi) # tile averaged embedding for each patient
+        # save the embeddings in a file for using in early fusion
+        embeddings_list = embeddings.tolist() if isinstance(embeddings, np.ndarray) else embeddings
+        patient_embeddings[tcga_id] = embeddings_list
+        # if batch_idx == 5:
+        #     break
+
+    filename = "./WSI_embeddings_23july.json"
+    with open(filename, 'w') as file:
+        json.dump(patient_embeddings, file)
+
+        # set_trace()
+        # 'x_wsi' contain data from all tiles (list of tensors residing on the gpu)
+        # len(x_wsi) = number of tiles per WSI
+        # should get embeddings for each tile and average them to get embeddings at the patient level
+        # dataset = CustomDatasetWSI(x_wsi, transform=transform)
+        # tile_loader = DataLoader(dataset, batch_size=1, shuffle=False)
+        # embeddings = []
+        # # forward pass through the pretrained model to obtain the embeddings
+        # with torch.no_grad():
+        #     # loop over all tiles within a WSI and get the averaged embedding
+        #     for tiles in tile_loader:
+        #         # set_trace()
+        #         tiles = tiles.to(device)
+        #         features = WSIEncoder.model(
+        #             tiles.squeeze(0))  # get rid of the leading dim; the model expects [batch_size, n_channels, h, w]
+        #         embeddings.append(features.cpu().numpy())
+        # embeddings_array = np.array(embeddings)
+        # # Concatenate all tile embeddings into a single numpy array
+        # averaged_embeddings = np.mean(embeddings_array, axis=0)
+        # # # embeddings = np.concatenate(embeddings, axis=0)
+        # # embeddings = np.mean(np.vstack(embeddings), axis=1)
+        # # return averaged_embeddings
+        # # main()
