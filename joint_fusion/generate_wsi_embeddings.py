@@ -8,6 +8,7 @@ import torch
 import json
 from torch.utils.data import Dataset, DataLoader, TensorDataset
 from datasets import CustomDataset
+import torch.nn as nn
 from torchvision import transforms
 from PIL import Image
 from timm.models.vision_transformer import VisionTransformer
@@ -67,17 +68,19 @@ def get_pretrained_url(key):
     pretrained_url = f"{URL_PREFIX}/{model_zoo_registry.get(key)}"
     return pretrained_url
 
-class WSIEncoder:
+class WSIEncoder(nn.Module):
     def __init__(self, pretrained=True, progress=False, key="DINO_p16", patch_size=16):
+        super(WSIEncoder, self).__init__()
         self.model = self.vit_small(pretrained, progress, key, patch_size=patch_size)
         # set_trace()
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         print("Number of trainable params: ", trainable_params)
-        self.model.eval()
+        if __name__ == "__main__":
+            self.model.eval() # use train mode when imported as module
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model.to(self.device)
-        total_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        print(f"Total number of trainable parameters in the model: {total_params / 1e6}M")
+        # total_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        # print(f"Total number of trainable parameters in the model: {total_params / 1e6}M")
 
     def vit_small(self, pretrained, progress, key, patch_size=16):
         model = VisionTransformer(
@@ -108,8 +111,6 @@ class WSIEncoder:
         embeddings_array = np.array(embeddings)
         # Concatenate all tile embeddings into a single numpy array
         averaged_embeddings = np.mean(embeddings_array, axis=0)
-        # # embeddings = np.concatenate(embeddings, axis=0)
-        # embeddings = np.mean(np.vstack(embeddings), axis=1)
         return averaged_embeddings
 
 
