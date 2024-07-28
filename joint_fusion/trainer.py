@@ -26,7 +26,7 @@ from torch.profiler import profile, record_function, ProfilerActivity
 # on Polaris, activate env /lus/eagle/clone/g2/projects/GeomicVar/tarak/multimodal_learning_T1/pytorch_py3p10
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--create_new_data_mapping', type=str, default=True, help="whether to create new data mapping or use existing one")
+parser.add_argument('--create_new_data_mapping', type=str, default=False, help="whether to create new data mapping or use existing one")
 parser.add_argument('--input_mapping_data_path', type=str,
                     # default='/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/joint_fusion/', # on laptop
                     default='/lus/eagle/clone/g2/projects/GeomicVar/tarak/multimodal_learning_T1/joint_fusion/', # on Polaris
@@ -38,7 +38,7 @@ parser.add_argument('--input_path', type=str,
 parser.add_argument('--input_wsi_path', type=str,
                     # default='/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/preprocessing/TCGA_WSI/LUAD_all/svs_files/FFPE_tiles/tiles/256px_9.9x/combined_tiles/', # on laptop
                     # default='/lus/eagle/clone/g2/projects/GeomicVar/tarak/multimodal_learning_T1/preprocessing/TCGA_WSI/LUAD_all/svs_files/FFPE_tiles_otsu_B/tiles/256px_9.9x/combined_tiles/', # on Polaris
-                    default='/lus/eagle/clone/g2/projects/GeomicVar/tarak/multimodal_learning_T1/preprocessing/TCGA_WSI/LUAD_all/svs_files/FFPE_tiles_single_sample_per_patient_13july/tiles/256px_9.9x/combined_tiles/',
+                    default='/lus/eagle/clone/g2/projects/GeomicVar/tarak/multimodal_learning_T1/preprocessing/TCGA_WSI/LUAD_all/svs_files/FFPE_tiles_single_sample_per_patient_13july/tiles/256px_9.9x/combined/',
                     help='Path to input WSI tiles')
 parser.add_argument('--input_wsi_embeddings_path', type=str,
                     # default='/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/early_fusion_inputs/', # on laptop
@@ -57,7 +57,7 @@ parser.add_argument('--input_size_wsi', type=int, default=256, help="input_size 
 parser.add_argument('--embedding_dim_wsi', type=int, default=384, help="embedding dimension for WSI")
 parser.add_argument('--embedding_dim_omic', type=int, default=256, help="embedding dimension for omic")
 parser.add_argument('--input_mode', type=str, default="wsi_omic", help="wsi, omic, wsi_omic")
-parser.add_argument('--fusion_type', type=str, default="joint_omic", help="early, late, joint, joint_omic, unimodal") # "joint_omic" only trains the omic embedding generator jointly with the downstream combined model
+parser.add_argument('--fusion_type', type=str, default="joint", help="early, late, joint, joint_omic, unimodal") # "joint_omic" only trains the omic embedding generator jointly with the downstream combined model
 parser.add_argument('--profile', type=str, default=False, help="whether to profile or not")
 parser.add_argument('--use_mixed_precision', type=str, default=False, help="whether to use mixed precision calculations")
 parser.add_argument('--use_gradient_accumulation', type=str, default=False, help="whether to use gradient accumulation")
@@ -110,7 +110,7 @@ if opt.create_new_data_mapping:
 else:
     mapping_df = pd.read_json(opt.input_mapping_data_path + "mapping_df.json", orient='index')
 
-set_trace()
+# set_trace()
 from train_test import train_nn
 # train the model
 if opt.profile:
