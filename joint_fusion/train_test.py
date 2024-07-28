@@ -136,22 +136,34 @@ def train_nn(opt, mapping_df, device):
                               mode=opt.input_mode,
                               fusion_type=opt.fusion_type)
     # model should return None for the absent modality in the unimodal case
+
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs")
+        model = nn.DataParallel(model)
+
     model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=opt.lr)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=opt.lr_decay_iters, gamma=0.1)
     cox_loss = CoxLoss()
-    print(f"Model mode: {model.mode}, fusion_type: {model.fusion_type}")
+    # print(f"Model mode: {model.mode}, fusion_type: {model.fusion_type}")
+    # the original model is now accessible through the .module attribute of the DataParallel wrapper
+    print(f"Model mode: {model.module.mode}, fusion_type: {model.module.fusion_type}")
     # set_trace()
     # if model.wsi_net is not None:
     print("##############  WSINetwork Summary  ##################")
-    print_model_summary(model.wsi_net)
+    # print_model_summary(model.wsi_net)
+    if model.module.wsi_net is not None:
+        print_model_summary(model.module.wsi_net)
 
     # if model.omic_net is not None:
     print("\n ##############  OmicNetwork Summary  ##############")
-    print_model_summary(model.omic_net)
+    # print_model_summary(model.omic_net)
+    if model.module.omic_net is not None:
+        print_model_summary(model.module.omic_net)
 
     print("\n ##############  MultimodalNetwork Summary ##############")
-    print_model_summary(model)
+    # print_model_summary(model)
+    print_model_summary(model.module)
 
     # print("--------Model arch------------")
     # print(model)
@@ -196,7 +208,7 @@ def train_nn(opt, mapping_df, device):
     # # use a separate train_loader for early fusion that should only handle the embeddings read from the files
     # if opt.fusion_type == 'early':
 
-    train_loader, validation_loader, _ = create_data_loaders(opt, mapping_df)
+    train_loader, validation_loader, test_loader = create_data_loaders(opt, mapping_df)
 
     for epoch in tqdm(range(1, opt.num_epochs + 1)):
         print(f"Epoch: {epoch} out of {opt.num_epochs}")
@@ -206,7 +218,8 @@ def train_nn(opt, mapping_df, device):
         # model training in batches using the train dataloader
         for batch_idx, (tcga_id, days_to_event, event_occurred, x_wsi, x_omic) in enumerate(train_loader):
             # x_wsi is a list of tensors (one tensor for each tile)
-            print(f"Batch index: {batch_idx} out of {np.ceil(len(train_loader.dataset) / opt.batch_size)}")
+            print(f"Batch size: {opt.batch_size}")
+            print(f"Batch index: {batch_idx + 1} out of {np.ceil(len(train_loader.dataset) / opt.batch_size)}")
             x_wsi = [x.to(device) for x in x_wsi]
             x_omic = x_omic.to(device)
             days_to_event = days_to_event.to(device)
@@ -297,8 +310,9 @@ def train_nn(opt, mapping_df, device):
 def test_and_interpret(model, test_loader, cox_loss, device):
     model.eval()
     test_loss = 0.0
-    integrated_gradients = IntegratedGradients(
-        model.omic_net)  # need to check this as the flow of the gradients in backprop should be through the downstream MLP and the omic MLP
+    # integrated_gradients = IntegratedGradients(model.omic_net)  # need to check this as the flow of the gradients in backprop should be through the downstream MLP and the omic MLP
+    # integrated_gradients = IntegratedGradients(model.fused_mlp)
+    integrated_gradients = IntegratedGradients(model.forward_omic_only)
     all_attributions = []
 
     with torch.no_grad():
@@ -319,6 +333,7 @@ def test_and_interpret(model, test_loader, cox_loss, device):
 
             x_omic.requires_grad = True
             baseline = torch.zeros_like(x_omic)  # is zeros the appropriate baseline?
+            # set_trace()
             attrs, delta = integrated_gradients.attribute(inputs=x_omic,
                                                           baselines=baseline,
                                                           return_convergence_delta=True)
