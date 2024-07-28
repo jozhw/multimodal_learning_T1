@@ -204,7 +204,6 @@ class MultimodalNetwork(nn.Module):
             # wsi_embedding_tensor = torch.tensor(data_array, dtype=torch.float32, device=device).squeeze(0)
             wsi_embedding_tensor = torch.tensor(wsi_embedding)
             omic_embedding_tensor = torch.tensor(omic_embedding)
-            set_trace()
             combined_embedding = torch.cat((wsi_embedding_tensor, omic_embedding_tensor), dim=1)
 
         combined_embedding = torch.tensor(combined_embedding).to(device)
