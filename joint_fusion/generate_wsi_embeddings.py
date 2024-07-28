@@ -70,6 +70,9 @@ def get_pretrained_url(key):
 class WSIEncoder:
     def __init__(self, pretrained=True, progress=False, key="DINO_p16", patch_size=16):
         self.model = self.vit_small(pretrained, progress, key, patch_size=patch_size)
+        # set_trace()
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        print("Number of trainable params: ", trainable_params)
         self.model.eval()
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model.to(self.device)
