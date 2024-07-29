@@ -16,6 +16,7 @@ class CustomDataset(Dataset):
         print("------------------- mapping_df.columns ----------------", mapping_df.columns)
         self.opt = opt
         self.mapping_df = mapping_df
+        # transformations/augmentations for WSI data
         self.transforms = transforms.Compose([
             transforms.RandomHorizontalFlip(0.5),
             transforms.RandomVerticalFlip(0.5),
@@ -25,23 +26,32 @@ class CustomDataset(Dataset):
             transforms.ToTensor(),
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
 
+        # log transform for rnaseq data
+        self.mapping_df['rnaseq_data'] = self.mapping_df['rnaseq_data'].apply(
+            lambda x: np.log1p(np.array(list(x.values()))))
+
     def __getitem__(self, index):
         if torch.is_tensor(index):
             index = index.tolist()
         sample = self.mapping_df.iloc[index]
+        tcga_id = self.mapping_df.index[index]
         days_to_death = sample['days_to_death']
         days_to_last_followup = sample['days_to_last_followup']
+        days_to_event = sample['time']
         event_occurred = 1 if sample['event_occurred'] == 'Dead' else 0
         tiles = sample['tiles']
         # convert these tile paths to images
         # x_wsi = [Image.open(self.opt.input_wsi_path + tile).convert('RGB') for tile in tiles] #.convert('RGB')
         x_wsi = [self.transforms(Image.open(self.opt.input_wsi_path + tile)) for tile in tiles]
         rnaseq_data = sample['rnaseq_data']
-        x_omic = torch.tensor(list(rnaseq_data.values()))
+        # x_omic = torch.tensor(list(rnaseq_data.values()))
+        x_omic = torch.tensor(rnaseq_data, dtype=torch.float32)
         if self.transforms:
             pass
 
-        return days_to_death, days_to_last_followup, event_occurred, x_wsi, x_omic
+        # return tcga_id, days_to_death, days_to_last_followup, event_occurred, x_wsi, x_omic
+
+        return tcga_id, days_to_event, event_occurred, x_wsi, x_omic
 
     def __len__(self):
         return len(self.mapping_df)
