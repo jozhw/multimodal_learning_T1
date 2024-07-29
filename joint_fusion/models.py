@@ -105,7 +105,7 @@ class OmicNetwork(nn.Module): # MLP for WSI tile-level embedding generation
             nn.Linear(19962, 512),
             nn.ReLU(),
             nn.Linear(512, embedding_dim),
-            nn.ReLU()
+            # nn.ReLU()
         )
 
     def forward(self, x):
@@ -119,8 +119,8 @@ class MultimodalNetwork(nn.Module):
 
         self.mode = mode  # wsi_omic, wsi or omic
         self.fusion_type = fusion_type
-        if self.fusion_type not in ['early', 'joint_omic']: # guard against calling and inferencing using WSI encoder for early fusion or joint_omic fusion
-            self.wsi_encoder = WSIEncoder()
+        # if self.fusion_type not in ['early', 'joint_omic']: # guard against calling and inferencing using WSI encoder for early fusion or joint_omic fusion
+        #     self.wsi_encoder = WSIEncoder()
 
         if self.mode != 'wsi_omic':
             self.fusion_type = None
@@ -130,6 +130,7 @@ class MultimodalNetwork(nn.Module):
         if self.mode == 'wsi_omic':
             self.wsi_net = WSINetwork(embedding_dim_wsi)
             self.omic_net = OmicNetwork(embedding_dim_omic)
+            # self.wsi_encoder = WSIEncoder()
             # Note: the above networks won't be used for early fusion
             embedding_dim = self.wsi_net.embedding_dim + self.omic_net.embedding_dim
 
@@ -151,6 +152,8 @@ class MultimodalNetwork(nn.Module):
             nn.ReLU(),
             nn.Linear(256, 1)
         )
+        print("##############  fused MLP Summary  ##################")
+        print_model_summary(self.fused_mlp)
 
         self.stored_omic_embedding = None
 
@@ -200,10 +203,8 @@ class MultimodalNetwork(nn.Module):
         elif self.mode == 'omic':
             combined_embedding = omic_embedding
         elif self.mode == 'wsi_omic' and (self.fusion_type == 'joint_omic' or self.fusion_type == 'joint'):
-            # data_array = np.array(wsi_embedding.applymap(np.array).values.tolist())
-            # wsi_embedding_tensor = torch.tensor(data_array, dtype=torch.float32, device=device).squeeze(0)
-            wsi_embedding_tensor = torch.tensor(wsi_embedding)
-            omic_embedding_tensor = torch.tensor(omic_embedding)
+            # wsi_embedding_tensor = torch.tensor(wsi_embedding)
+            # omic_embedding_tensor = torch.tensor(omic_embedding)
             combined_embedding = torch.cat((wsi_embedding_tensor, omic_embedding_tensor), dim=1)
 
         combined_embedding = torch.tensor(combined_embedding).to(device)
@@ -224,9 +225,9 @@ def print_model_summary(model):
         print("model is NoneType")
         return
     total_params = sum(p.numel() for p in model.parameters())
-    print("NOTE: these do not account for the memory required for storing the optimizer states and the activations")
+    # print("NOTE: these do not account for the memory required for storing the optimizer states and the activations")
     print(f"Total Parameters (million): {total_params / 1e6}")
     memory_bytes = total_params * 4  # 4 bytes for a torch.float32 model parameter
     # memory_mb = memory_bytes / (1024 ** 2)
     memory_gb = memory_bytes / 1e9
-    print(f"Estimated Memory (GB): {memory_gb}")
+    # print(f"Estimated Memory (GB): {memory_gb}")
