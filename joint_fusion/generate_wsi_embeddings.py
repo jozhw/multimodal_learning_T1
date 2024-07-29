@@ -75,6 +75,7 @@ class WSIEncoder(nn.Module):
         # set_trace()
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         print("Number of trainable params: ", trainable_params)
+        # need to fix this when early fusion is integrated. Right, early fusion is carried out generating the embeddings separately, and using a different code for the fusion ('early_fusion_poc_combine_test_validation.py')
         if __name__ == "__main__":
             self.model.eval() # use train mode when imported as module
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -99,18 +100,29 @@ class WSIEncoder(nn.Module):
         dataset = CustomDatasetWSI(x_wsi, transform=transform)
         tile_loader = DataLoader(dataset, batch_size=1, shuffle=False)
         embeddings = []
-        # forward pass through the pretrained model to obtain the embeddings
-        with torch.no_grad():
-            # loop over all tiles within a WSI and get the averaged embedding
+        if __name__ == "__main__":
+            # forward pass through the pretrained model to obtain the embeddings
+            with torch.no_grad(): # using in evaluation mode for early fusion
+                # loop over all tiles within a WSI and get the averaged embedding
+                for tiles in tile_loader:
+                    # set_trace()
+                    tiles = tiles.to(device)
+                    features = self.model(
+                        tiles.squeeze(0))  # get rid of the leading dim; the model expects [batch_size, n_channels, h, w]
+                    embeddings.append(features.cpu().numpy())
+            embeddings_array = np.array(embeddings)
+            # Concatenate all tile embeddings into a single numpy array
+            averaged_embeddings = np.mean(embeddings_array, axis=0)
+        else:
             for tiles in tile_loader:
-                # set_trace()
                 tiles = tiles.to(device)
-                features = self.model(
-                    tiles.squeeze(0))  # get rid of the leading dim; the model expects [batch_size, n_channels, h, w]
-                embeddings.append(features.cpu().numpy())
-        embeddings_array = np.array(embeddings)
-        # Concatenate all tile embeddings into a single numpy array
-        averaged_embeddings = np.mean(embeddings_array, axis=0)
+                features = self.model(tiles.squeeze(0))  # Get rid of the leading dim; the model expects [batch_size, n_channels, h, w]
+                embeddings.append(features)
+            # stack embeddings to create a single tensor
+            embeddings_tensor = torch.stack(embeddings)
+            # average the embeddings across the tile dimension
+            averaged_embeddings = torch.mean(embeddings_tensor, dim=0)
+            
         return averaged_embeddings
 
 
