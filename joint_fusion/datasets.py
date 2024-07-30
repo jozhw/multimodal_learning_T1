@@ -12,19 +12,27 @@ from torchvision import datasets, transforms
 
 
 class CustomDataset(Dataset):
-    def __init__(self, opt, mapping_df, split=None, mode='wsi'):
+    def __init__(self, opt, mapping_df, split=None, mode='wsi', train_val_test = "train"):
         print("------------------- mapping_df.columns ----------------", mapping_df.columns)
         self.opt = opt
+        self.train_val_test = train_val_test
         self.mapping_df = mapping_df
         # transformations/augmentations for WSI data
-        self.transforms = transforms.Compose([
-            transforms.RandomHorizontalFlip(0.5),
-            transforms.RandomVerticalFlip(0.5),
-            transforms.RandomCrop(opt.input_size_wsi),
-            # transforms.RandomCrop(256), #hardcoded
-            transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.05, hue=0.01),
-            transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
+        if self.train_val_test == "train":
+            self.transforms = transforms.Compose([
+                transforms.RandomHorizontalFlip(0.5),
+                transforms.RandomVerticalFlip(0.5),
+                # transforms.RandomCrop(opt.input_size_wsi),
+                # transforms.RandomCrop(256), # cropping or resizing not required as the tiles are already 256 x 256
+                transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.05, hue=0.01),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.70322989, 0.53606487, 0.66096631], std=[0.21716536, 0.26081574, 0.20723464]) # from lunit (https://github.com/lunit-io/benchmark-ssl-pathology/releases)
+            ])
+        else:
+            self.transforms = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.70322989, 0.53606487, 0.66096631], std=[0.21716536, 0.26081574, 0.20723464]),
+            ])
 
         # log transform for rnaseq data
         self.mapping_df['rnaseq_data'] = self.mapping_df['rnaseq_data'].apply(

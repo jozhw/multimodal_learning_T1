@@ -2,6 +2,7 @@ import random
 from tqdm import tqdm
 import numpy as np
 import torch
+import os
 
 from torch import nn
 import torch.backends.cudnn as cudnn
@@ -10,6 +11,7 @@ from torch.utils.data import RandomSampler
 # import torch.optim.lr_scheduler as lr_scheduler
 from torchsummary import summary
 from torch.cuda.amp import autocast, GradScaler
+from torch.utils.tensorboard import SummaryWriter
 from datasets import CustomDataset
 from models import MultimodalNetwork, OmicNetwork, print_model_summary
 from sklearn.model_selection import train_test_split
@@ -21,6 +23,8 @@ import pickle
 import os
 from pdb import set_trace
 from captum.attr import IntegratedGradients
+
+import torchviz
 
 torch.autograd.set_detect_anomaly(True)
 
@@ -109,22 +113,31 @@ def create_data_loaders(opt, mapping_df):
     mapping_df_val, mapping_df_test = train_test_split(temp_df, test_size=0.5, random_state=40)
 
     train_loader = torch.utils.data.DataLoader(
-        dataset=CustomDataset(opt, mapping_df_train, mode=opt.input_mode),
+        dataset=CustomDataset(opt, mapping_df_train, mode=opt.input_mode, train_val_test = "train"),
         batch_size=opt.batch_size,
         shuffle=True,
+        num_workers=4,
+        prefetch_factor=2,
+        pin_memory=True
         # collate_fn=mixed_collate  # Uncomment if needed
     )
 
     validation_loader = torch.utils.data.DataLoader(
-        dataset=CustomDataset(opt, mapping_df_val, mode=opt.input_mode),
+        dataset=CustomDataset(opt, mapping_df_val, mode=opt.input_mode, train_val_test = "val"),
         batch_size=opt.batch_size,
         shuffle=True,
+        num_workers=4,
+        prefetch_factor=2,
+        pin_memory=True
     )
 
     test_loader = torch.utils.data.DataLoader(
-        dataset=CustomDataset(opt, mapping_df_test, mode=opt.input_mode),
+        dataset=CustomDataset(opt, mapping_df_test, mode=opt.input_mode, train_val_test = "test"),
         batch_size=opt.batch_size,
         shuffle=True,
+        num_workers=4,
+        prefetch_factor=2,
+        pin_memory=True
     )
 
     return train_loader, validation_loader, test_loader
@@ -145,6 +158,16 @@ def train_nn(opt, mapping_df, device):
     optimizer = torch.optim.Adam(model.parameters(), lr=opt.lr)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=opt.lr_decay_iters, gamma=0.1)
     cox_loss = CoxLoss()
+
+    log_dir = os.path.abspath("./logs")
+    writer = SummaryWriter(log_dir=log_dir)
+
+    # logging the initial model summary and configuration
+    if hasattr(model, 'module'):
+        model_to_log = model.module
+    else:
+        model_to_log = model
+    # set_trace()
     # print(f"Model mode: {model.mode}, fusion_type: {model.fusion_type}")
     # the original model is now accessible through the .module attribute of the DataParallel wrapper
     print(f"Model mode: {model.module.mode}, fusion_type: {model.module.fusion_type}")
@@ -154,22 +177,19 @@ def train_nn(opt, mapping_df, device):
     # print_model_summary(model.wsi_net)
     if model.module.wsi_net is not None:
         print_model_summary(model.module.wsi_net)
+        # print_total_parameters(model.module.wsi_net)
 
     # if model.omic_net is not None:
     print("\n ##############  OmicNetwork Summary  ##############")
     # print_model_summary(model.omic_net)
     if model.module.omic_net is not None:
         print_model_summary(model.module.omic_net)
+        # print_total_parameters(model.module.omic_net)
 
     print("\n ##############  MultimodalNetwork Summary ##############")
     # print_model_summary(model)
     print_model_summary(model.module)
-
-    # print("--------Model arch------------")
-    # print(model)
-    # print("--------WSI Model summary -----------")
-    # if model.wsi_net is not None:
-    #     summary(model.wsi_net, input_size=(3, 1024, 1024))
+    # print_total_parameters(model)
 
     if opt.use_gradient_accumulation:
         accumulation_steps = 10
@@ -210,8 +230,8 @@ def train_nn(opt, mapping_df, device):
 
     train_loader, validation_loader, test_loader = create_data_loaders(opt, mapping_df)
 
-    for epoch in tqdm(range(1, opt.num_epochs + 1)):
-        print(f"Epoch: {epoch} out of {opt.num_epochs}")
+    for epoch in tqdm(range(0, opt.num_epochs)):
+        print(f"Epoch: {epoch + 1} out of {opt.num_epochs}")
         model.train()
         loss_epoch = 0
 
@@ -262,8 +282,19 @@ def train_nn(opt, mapping_df, device):
                 print("\n loss (train): ", loss.data.item())
                 loss_epoch += loss.data.item() * len(
                     x_omic)  # multiplying loss by batch size for accurate epoch averaging
-                loss.backward()
+                loss.backward(
+                    retain_graph=True if epoch == 0 and batch_idx == 0 else False)  # tensors retained to allow backpropagation for torchhviz
                 optimizer.step()
+
+                # if epoch == 0 and batch_idx == 0:
+                #     # Note: graphviz is fine for small graphs, but for large graphs it becomes cumbersome so instead opting TensorBoard for the latter
+                #     # graph = torchviz.make_dot(loss, params=dict(model.named_parameters()))
+                #     # file_path = os.path.abspath("data_flow_graph")
+                #     # graph.render(file_path, format="png")
+                #     # print(f"Graph saved as {file_path}.png. You can open it manually.")
+                #
+                #     writer.add_graph(model_to_log, [x_wsi[0], x_omic])
+                #     print(f"Computation graph saved to TensorBoard logs at {log_dir}")
 
         train_loss = loss_epoch / len(train_loader.dataset)  # average training loss per sample for the epoch
         scheduler.step()  # step scheduler after each epoch
@@ -305,6 +336,15 @@ def train_nn(opt, mapping_df, device):
                 print("Validation loss: ", val_loss)
 
     return model, optimizer
+
+
+def print_total_parameters(model):
+    total_params = 0
+    for name, param in model.named_parameters():
+        print(f"{name}: {param.numel()} parameters")
+        total_params += param.numel()
+    print(f"Total parameters: {total_params / 1e6} million")
+    print("Number of trainable params: ", sum(p.numel() for p in model.parameters() if p.requires_grad))
 
 
 def test_and_interpret(model, test_loader, cox_loss, device):
