@@ -203,8 +203,8 @@ class MultimodalNetwork(nn.Module):
         elif self.mode == 'omic':
             combined_embedding = omic_embedding
         elif self.mode == 'wsi_omic' and (self.fusion_type == 'joint_omic' or self.fusion_type == 'joint'):
-            # wsi_embedding_tensor = torch.tensor(wsi_embedding)
-            # omic_embedding_tensor = torch.tensor(omic_embedding)
+            wsi_embedding_tensor = torch.tensor(wsi_embedding)
+            omic_embedding_tensor = torch.tensor(omic_embedding)
             combined_embedding = torch.cat((wsi_embedding_tensor, omic_embedding_tensor), dim=1)
 
         combined_embedding = torch.tensor(combined_embedding).to(device)
@@ -227,7 +227,10 @@ def print_model_summary(model):
     total_params = sum(p.numel() for p in model.parameters())
     # print("NOTE: these do not account for the memory required for storing the optimizer states and the activations")
     print(f"Total Parameters (million): {total_params / 1e6}")
-    memory_bytes = total_params * 4  # 4 bytes for a torch.float32 model parameter
+    total_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Number of trainable params (million): {total_trainable_params / 1e6}")
+
+    # memory_bytes = total_params * 4  # 4 bytes for a torch.float32 model parameter
     # memory_mb = memory_bytes / (1024 ** 2)
-    memory_gb = memory_bytes / 1e9
+    # memory_gb = memory_bytes / 1e9
     # print(f"Estimated Memory (GB): {memory_gb}")

@@ -72,7 +72,19 @@ class WSIEncoder(nn.Module):
     def __init__(self, pretrained=True, progress=False, key="DINO_p16", patch_size=16):
         super(WSIEncoder, self).__init__()
         self.model = self.vit_small(pretrained, progress, key, patch_size=patch_size)
-        # set_trace()
+
+        # print(self.model)  # print the entire model architecture
+        # # print all children layers
+        # for name, layer in self.model.named_children():
+        #     print(name, layer)
+        # # print all modules
+        # for name, module in self.model.named_modules():
+        #     print(name, module)
+        #
+        # for name, param in self.model.named_parameters():
+        #     # if "head" not in name:
+        #     param.requires_grad = False
+
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         print("Number of trainable params: ", trainable_params)
         # need to fix this when early fusion is integrated. Right, early fusion is carried out generating the embeddings separately, and using a different code for the fusion ('early_fusion_poc_combine_test_validation.py')
@@ -87,6 +99,23 @@ class WSIEncoder(nn.Module):
         model = VisionTransformer(
             img_size=224, patch_size=patch_size, embed_dim=384, num_heads=6, num_classes=0
         )
+
+        # freeze all layers
+        for param in model.parameters():
+            param.requires_grad = False
+
+        # unfreeze the last transformer block (block 11)
+        for param in model.blocks[11].parameters():
+            param.requires_grad = True
+
+        # unfreeze the final norm layer
+        for param in model.norm.parameters():
+            param.requires_grad = True
+
+        # print the trainable params
+        for name, param in model.named_parameters():
+            print(f"{name}: {param.requires_grad}")
+
         if pretrained:
             pretrained_url = get_pretrained_url(key)
             model.load_state_dict(torch.hub.load_state_dict_from_url(pretrained_url, progress=progress))
@@ -107,8 +136,7 @@ class WSIEncoder(nn.Module):
                 for tiles in tile_loader:
                     # set_trace()
                     tiles = tiles.to(device)
-                    features = self.model(
-                        tiles.squeeze(0))  # get rid of the leading dim; the model expects [batch_size, n_channels, h, w]
+                    features = self.model(tiles.squeeze(0))  # get rid of the leading dim; the model expects [batch_size, n_channels, h, w]
                     embeddings.append(features.cpu().numpy())
             embeddings_array = np.array(embeddings)
             # Concatenate all tile embeddings into a single numpy array
@@ -117,12 +145,27 @@ class WSIEncoder(nn.Module):
             for tiles in tile_loader:
                 tiles = tiles.to(device)
                 features = self.model(tiles.squeeze(0))  # Get rid of the leading dim; the model expects [batch_size, n_channels, h, w]
-                embeddings.append(features)
-            # stack embeddings to create a single tensor
+                embeddings.append(features.cpu())
             embeddings_tensor = torch.stack(embeddings)
             # average the embeddings across the tile dimension
             averaged_embeddings = torch.mean(embeddings_tensor, dim=0)
-            
+
+            # # instead of storing all embeddings in a list, accumulate the sum of embeddings directly to prevent OOM error
+            # total_embeddings = None
+            # count = 0
+            #
+            # for tiles in tile_loader:
+            #     tiles = tiles.to(device)
+            #     features = self.model(tiles.squeeze(0))  # get rid of the leading dim; the model expects [batch_size, n_channels, h, w]
+            #
+            #     if total_embeddings is None:
+            #         total_embeddings = features
+            #     else:
+            #         total_embeddings += features
+            #     count += 1
+            #
+            # averaged_embeddings = total_embeddings / count
+
         return averaged_embeddings
 
 
