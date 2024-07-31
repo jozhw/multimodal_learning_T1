@@ -23,7 +23,8 @@ from sksurv.ensemble import GradientBoostingSurvivalAnalysis
 from sksurv.util import Surv
 from sksurv.metrics import concordance_index_censored
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0" # force to use only one GPU to avoid any issues with the Cox PH loss function (that requires data for all at-risk samples)
+os.environ[
+    "CUDA_VISIBLE_DEVICES"] = "0"  # force to use only one GPU to avoid any issues with the Cox PH loss function (that requires data for all at-risk samples)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 import pdb
 import pickle
@@ -98,9 +99,10 @@ class CoxLoss(nn.Module):
         for time_index in range(len(sorted_times)):
             # include only the uncensored samples (i.e., for whom the event has happened)
             if sorted_censor[time_index] == 1:
-                at_risk_mask = torch.arange(len(sorted_times)) <= time_index # less than, as sorted_times is in descending order
+                at_risk_mask = torch.arange(
+                    len(sorted_times)) <= time_index  # less than, as sorted_times is in descending order
                 at_risk_mask = at_risk_mask.to(device)
-                at_risk_sum = torch.sum(exp_sorted_log_risks[     # 2nd term on the RHS
+                at_risk_sum = torch.sum(exp_sorted_log_risks[  # 2nd term on the RHS
                                             at_risk_mask])  # all are at-risk for the first sample (after arranged in descending order)
                 loss = sorted_log_risks[time_index] - torch.log(at_risk_sum + 1e-15)
                 losses.append(loss)
@@ -120,17 +122,17 @@ def create_data_loaders(opt, mapping_df):
     mapping_df_val, mapping_df_test = train_test_split(temp_df, test_size=0.5, random_state=40)
 
     train_loader = torch.utils.data.DataLoader(
-        dataset=CustomDataset(opt, mapping_df_train, mode=opt.input_mode, train_val_test = "train"),
+        dataset=CustomDataset(opt, mapping_df_train, mode=opt.input_mode, train_val_test="train"),
         batch_size=opt.batch_size,
         shuffle=True,
-        num_workers=4,
+        num_workers=16,
         prefetch_factor=2,
         pin_memory=True
         # collate_fn=mixed_collate  # Uncomment if needed
     )
 
     validation_loader = torch.utils.data.DataLoader(
-        dataset=CustomDataset(opt, mapping_df_val, mode=opt.input_mode, train_val_test = "val"),
+        dataset=CustomDataset(opt, mapping_df_val, mode=opt.input_mode, train_val_test="val"),
         batch_size=opt.val_batch_size,
         shuffle=True,
         num_workers=4,
@@ -139,7 +141,7 @@ def create_data_loaders(opt, mapping_df):
     )
 
     test_loader = torch.utils.data.DataLoader(
-        dataset=CustomDataset(opt, mapping_df_test, mode=opt.input_mode, train_val_test = "test"),
+        dataset=CustomDataset(opt, mapping_df_test, mode=opt.input_mode, train_val_test="test"),
         batch_size=opt.batch_size,
         shuffle=True,
         num_workers=4,
@@ -293,7 +295,7 @@ def train_nn(opt, mapping_df, device):
                                 days_to_event,
                                 event_occurred)  # Cox partial likelihood loss for survival outcome prediction
                 print("\n loss (train): ", loss.data.item())
-                loss_epoch += loss.data.item() * opt.batch_size # multiplying loss by batch size for accurate epoch averaging
+                loss_epoch += loss.data.item() * len(tcga_id)  # multiplying loss by batch size for accurate epoch averaging
                 loss.backward(
                     retain_graph=True if epoch == 0 and batch_idx == 0 else False)  # tensors retained to allow backpropagation for torchhviz
                 optimizer.step()
@@ -309,6 +311,7 @@ def train_nn(opt, mapping_df, device):
                 #     print(f"Computation graph saved to TensorBoard logs at {log_dir}")
 
         train_loss = loss_epoch / len(train_loader.dataset)  # average training loss per sample for the epoch
+        writer.add_scalar('Loss/train', train_loss, epoch)
         scheduler.step()  # step scheduler after each epoch
         print("\n train loss over epoch: ", train_loss)
 
@@ -320,12 +323,12 @@ def train_nn(opt, mapping_df, device):
         all_events = []
 
         # if (epoch + 1) % 1:
-        with torch.no_grad(): # inference on the validation data
+        with torch.no_grad():  # inference on the validation data
             for batch_idx, (tcga_id, days_to_event, event_occurred, x_wsi, x_omic) in enumerate(validation_loader):
                 # x_wsi is a list of tensors (one tensor for each tile)
                 print(f"Batch size: {len(validation_loader.dataset)}")
                 print(
-                    f"Validation Batch index: {batch_idx} out of {np.ceil(len(validation_loader.dataset) / opt.val_batch_size)}")
+                    f"Validation Batch index: {batch_idx+1} out of {np.ceil(len(validation_loader.dataset) / opt.val_batch_size)}")
                 x_wsi = [x.to(device) for x in x_wsi]
                 x_omic = x_omic.to(device)
                 days_to_event = days_to_event.to(device)
@@ -343,7 +346,7 @@ def train_nn(opt, mapping_df, device):
                                 event_occurred)  # Cox partial likelihood loss for survival outcome prediction
                 # set_trace()
                 print("\n loss (validation): ", loss.data.item())
-                val_loss_epoch += loss.data.item() * opt.val_batch_size
+                val_loss_epoch += loss.data.item() * len(tcga_id)
                 all_predictions.append(outputs.squeeze())
                 all_times.append(days_to_event)
                 all_events.append(event_occurred)
@@ -353,6 +356,8 @@ def train_nn(opt, mapping_df, device):
                 print(f"saved model checkpoint at epoch {epoch} to {model_path}")
 
             val_loss = val_loss_epoch / len(validation_loader.dataset)
+            writer.add_scalar('Loss/validation', val_loss, epoch)
+
             all_predictions = torch.cat(all_predictions)
             all_times = torch.cat(all_times)
             all_events = torch.cat(all_events)
@@ -369,6 +374,7 @@ def train_nn(opt, mapping_df, device):
             torch.save(model.state_dict(), model_path)
             print(f"saved model checkpoint at epoch {epoch} to {model_path}")
 
+    writer.close()
     return model, optimizer
 
 
