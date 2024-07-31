@@ -17,6 +17,13 @@ from models import MultimodalNetwork, OmicNetwork, print_model_summary
 from sklearn.model_selection import train_test_split
 from utils import mixed_collate
 
+from lifelines import KaplanMeierFitter
+from lifelines.statistics import logrank_test
+from sksurv.ensemble import GradientBoostingSurvivalAnalysis
+from sksurv.util import Surv
+from sksurv.metrics import concordance_index_censored
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "0" # force to use only one GPU to avoid any issues with the Cox PH loss function (that requires data for all at-risk samples)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 import pdb
 import pickle
@@ -89,11 +96,11 @@ class CoxLoss(nn.Module):
 
         losses = []
         for time_index in range(len(sorted_times)):
-            # include only the uncensored samples
+            # include only the uncensored samples (i.e., for whom the event has happened)
             if sorted_censor[time_index] == 1:
-                at_risk_mask = torch.arange(len(sorted_times)) <= time_index
+                at_risk_mask = torch.arange(len(sorted_times)) <= time_index # less than, as sorted_times is in descending order
                 at_risk_mask = at_risk_mask.to(device)
-                at_risk_sum = torch.sum(exp_sorted_log_risks[
+                at_risk_sum = torch.sum(exp_sorted_log_risks[     # 2nd term on the RHS
                                             at_risk_mask])  # all are at-risk for the first sample (after arranged in descending order)
                 loss = sorted_log_risks[time_index] - torch.log(at_risk_sum + 1e-15)
                 losses.append(loss)
@@ -124,7 +131,7 @@ def create_data_loaders(opt, mapping_df):
 
     validation_loader = torch.utils.data.DataLoader(
         dataset=CustomDataset(opt, mapping_df_val, mode=opt.input_mode, train_val_test = "val"),
-        batch_size=opt.batch_size,
+        batch_size=opt.val_batch_size,
         shuffle=True,
         num_workers=4,
         prefetch_factor=2,
@@ -170,25 +177,32 @@ def train_nn(opt, mapping_df, device):
     # set_trace()
     # print(f"Model mode: {model.mode}, fusion_type: {model.fusion_type}")
     # the original model is now accessible through the .module attribute of the DataParallel wrapper
-    print(f"Model mode: {model.module.mode}, fusion_type: {model.module.fusion_type}")
+    if hasattr(model, 'module'):
+        print(f"Model mode: {model.module.mode}, fusion_type: {model.module.fusion_type}")
+    else:
+        print(f"Model mode: {model.mode}, fusion_type: {model.fusion_type}")
     # set_trace()
     # if model.wsi_net is not None:
     print("##############  WSINetwork Summary  ##################")
     # print_model_summary(model.wsi_net)
-    if model.module.wsi_net is not None:
+    if hasattr(model, 'module'):
         print_model_summary(model.module.wsi_net)
-        # print_total_parameters(model.module.wsi_net)
+    else:
+        print_model_summary(model.wsi_net)
 
     # if model.omic_net is not None:
     print("\n ##############  OmicNetwork Summary  ##############")
     # print_model_summary(model.omic_net)
-    if model.module.omic_net is not None:
+    if hasattr(model, 'module'):
         print_model_summary(model.module.omic_net)
-        # print_total_parameters(model.module.omic_net)
+    else:
+        print_model_summary(model.omic_net)
 
     print("\n ##############  MultimodalNetwork Summary ##############")
-    # print_model_summary(model)
-    print_model_summary(model.module)
+    if hasattr(model, 'module'):
+        print_model_summary(model.module)
+    else:
+        print_model_summary(model)
     # print_total_parameters(model)
 
     if opt.use_gradient_accumulation:
@@ -278,10 +292,8 @@ def train_nn(opt, mapping_df, device):
                                 # predictions are not survival outcomes, rather log-risk scores beta*X
                                 days_to_event,
                                 event_occurred)  # Cox partial likelihood loss for survival outcome prediction
-                # set_trace()
                 print("\n loss (train): ", loss.data.item())
-                loss_epoch += loss.data.item() * len(
-                    x_omic)  # multiplying loss by batch size for accurate epoch averaging
+                loss_epoch += loss.data.item() * opt.batch_size # multiplying loss by batch size for accurate epoch averaging
                 loss.backward(
                     retain_graph=True if epoch == 0 and batch_idx == 0 else False)  # tensors retained to allow backpropagation for torchhviz
                 optimizer.step()
@@ -298,42 +310,64 @@ def train_nn(opt, mapping_df, device):
 
         train_loss = loss_epoch / len(train_loader.dataset)  # average training loss per sample for the epoch
         scheduler.step()  # step scheduler after each epoch
-        print("train loss: ", train_loss)
+        print("\n train loss over epoch: ", train_loss)
 
         # get predictions on the validation dataset (to keep track of validation loss during training)
         model.eval()
         val_loss_epoch = 0.0
-        if epoch % 100:
-            with torch.no_grad():
-                for batch_idx, (tcga_id, days_to_event, event_occurred, x_wsi, x_omic) in enumerate(validation_loader):
-                    # x_wsi is a list of tensors (one tensor for each tile)
-                    print(
-                        f"Validation Batch index: {batch_idx} out of {np.ceil(len(validation_loader.dataset) / opt.batch_size)}")
-                    x_wsi = [x.to(device) for x in x_wsi]
-                    x_omic = x_omic.to(device)
-                    days_to_event = days_to_event.to(device)
-                    event_occurred = event_occurred.to(device)
-                    print("Days to event: ", days_to_event)
-                    print("event occurred: ", event_occurred)
-                    outputs = model(opt,
-                                    tcga_id,
-                                    x_wsi=x_wsi,  # list of tensors (one for each tile)
-                                    x_omic=x_omic,
-                                    )
-                    loss = cox_loss(outputs.squeeze(),
-                                    # predictions are not survival outcomes, rather log-risk scores beta*X
-                                    days_to_event,
-                                    event_occurred)  # Cox partial likelihood loss for survival outcome prediction
-                    # set_trace()
-                    print("\n loss (validation): ", loss.data.item())
-                    val_loss_epoch += loss.data.item() * len(x_omic)
+        all_predictions = []
+        all_times = []
+        all_events = []
 
-                    model_path = os.path.join("./saved_models", f"model_epoch_{epoch}.pt")
-                    torch.save(model.state_dict(), model_path)
-                    print(f"saved model checkpoint at epoch {epoch} to {model_path}")
+        # if (epoch + 1) % 1:
+        with torch.no_grad(): # inference on the validation data
+            for batch_idx, (tcga_id, days_to_event, event_occurred, x_wsi, x_omic) in enumerate(validation_loader):
+                # x_wsi is a list of tensors (one tensor for each tile)
+                print(f"Batch size: {len(validation_loader.dataset)}")
+                print(
+                    f"Validation Batch index: {batch_idx} out of {np.ceil(len(validation_loader.dataset) / opt.val_batch_size)}")
+                x_wsi = [x.to(device) for x in x_wsi]
+                x_omic = x_omic.to(device)
+                days_to_event = days_to_event.to(device)
+                event_occurred = event_occurred.to(device)
+                print("Days to event: ", days_to_event)
+                print("event occurred: ", event_occurred)
+                outputs = model(opt,
+                                tcga_id,
+                                x_wsi=x_wsi,  # list of tensors (one for each tile)
+                                x_omic=x_omic,
+                                )
+                loss = cox_loss(outputs.squeeze(),
+                                # predictions are not survival outcomes, rather log-risk scores beta*X
+                                days_to_event,
+                                event_occurred)  # Cox partial likelihood loss for survival outcome prediction
+                # set_trace()
+                print("\n loss (validation): ", loss.data.item())
+                val_loss_epoch += loss.data.item() * opt.val_batch_size
+                all_predictions.append(outputs.squeeze())
+                all_times.append(days_to_event)
+                all_events.append(event_occurred)
 
-                val_loss = val_loss_epoch / len(validation_loader.dataset)
-                print("Validation loss: ", val_loss)
+                model_path = os.path.join("./saved_models", f"model_epoch_{epoch}.pt")
+                torch.save(model.state_dict(), model_path)
+                print(f"saved model checkpoint at epoch {epoch} to {model_path}")
+
+            val_loss = val_loss_epoch / len(validation_loader.dataset)
+            all_predictions = torch.cat(all_predictions)
+            all_times = torch.cat(all_times)
+            all_events = torch.cat(all_events)
+
+            # convert to numpy arrays for CI calculation
+            all_predictions_np = all_predictions.cpu().numpy()
+            all_times_np = all_times.cpu().numpy()
+            all_events_np = all_events.cpu().numpy()
+
+            c_index = concordance_index_censored(all_events_np.astype(bool), all_times_np, all_predictions_np)
+            print(f"Validation loss: {val_loss}, CI: {c_index[0]}")
+
+            model_path = os.path.join("./saved_models", f"model_epoch_{epoch}.pt")
+            torch.save(model.state_dict(), model_path)
+            print(f"saved model checkpoint at epoch {epoch} to {model_path}")
 
     return model, optimizer
 
@@ -425,9 +459,10 @@ if __name__ == "__main__":
                               mode=opt.input_mode,
                               fusion_type=opt.fusion_type)
     # model should return None for the absent modality in the unimodal case
+
     model.to(device)
     cox_loss = CoxLoss()
-
+    model.load_state_dict(torch.load("./saved_models/model_epoch_0.pt"))
     train_loader, validation_loader, test_loader = create_data_loaders(opt, mapping_df)
 
     test_loss, attributions = test_and_interpret(model, test_loader, cox_loss, device)

@@ -11,6 +11,7 @@ import numpy as np
 # import datasets
 # from models import
 # from train_test import train_nn
+from sklearn.model_selection import train_test_split, KFold
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import pickle
@@ -26,14 +27,17 @@ from torch.profiler import profile, record_function, ProfilerActivity
 # on Polaris, activate env /lus/eagle/clone/g2/projects/GeomicVar/tarak/multimodal_learning_T1/pytorch_py3p10
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--create_new_data_mapping', type=str, default=False, help="whether to create new data mapping or use existing one")
+parser.add_argument('--create_new_data_mapping', type=str, default=False,
+                    help="whether to create new data mapping or use existing one")
 parser.add_argument('--input_mapping_data_path', type=str,
                     # default='/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/joint_fusion/', # on laptop
-                    default='/lus/eagle/clone/g2/projects/GeomicVar/tarak/multimodal_learning_T1/joint_fusion/', # on Polaris
+                    default='/lus/eagle/clone/g2/projects/GeomicVar/tarak/multimodal_learning_T1/joint_fusion/',
+                    # on Polaris
                     help='Path to input mapping data file')
 parser.add_argument('--input_path', type=str,
                     # default='/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/preprocessing/', # on laptop
-                    default='/lus/eagle/clone/g2/projects/GeomicVar/tarak/multimodal_learning_T1/preprocessing/', # on Polaris
+                    default='/lus/eagle/clone/g2/projects/GeomicVar/tarak/multimodal_learning_T1/preprocessing/',
+                    # on Polaris
                     help='Path to input data files')
 parser.add_argument('--input_wsi_path', type=str,
                     # default='/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/preprocessing/TCGA_WSI/LUAD_all/svs_files/FFPE_tiles/tiles/256px_9.9x/combined_tiles/', # on laptop
@@ -42,24 +46,28 @@ parser.add_argument('--input_wsi_path', type=str,
                     help='Path to input WSI tiles')
 parser.add_argument('--input_wsi_embeddings_path', type=str,
                     # default='/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/early_fusion_inputs/', # on laptop
-                    default='/lus/eagle/clone/g2/projects/GeomicVar/tarak/multimodal_learning_T1/preprocessing/TCGA_WSI/LUAD_all/svs_files/FFPE_tiles_otsu_B/tiles/256px_9.9x/combined_tiles/', # on Polaris
+                    default='/lus/eagle/clone/g2/projects/GeomicVar/tarak/multimodal_learning_T1/preprocessing/TCGA_WSI/LUAD_all/svs_files/FFPE_tiles_otsu_B/tiles/256px_9.9x/combined_tiles/',
+                    # on Polaris
                     help='Path to WSI embeddings generated from pretrained pathology foundation model')
 parser.add_argument('--checkpoint_dir', type=str,
                     default='/lus/eagle/clone/g2/projects/GeomicVar/tarak/multimodal_learning_T1/joint_fusion/checkpoint_2024-04-20-08-43-52/',
                     help='Path to the checkpoint files from trained VAE for omic embedding generation')
 # parser.add_argument('--output_path', type=str, default='results/output.txt', help='Path to output results file')
-parser.add_argument('--batch_size', type=int, default=16, help='Batch size for training')
-parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
+parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training (overall)')
+parser.add_argument('--val_batch_size', type=int, default=1000, help='Batch size for validation data (using all samples for better Cox loss calculation)')
+parser.add_argument('--lr', type=float, default=0.0001, help='Learning rate')
 parser.add_argument('--lr_decay_iters', type=int, default=100, help='Learning rate decay steps')
-parser.add_argument('--num_epochs', type=int, default=2, help='Number of training epochs')
+parser.add_argument('--num_epochs', type=int, default=100, help='Number of training epochs')
 parser.add_argument('--gpu_ids', type=str, default='0', help='gpu ids: e.g. 0  0,1,2, 0,2. use -1 for CPU')
 parser.add_argument('--input_size_wsi', type=int, default=256, help="input_size for path images")
 parser.add_argument('--embedding_dim_wsi', type=int, default=384, help="embedding dimension for WSI")
 parser.add_argument('--embedding_dim_omic', type=int, default=256, help="embedding dimension for omic")
 parser.add_argument('--input_mode', type=str, default="wsi_omic", help="wsi, omic, wsi_omic")
-parser.add_argument('--fusion_type', type=str, default="joint", help="early, late, joint, joint_omic, unimodal") # "joint_omic" only trains the omic embedding generator jointly with the downstream combined model
+parser.add_argument('--fusion_type', type=str, default="joint",
+                    help="early, late, joint, joint_omic, unimodal")  # "joint_omic" only trains the omic embedding generator jointly with the downstream combined model
 parser.add_argument('--profile', type=str, default=False, help="whether to profile or not")
-parser.add_argument('--use_mixed_precision', type=str, default=False, help="whether to use mixed precision calculations")
+parser.add_argument('--use_mixed_precision', type=str, default=False,
+                    help="whether to use mixed precision calculations")
 parser.add_argument('--use_gradient_accumulation', type=str, default=False, help="whether to use gradient accumulation")
 
 opt = parser.parse_args()
@@ -101,7 +109,6 @@ if opt.create_new_data_mapping:
     # combine 'days_to_death' and 'days_to_last_followup' into a single column
     # assuming that for rows where 'days_to_death' is NaN, 'days_to_last_followup' contains the censoring time
     mapping_df['time'] = mapping_df['days_to_death'].fillna(mapping_df['days_to_last_followup'])
-    # NOTE: TCGA-49-6742 seems to have both 'days_to_death' as well as 'days_to_last_followup' as None. So ignoring this for survival analysis
     mapping_df = mapping_df.dropna(subset=['time', 'event_occurred'])
     # remove that from the wsi and rnaseq combined embeddings too
     # rnaseq_df = rnaseq_df.drop(columns=['TCGA-49-6742'])
@@ -110,8 +117,16 @@ if opt.create_new_data_mapping:
 else:
     mapping_df = pd.read_json(opt.input_mapping_data_path + "mapping_df.json", orient='index')
 
+## create k folds from mapping_df
+# def create_train_test_split(mapping_df):
+#     mapping_df_train, mapping_df_test = train_test_split(mapping_df, test_size=0.2, random_state=42)
+#     return mapping_df_train, mapping_df_test
+#
+# mapping_df_train, mapping_df_test = create_train_test_split(mapping_df)
+
 # set_trace()
 from train_test import train_nn
+
 # train the model
 if opt.profile:
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
