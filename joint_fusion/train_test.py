@@ -3,6 +3,8 @@ from tqdm import tqdm
 import numpy as np
 import torch
 import os
+import wandb
+import time
 
 from torch import nn
 import torch.backends.cudnn as cudnn
@@ -11,7 +13,6 @@ from torch.utils.data import RandomSampler
 # import torch.optim.lr_scheduler as lr_scheduler
 from torchsummary import summary
 from torch.cuda.amp import autocast, GradScaler
-from torch.utils.tensorboard import SummaryWriter
 from datasets import CustomDataset
 from models import MultimodalNetwork, OmicNetwork, print_model_summary
 from sklearn.model_selection import train_test_split
@@ -153,6 +154,10 @@ def create_data_loaders(opt, mapping_df):
 
 
 def train_nn(opt, mapping_df, device):
+
+    wandb.init(project="multimodal_survival_analysis", entity='tnnandi')
+    config = wandb.config
+
     model = MultimodalNetwork(embedding_dim_wsi=opt.embedding_dim_wsi,
                               embedding_dim_omic=opt.embedding_dim_omic,
                               mode=opt.input_mode,
@@ -168,9 +173,6 @@ def train_nn(opt, mapping_df, device):
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=opt.lr_decay_iters, gamma=0.1)
     cox_loss = CoxLoss()
 
-    log_dir = os.path.abspath("./logs")
-    writer = SummaryWriter(log_dir=log_dir)
-
     # logging the initial model summary and configuration
     if hasattr(model, 'module'):
         model_to_log = model.module
@@ -179,7 +181,7 @@ def train_nn(opt, mapping_df, device):
     # set_trace()
     # print(f"Model mode: {model.mode}, fusion_type: {model.fusion_type}")
     # the original model is now accessible through the .module attribute of the DataParallel wrapper
-    if hasattr(model, 'module'):
+    if hasattr(model, 'module'): # when using DataParallel
         print(f"Model mode: {model.module.mode}, fusion_type: {model.module.fusion_type}")
     else:
         print(f"Model mode: {model.mode}, fusion_type: {model.fusion_type}")
@@ -248,6 +250,7 @@ def train_nn(opt, mapping_df, device):
 
     for epoch in tqdm(range(0, opt.num_epochs)):
         print(f"Epoch: {epoch + 1} out of {opt.num_epochs}")
+        start_train_time = time.time()
         model.train()
         loss_epoch = 0
 
@@ -311,9 +314,15 @@ def train_nn(opt, mapping_df, device):
                 #     print(f"Computation graph saved to TensorBoard logs at {log_dir}")
 
         train_loss = loss_epoch / len(train_loader.dataset)  # average training loss per sample for the epoch
-        writer.add_scalar('Loss/train', train_loss, epoch)
+        wandb.log({"Loss/train": train_loss}, step=epoch)
         scheduler.step()  # step scheduler after each epoch
         print("\n train loss over epoch: ", train_loss)
+        end_train_time = time.time()
+        train_duration = end_train_time - start_train_time
+        wandb.log({"Time/train": train_duration}, step=epoch)
+
+        start_val_time = time.time()
+
 
         # get predictions on the validation dataset (to keep track of validation loss during training)
         model.eval()
@@ -356,7 +365,7 @@ def train_nn(opt, mapping_df, device):
                 print(f"saved model checkpoint at epoch {epoch} to {model_path}")
 
             val_loss = val_loss_epoch / len(validation_loader.dataset)
-            writer.add_scalar('Loss/validation', val_loss, epoch)
+            wandb.log({"Loss/validation": val_loss}, step=epoch)
 
             all_predictions = torch.cat(all_predictions)
             all_times = torch.cat(all_times)
@@ -369,12 +378,16 @@ def train_nn(opt, mapping_df, device):
 
             c_index = concordance_index_censored(all_events_np.astype(bool), all_times_np, all_predictions_np)
             print(f"Validation loss: {val_loss}, CI: {c_index[0]}")
+            wandb.log({"CI/validation": c_index[0]}, step=epoch)
 
             model_path = os.path.join("./saved_models", f"model_epoch_{epoch}.pt")
             torch.save(model.state_dict(), model_path)
             print(f"saved model checkpoint at epoch {epoch} to {model_path}")
 
-    writer.close()
+            end_val_time = time.time()
+            val_duration = end_val_time - start_val_time
+            wandb.log({"Time/validation": val_duration}, step=epoch)
+
     return model, optimizer
 
 
