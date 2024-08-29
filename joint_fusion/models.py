@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import pandas as pd
 import numpy as np
 import os
+import time
 from generate_rnaseq_embeddings import get_omic_embeddings
 from lookup_embeddings import early_fusion_get_omic_embeddings, early_fusion_get_wsi_embeddings
 from generate_wsi_embeddings import WSIEncoder
@@ -91,7 +92,8 @@ class WSINetwork(nn.Module):
         # print("+++++++++++++ Input shape within WSINetwork: ", x_wsi.shape)
         if self.use_lunit_dino:
             embeddings = self.encoder.get_wsi_embeddings(x_wsi)
-            embeddings = torch.tensor(embeddings).to(self.encoder.device)
+            # embeddings = torch.tensor(embeddings).to(self.encoder.device)
+            embeddings = embeddings.to(self.encoder.device)
             return self.net(embeddings)
         else:
             return self.net(x_wsi)
@@ -102,14 +104,14 @@ class OmicNetwork(nn.Module): # MLP for WSI tile-level embedding generation
         super(OmicNetwork, self).__init__()
         self.embedding_dim = embedding_dim
         self.net = nn.Sequential(
-            nn.Linear(19962, 512),
+            nn.Linear(19962, 256),
             nn.ReLU(),
-            nn.Linear(512, embedding_dim),
+            nn.Linear(256, embedding_dim),
             # nn.ReLU()
         )
 
     def forward(self, x):
-        print("+++++++++++++ Input shape within omic network: ", x.shape)
+        # print("+++++++++++++ Input shape within omic network: ", x.shape)
         return self.net(x)
 
 
@@ -158,13 +160,17 @@ class MultimodalNetwork(nn.Module):
         self.stored_omic_embedding = None
 
     def forward(self, opt, tcga_id, x_wsi=None, x_omic=None):
-        print("fusion type: ", self.fusion_type)
+        # print("x_wsi: ", x_wsi) # contains float values and not the image files here
+        # print("x_omic: ", x_omic)
+        start_time = time.time()
+        # print("fusion type: ", self.fusion_type)
         if self.fusion_type == 'joint':
             wsi_embedding = self.wsi_net(x_wsi)
             omic_embedding = self.omic_net(x_omic)
-            print("wsi_embedding.shape: ", wsi_embedding.shape)
-            print("omic_embedding.shape: ", omic_embedding.shape)
-
+            # print("wsi_embedding.shape: ", wsi_embedding.shape)
+            # print("omic_embedding.shape: ", omic_embedding.shape)
+        step1_time = time.time()
+        # set_trace()
         if self.fusion_type == 'joint_omic':
             wsi_embedding = pd.read_json(os.path.join(opt.input_wsi_embeddings_path, 'WSI_embeddings.json'))  # read pre-generated embeddings from the pathology foundation model
             wsi_embedding = wsi_embedding[list(tcga_id)] # keep only the embeddings corresponding to the tcga_ids in the batch
@@ -203,14 +209,25 @@ class MultimodalNetwork(nn.Module):
         elif self.mode == 'omic':
             combined_embedding = omic_embedding
         elif self.mode == 'wsi_omic' and (self.fusion_type == 'joint_omic' or self.fusion_type == 'joint'):
-            wsi_embedding_tensor = torch.tensor(wsi_embedding)
-            omic_embedding_tensor = torch.tensor(omic_embedding)
-            combined_embedding = torch.cat((wsi_embedding_tensor, omic_embedding_tensor), dim=1)
-
-        combined_embedding = torch.tensor(combined_embedding).to(device)
+            # set_trace()
+            # wsi_embedding_tensor = torch.tensor(wsi_embedding)
+            # omic_embedding_tensor = torch.tensor(omic_embedding)
+            # Do not re-create tensors from embeddings if they are already tensors
+            if not isinstance(wsi_embedding, torch.Tensor):
+                wsi_embedding = torch.tensor(wsi_embedding).to(device)
+            if not isinstance(omic_embedding, torch.Tensor):
+                omic_embedding = torch.tensor(omic_embedding).to(device)
+            # combined_embedding = torch.cat((wsi_embedding_tensor, omic_embedding_tensor), dim=1)
+            combined_embedding = torch.cat((wsi_embedding, omic_embedding), dim=1)
+        step2_time = time.time()
+        # combined_embedding = torch.tensor(combined_embedding).to(device) # removed to avoid graph disconnect during backprop
         print("combined_embedding.shape: ", combined_embedding.shape)
         # use combined embedding with downstream MLP for getting the output that enters the loss function
+        step3_time = time.time()
         output = self.fused_mlp(combined_embedding)
+        # step2_time = time.time()
+        print(
+            f"(In MultimodalNetwork) Step 1: {step1_time - start_time:.4f}s, Step 2: {step2_time - step1_time:.4f}s, Step 3: {step3_time - step2_time:.4f}s")
 
         return output
 

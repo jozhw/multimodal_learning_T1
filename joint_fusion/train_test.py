@@ -5,18 +5,23 @@ import torch
 import os
 import wandb
 import time
-
+import matplotlib.pyplot as plt
+import cv2
 from torch import nn
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
-from torch.utils.data import RandomSampler
+from torch.utils.data import RandomSampler, DataLoader
 # import torch.optim.lr_scheduler as lr_scheduler
 from torchsummary import summary
 from torch.cuda.amp import autocast, GradScaler
-from datasets import CustomDataset
-from models import MultimodalNetwork, OmicNetwork, print_model_summary
 from sklearn.model_selection import train_test_split
 from utils import mixed_collate
+from tqdm import tqdm
+
+from datasets import CustomDataset, HDF5Dataset
+from models import MultimodalNetwork, OmicNetwork, print_model_summary
+from generate_wsi_embeddings import CustomDatasetWSI
+
 
 from lifelines import KaplanMeierFitter
 from lifelines.statistics import logrank_test
@@ -24,19 +29,19 @@ from sksurv.ensemble import GradientBoostingSurvivalAnalysis
 from sksurv.util import Surv
 from sksurv.metrics import concordance_index_censored
 
-os.environ[
-    "CUDA_VISIBLE_DEVICES"] = "0"  # force to use only one GPU to avoid any issues with the Cox PH loss function (that requires data for all at-risk samples)
+if __name__ == "__main__":
+    os.environ[
+        "CUDA_VISIBLE_DEVICES"] = "0"  # force to use only one GPU to avoid any issues with the Cox PH loss function (that requires data for all at-risk samples)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 import pdb
 import pickle
 import os
 from pdb import set_trace
-from captum.attr import IntegratedGradients
+from captum.attr import IntegratedGradients, Saliency
 
 import torchviz
 
 torch.autograd.set_detect_anomaly(True)
-
 
 class CoxLossOld(nn.Module):
     def __init__(self):
@@ -118,43 +123,38 @@ class CoxLoss(nn.Module):
         return cox_loss
 
 
-def create_data_loaders(opt, mapping_df):
-    mapping_df_train, temp_df = train_test_split(mapping_df, test_size=0.3, random_state=40)
-    mapping_df_val, mapping_df_test = train_test_split(temp_df, test_size=0.5, random_state=40)
-
+def create_data_loaders(opt, h5_file):
     train_loader = torch.utils.data.DataLoader(
-        dataset=CustomDataset(opt, mapping_df_train, mode=opt.input_mode, train_val_test="train"),
+        dataset=HDF5Dataset(opt, h5_file, split='train', mode=opt.input_mode, train_val_test="train"),
         batch_size=opt.batch_size,
         shuffle=True,
-        num_workers=16,
+        num_workers=8,
         prefetch_factor=2,
         pin_memory=True
-        # collate_fn=mixed_collate  # Uncomment if needed
     )
 
     validation_loader = torch.utils.data.DataLoader(
-        dataset=CustomDataset(opt, mapping_df_val, mode=opt.input_mode, train_val_test="val"),
+        dataset=HDF5Dataset(opt, h5_file, split='val', mode=opt.input_mode, train_val_test="val"),
         batch_size=opt.val_batch_size,
         shuffle=True,
-        num_workers=4,
+        num_workers=8,
         prefetch_factor=2,
         pin_memory=True
     )
 
     test_loader = torch.utils.data.DataLoader(
-        dataset=CustomDataset(opt, mapping_df_test, mode=opt.input_mode, train_val_test="test"),
-        batch_size=opt.batch_size,
+        dataset=HDF5Dataset(opt, h5_file, split='test', mode=opt.input_mode, train_val_test="test"),
+        batch_size=opt.test_batch_size,
         shuffle=True,
-        num_workers=4,
-        prefetch_factor=2,
+        num_workers=0, #1, #4,
+        # prefetch_factor=2,
         pin_memory=True
     )
 
     return train_loader, validation_loader, test_loader
 
 
-def train_nn(opt, mapping_df, device):
-
+def train_nn(opt, h5_file, device):
     wandb.init(project="multimodal_survival_analysis", entity='tnnandi')
     config = wandb.config
 
@@ -181,7 +181,7 @@ def train_nn(opt, mapping_df, device):
     # set_trace()
     # print(f"Model mode: {model.mode}, fusion_type: {model.fusion_type}")
     # the original model is now accessible through the .module attribute of the DataParallel wrapper
-    if hasattr(model, 'module'): # when using DataParallel
+    if hasattr(model, 'module'):  # when using DataParallel
         print(f"Model mode: {model.module.mode}, fusion_type: {model.module.fusion_type}")
     else:
         print(f"Model mode: {model.mode}, fusion_type: {model.fusion_type}")
@@ -246,7 +246,7 @@ def train_nn(opt, mapping_df, device):
     # # use a separate train_loader for early fusion that should only handle the embeddings read from the files
     # if opt.fusion_type == 'early':
 
-    train_loader, validation_loader, test_loader = create_data_loaders(opt, mapping_df)
+    train_loader, validation_loader, test_loader = create_data_loaders(opt, h5_file)
 
     for epoch in tqdm(range(0, opt.num_epochs)):
         print(f"Epoch: {epoch + 1} out of {opt.num_epochs}")
@@ -287,21 +287,29 @@ def train_nn(opt, mapping_df, device):
                 # the model output should be considered as beta*X to be used in the Cox loss function
 
                 # for early fusion, the model class should use the inputs from here by the generated embeddings
+                start_time = time.time()
                 predictions = model(opt,
                                     tcga_id,
                                     x_wsi=x_wsi,  # list of tensors (one for each tile)
                                     x_omic=x_omic,
                                     )
+                step1_time = time.time()
                 # need to correct the loss calculation to include the time to last followup
                 loss = cox_loss(predictions.squeeze(),
                                 # predictions are not survival outcomes, rather log-risk scores beta*X
                                 days_to_event,
                                 event_occurred)  # Cox partial likelihood loss for survival outcome prediction
                 print("\n loss (train): ", loss.data.item())
-                loss_epoch += loss.data.item() * len(tcga_id)  # multiplying loss by batch size for accurate epoch averaging
+                step2_time = time.time()
+                loss_epoch += loss.data.item() * len(
+                    tcga_id)  # multiplying loss by batch size for accurate epoch averaging
                 loss.backward(
                     retain_graph=True if epoch == 0 and batch_idx == 0 else False)  # tensors retained to allow backpropagation for torchhviz
                 optimizer.step()
+
+                step3_time = time.time()
+                print(
+                    f"(in train_nn) Step 1: {step1_time - start_time:.4f}s, Step 2: {step2_time - step1_time:.4f}s, Step 3: {step3_time - step2_time:.4f}s")
 
                 # if epoch == 0 and batch_idx == 0:
                 #     # Note: graphviz is fine for small graphs, but for large graphs it becomes cumbersome so instead opting TensorBoard for the latter
@@ -323,7 +331,6 @@ def train_nn(opt, mapping_df, device):
 
         start_val_time = time.time()
 
-
         # get predictions on the validation dataset (to keep track of validation loss during training)
         model.eval()
         val_loss_epoch = 0.0
@@ -337,7 +344,7 @@ def train_nn(opt, mapping_df, device):
                 # x_wsi is a list of tensors (one tensor for each tile)
                 print(f"Batch size: {len(validation_loader.dataset)}")
                 print(
-                    f"Validation Batch index: {batch_idx+1} out of {np.ceil(len(validation_loader.dataset) / opt.val_batch_size)}")
+                    f"Validation Batch index: {batch_idx + 1} out of {np.ceil(len(validation_loader.dataset) / opt.val_batch_size)}")
                 x_wsi = [x.to(device) for x in x_wsi]
                 x_omic = x_omic.to(device)
                 days_to_event = days_to_event.to(device)
@@ -402,11 +409,130 @@ def print_total_parameters(model):
 
 def test_and_interpret(model, test_loader, cox_loss, device):
     model.eval()
-    test_loss = 0.0
-    # integrated_gradients = IntegratedGradients(model.omic_net)  # need to check this as the flow of the gradients in backprop should be through the downstream MLP and the omic MLP
-    # integrated_gradients = IntegratedGradients(model.fused_mlp)
-    integrated_gradients = IntegratedGradients(model.forward_omic_only)
-    all_attributions = []
+    test_loss_epoch = 0.0
+    all_predictions = []
+    all_times = []
+    all_events = []
+
+    # create the directory to save saliency maps if it doesn't exist
+    output_dir = "./saliency_maps"
+    os.makedirs(output_dir, exist_ok=True)
+
+    # for training, only the last transformer block (block 11) in the WSI encoder was kept trainable
+    # see WSIEncoder class in generate_Wsi_embeddings.py
+
+    # Get the CI and the KM plots for the test set
+    for batch_idx, (tcga_id, days_to_event, event_occurred, x_wsi, x_omic) in enumerate(test_loader):
+        with torch.no_grad():  # disable gradients during data loading and moving to the device
+            x_wsi = [x.to(device) for x in x_wsi]
+            x_omic = x_omic.to(device)
+            days_to_event = days_to_event.to(device)
+            event_occurred = event_occurred.to(device)
+
+        # enable gradients only after data loading
+        x_wsi = [x.requires_grad_() for x in x_wsi]
+
+        print(f"Batch size: {len(test_loader.dataset)}")
+        print(f"Test Batch index: {batch_idx + 1} out of {np.ceil(len(test_loader.dataset) / opt.test_batch_size)}")
+        print("Days to event: ", days_to_event)
+        print("event occurred: ", event_occurred)
+
+        # perform the forward pass without torch.no_grad() to allow gradient computation
+        outputs = model(
+            opt,
+            tcga_id,
+            x_wsi=x_wsi,  # list of tensors (one for each tile)
+            x_omic=x_omic,
+        )
+        # set_trace()
+        # backward pass to compute gradients for saliency maps
+        outputs.backward()  # if outputs is not scalar, reduce it to scalar
+
+        saliencies = []  # list of saliency maps corresponding to each image in `x_wsi`
+        for image in x_wsi:
+            if image.grad is not None:
+                saliency, _ = torch.max(image.grad.data.abs(), dim=1)
+                saliencies.append(saliency)
+            else:
+                raise RuntimeError("Gradients have not been computed for one of the images in x_wsi.")
+            # set_trace()
+
+        loss = cox_loss(outputs.squeeze(),
+                        # predictions are not survival outcomes, rather log-risk scores beta*X
+                        days_to_event,
+                        event_occurred)  # Cox partial likelihood loss for survival outcome prediction
+        # set_trace()
+        print("\n loss (test): ", loss.data.item())
+        test_loss_epoch += loss.data.item() * len(tcga_id)
+        all_predictions.append(outputs.squeeze())
+        all_times.append(days_to_event)
+        all_events.append(event_occurred)
+
+        test_loss = test_loss_epoch / len(test_loader.dataset)
+
+        all_predictions = torch.cat(all_predictions)
+        all_times = torch.cat(all_times)
+        all_events = torch.cat(all_events)
+
+        # convert to numpy arrays for CI calculation
+        all_predictions_np = all_predictions.cpu().numpy()
+        all_times_np = all_times.cpu().numpy()
+        all_events_np = all_events.cpu().numpy()
+
+        c_index = concordance_index_censored(all_events_np.astype(bool), all_times_np, all_predictions_np)
+        print(f"Test loss: {test_loss}, CI: {c_index[0]}")
+
+    # stratify based on the median risk scores
+    median_prediction = np.median(all_predictions_np)
+    high_risk_idx = all_predictions_np >= median_prediction
+    low_risk_idx = all_predictions_np < median_prediction
+
+    # separate the times and events into high and low-risk groups
+    high_risk_times = all_times_np[high_risk_idx]
+    high_risk_events = all_events_np[high_risk_idx]
+    low_risk_times = all_times_np[low_risk_idx]
+    low_risk_events = all_events_np[low_risk_idx]
+
+    # initialize the Kaplan-Meier fitter
+    kmf_high_risk = KaplanMeierFitter()
+    kmf_low_risk = KaplanMeierFitter()
+
+    # fit
+    kmf_high_risk.fit(high_risk_times, event_observed=high_risk_events, label='High Risk')
+    kmf_low_risk.fit(low_risk_times, event_observed=low_risk_events, label='Low Risk')
+
+    # perform the log-rank test
+    log_rank_results = logrank_test(high_risk_times, low_risk_times,
+                                    event_observed_A=high_risk_events,
+                                    event_observed_B=low_risk_events)
+
+    p_value = log_rank_results.p_value
+    print(f"Log-Rank Test p-value: {p_value}")
+    print(f"Log-Rank Test statistic: {log_rank_results.test_statistic}")
+
+    plt.figure(figsize=(10, 6))
+    kmf_high_risk.plot(ci_show=True, color='blue')
+    kmf_low_risk.plot(ci_show=True, color='red')
+    plt.title(
+        'Patient stratification: high risk vs low risk groups based on predicted risk scores\nLog-rank test p-value: {:.4f}'.format(
+            p_value))
+    plt.xlabel('Time (days)')
+    plt.ylabel('Survival probability')
+    plt.legend()
+    plt.savefig('km_plot_joint_fusion.png', format='png', dpi=300)
+    # plt.show()
+
+    set_trace()
+
+    # the flow of the gradients in backprop should be through the downstream MLP and the omic MLP
+
+    # saliency = Saliency(model.wsi_net.forward)
+    # integrated_gradients = IntegratedGradients(model.omic_net.forward)
+    saliency = Saliency(model.forward)
+    integrated_gradients = IntegratedGradients(model.forward)
+
+    all_attributions_saliency = []
+    all_attributions_ig = []
 
     with torch.no_grad():
         for tcga_id, days_to_event, event_occurred, x_wsi, x_omic in test_loader:
@@ -419,26 +545,89 @@ def test_and_interpret(model, test_loader, cox_loss, device):
                                 tcga_id,
                                 x_wsi=x_wsi,
                                 x_omic=x_omic)
-            loss = cox_loss(predictions.squeeze(),
-                            days_to_event,
-                            event_occurred)
-            test_loss += loss.item() * len(x_omic)
 
-            x_omic.requires_grad = True
+            risk_scores = predictions.squeeze()
+
+            dataset = CustomDatasetWSI(x_wsi, transform=None)
+            tile_loader = DataLoader(dataset, batch_size=1,
+                                     shuffle=False)  # check later why the batch size is hard-coded to 1
+
+            if model.module.mode == 'wsi_omic':
+                # saliency maps for WSI
+                # generate saliency map for each tile
+                for tiles in tile_loader:
+                    tiles = tiles.to(device)
+                    tiles = tiles.squeeze(0)  # Remove the batch dimension: [8, 3, 256, 256]
+
+                    for j, tile in enumerate(tiles):
+                        tile = tile.unsqueeze(0) # add batch dimension back
+                        tile.requires_grad_()
+                        # set_trace()
+                        salience_attributions = saliency.attribute(tile, target=risk_scores[j], additional_forward_args=(opt, tcga_id, tile, x_omic[j]))
+
+                        saliency_attributions_abs = torch.abs(saliency_attributions)
+                        saliency_map = saliency_attributions_abs.cpu().numpy().squeeze().transpose(1, 2, 0)  # HWC format
+
+
+                        # set_trace()
+                x_wsi_stacked = torch.stack(x_wsi).requires_grad_(True)
+                x_omic.requires_grad = False  # for WSI, the output gradients should be calculated only wrt the WSI inputs and not the RNASeq inputs
+
+                # wsi_embedding = model.wsi_net(x_wsi_stacked)
+                # omic_embedding = model.omic_net(x_omic)
+                # combined_embedding = torch.cat((wsi_embedding, omic_embedding), dim=1).requires_grad_(True)
+                # output = model.fused_mlp(combined_embedding)
+                # output = output.squeeze()
+                # output.backward()  # getting gradients of output w.r.t. graph leaves
+
+                # saliency_attributions = x_wsi_stacked.grad
+                saliency_attributions = saliency.attribute(x_wsi_stacked, target=risk_scores,
+                                                           additional_forward_args=(opt, tcga_id, x_omic))
+                saliency_attributions_abs = torch.abs(saliency_attributions)
+                all_attributions_saliency.append(saliency_attributions_abs.cpu().numpy())
+
+                # visualize and overlay saliency maps on original patches
+                for i, attr in enumerate(saliency_attributions_abs):
+                    attr_np = attr.cpu().numpy().transpose(1, 2, 0) # convert to HWC format
+                    attr_np = cv2.normalize(attr_np, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+                    heatmap = cv2.applyColorMap(attr_np, cv2.COLORMAP_JET)
+                    original_patch = x_wsi_stacked[i].cpu().numpy().transpose(1, 2, 0)
+                    original_patch = cv2.normalize(original_patch, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+                    # overlay the saliency heatmaps with the original WSI patch
+                    overlay = cv2.addWeighted(heatmap, 0.5, original_patch, 0.5, 0)
+
+                    output_path = os.path.join(output_dir, f'saliency_map_patch_{i}.png')
+                    # cv2.imwrite(output_path, overlay)
+
+                    plt.figure(figsize=(6, 6))
+                    plt.imshow(overlay)
+                    plt.title(f'Saliency Map Overlay for Patch {i}')
+                    plt.axis('off')
+                    plt.savefig(output_path)
+                    plt.close()
+
+            # IG for rnaseq
+            x_wsi_stacked.requires_grad = False
+            # x_omic.requires_grad_()
+            x_omic.requires_grad = True # reset to True. It was set to False for WSI saliency map computations
+
             baseline = torch.zeros_like(x_omic)  # is zeros the appropriate baseline?
             # set_trace()
             attrs, delta = integrated_gradients.attribute(inputs=x_omic,
                                                           baselines=baseline,
+                                                          target=risk_scores,
+                                                          additional_forward_args=(opt, tcga_id, x_omic),
                                                           return_convergence_delta=True)
-            all_attributions.append(attrs.cpu().numpy())
+            all_attributions_ig.append(attrs.cpu().numpy())
 
-    test_loss /= len(test_loader.dataset)
-    print("test loss: ", test_loss)
+    all_attributions_saliency = np.concatenate(all_attributions_saliency, axis=0)
+    all_attributions_ig = np.concatenate(all_attributions_ig, axis=0)
 
-    all_attributions = np.concatenate(all_attributions, axis=0)
-    np.save("omic_attributions.npy", all_attributions)
+    np.save("wsi_attributions_saliency.npy", all_attributions_saliency)
+    np.save("omic_attributions_ig.npy", all_attributions_ig)
 
-    return test_loss, all_attributions
+    return all_attributions_saliency, all_attributions_ig
 
 
 if __name__ == "__main__":
@@ -447,27 +636,23 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--input_mapping_data_path', type=str,
-                        default='/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/joint_fusion/',
-                        # on laptop
-                        # default='/lus/eagle/clone/g2/projects/GeomicVar/tarak/multimodal_learning_T1/joint_fusion/', # on Polaris
+                        default='/lus/eagle/clone/g2/projects/GeomicVar/tarak/multimodal_learning_T1/joint_fusion/',
                         help='Path to input mapping data file')
     parser.add_argument('--input_wsi_path', type=str,
-                        default='/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/preprocessing/TCGA_WSI/LUAD_all/svs_files/FFPE_tiles/tiles/256px_9.9x/combined_tiles/',
-                        # on laptop
-                        # default='/lus/eagle/clone/g2/projects/GeomicVar/tarak/multimodal_learning_T1/preprocessing/TCGA_WSI/LUAD_all/svs_files/FFPE_tiles/tiles/256px_9.9x/combined_tiles/', # on Polaris
+                        default='/lus/eagle/clone/g2/projects/GeomicVar/tarak/multimodal_learning_T1/preprocessing/TCGA_WSI/LUAD_all/svs_files/FFPE_tiles_single_sample_per_patient_13july/tiles/256px_9.9x/combined/',
                         help='Path to input WSI tiles')
-    parser.add_argument('--input_wsi_embeddings_path', type=str,
-                        default='/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/early_fusion_inputs/',
-                        # on laptop
-                        # default='/lus/eagle/clone/g2/projects/GeomicVar/tarak/multimodal_learning_T1/preprocessing/TCGA_WSI/LUAD_all/svs_files/FFPE_tiles/tiles/256px_9.9x/combined_tiles/', # on Polaris
-                        help='Path to WSI embeddings generated from pretrained pathology foundation model')
-    parser.add_argument('--batch_size', type=int, default=16, help='Batch size for training')
+    # parser.add_argument('--input_wsi_embeddings_path', type=str,
+    #                     default='/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/early_fusion_inputs/',
+    #                     help='Path to WSI embeddings generated from pretrained pathology foundation model')
+    parser.add_argument('--batch_size', type=int, default=1, help='Batch size for training')
+    parser.add_argument('--val_batch_size', type=int, default=1, help='Batch size for validation')
+    # parser.add_argument('--test_batch_size', type=int, default=1000, help='Batch size for testing')
+    parser.add_argument('--test_batch_size', type=int, default=1, help='Batch size for testing')
     parser.add_argument('--input_size_wsi', type=int, default=256, help="input_size for path images")
     parser.add_argument('--embedding_dim_wsi', type=int, default=384, help="embedding dimension for WSI")
-    parser.add_argument('--embedding_dim_omic', type=int, default=256, help="embedding dimension for omic")
+    parser.add_argument('--embedding_dim_omic', type=int, default=128, help="embedding dimension for omic")
     parser.add_argument('--input_mode', type=str, default="wsi_omic", help="wsi, omic, wsi_omic")
-    parser.add_argument('--fusion_type', type=str, default="joint_omic",
-                        help="early, late, joint, joint_omic, unimodal")
+    parser.add_argument('--fusion_type', type=str, default="joint", help="early, late, joint, joint_omic, unimodal")
     opt = parser.parse_args()
 
     mapping_df = pd.read_json(opt.input_mapping_data_path + "mapping_df.json", orient='index')
@@ -477,11 +662,24 @@ if __name__ == "__main__":
                               embedding_dim_omic=opt.embedding_dim_omic,
                               mode=opt.input_mode,
                               fusion_type=opt.fusion_type)
+
+    model = torch.nn.DataParallel(model)
+
     # model should return None for the absent modality in the unimodal case
 
     model.to(device)
     cox_loss = CoxLoss()
-    model.load_state_dict(torch.load("./saved_models/model_epoch_0.pt"))
-    train_loader, validation_loader, test_loader = create_data_loaders(opt, mapping_df)
+    model.load_state_dict(torch.load("./saved_models/model_epoch_98.pt"))
+    # model.load_state_dict(torch.load("./saved_models/model_epoch_1.pt"))
 
-    test_loss, attributions = test_and_interpret(model, test_loader, cox_loss, device)
+    # state_dict = torch.load("./saved_models/model_epoch_98.pt")
+    # from collections import OrderedDict
+    #
+    # new_state_dict = OrderedDict()
+    # for k, v in state_dict.items():
+    #     name = k[7:] if k.startswith('module.') else k  # remove `module.` if present
+    #     new_state_dict[name] = v
+    # model.load_state_dict(new_state_dict)
+
+    train_loader, validation_loader, test_loader = create_data_loaders(opt, 'mapping_data.h5')
+    attributions_saliency, attributions_ig = test_and_interpret(model, test_loader, cox_loss, device)

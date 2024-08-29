@@ -1,5 +1,6 @@
 import pandas as pd
 import torch
+import h5py
 from pdb import set_trace
 from torch import nn
 import torch.nn.functional as F
@@ -22,13 +23,18 @@ from collections import Counter
 # for profiling
 # torch.autograd.profiler.profile(enabled=True)
 from torch.profiler import profile, record_function, ProfilerActivity
+from PIL import Image
+from sklearn.model_selection import train_test_split
 
 # on Dell laptop (activate conda env 'pytorch_py3p10' and use 'python trainer.py')
+# should we run only on one 1 GPU to avoid issues with the Cox loss calculation (need to understand if this is indeed a problem)
 # on Polaris, activate env /lus/eagle/clone/g2/projects/GeomicVar/tarak/multimodal_learning_T1/pytorch_py3p10
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--create_new_data_mapping', type=str, default=False,
                     help="whether to create new data mapping or use existing one")
+parser.add_argument('--create_new_data_mapping_h5', type=str, default=False,
+                    help="whether to create new HDF5 data mapping or use existing one")
 parser.add_argument('--input_mapping_data_path', type=str,
                     # default='/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/joint_fusion/', # on laptop
                     default='/lus/eagle/clone/g2/projects/GeomicVar/tarak/multimodal_learning_T1/joint_fusion/',
@@ -54,14 +60,16 @@ parser.add_argument('--checkpoint_dir', type=str,
                     help='Path to the checkpoint files from trained VAE for omic embedding generation')
 # parser.add_argument('--output_path', type=str, default='results/output.txt', help='Path to output results file')
 parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training (overall)')
-parser.add_argument('--val_batch_size', type=int, default=1000, help='Batch size for validation data (using all samples for better Cox loss calculation)')
+parser.add_argument('--val_batch_size', type=int, default=1000,
+                    help='Batch size for validation data (using all samples for better Cox loss calculation)')
+parser.add_argument('--test_batch_size', type=int, default=1, help='Batch size for testing')
 parser.add_argument('--lr', type=float, default=0.0001, help='Learning rate')
 parser.add_argument('--lr_decay_iters', type=int, default=100, help='Learning rate decay steps')
 parser.add_argument('--num_epochs', type=int, default=100, help='Number of training epochs')
 parser.add_argument('--gpu_ids', type=str, default='0', help='gpu ids: e.g. 0  0,1,2, 0,2. use -1 for CPU')
 parser.add_argument('--input_size_wsi', type=int, default=256, help="input_size for path images")
 parser.add_argument('--embedding_dim_wsi', type=int, default=384, help="embedding dimension for WSI")
-parser.add_argument('--embedding_dim_omic', type=int, default=256, help="embedding dimension for omic")
+parser.add_argument('--embedding_dim_omic', type=int, default=128, help="embedding dimension for omic")
 parser.add_argument('--input_mode', type=str, default="wsi_omic", help="wsi, omic, wsi_omic")
 parser.add_argument('--fusion_type', type=str, default="joint",
                     help="early, late, joint, joint_omic, unimodal")  # "joint_omic" only trains the omic embedding generator jointly with the downstream combined model
@@ -117,6 +125,46 @@ if opt.create_new_data_mapping:
 else:
     mapping_df = pd.read_json(opt.input_mapping_data_path + "mapping_df.json", orient='index')
 
+# set_trace()
+
+mapping_df_train, temp_df = train_test_split(mapping_df, test_size=0.3, random_state=40)
+mapping_df_val, mapping_df_test = train_test_split(temp_df, test_size=0.5, random_state=40)
+
+
+def create_h5_file(file_name, train_df, val_df, test_df, image_dir):
+    with h5py.File(file_name, 'w') as hdf:
+        for df, split in zip([train_df, val_df, test_df], ['train', 'val', 'test']):
+            split_group = hdf.create_group(split)
+            total_rows = len(df)
+            count_row = 0
+            for idx, row in df.iterrows():
+                # set_trace()
+                count_row += 1
+                print(f"Processing {split} data: {count_row}/{total_rows} rows")
+                patient_group = split_group.create_group(idx)
+                patient_group.create_dataset('days_to_death', data=row['days_to_death'])
+                patient_group.create_dataset('days_to_last_followup', data=row['days_to_last_followup'])
+                patient_group.create_dataset('days_to_event', data=row['time'])
+                patient_group.create_dataset('event_occurred', data=1 if row['event_occurred'] == 'Dead' else 0)
+
+                # store RNA-seq data
+                # rnaseq_data = np.log1p(np.array(list(row['rnaseq_data'].values())))
+                rnaseq_data = np.array(list(row['rnaseq_data'].values()))
+                patient_group.create_dataset('rnaseq_data', data=rnaseq_data)
+
+                # store image tiles
+                images_group = patient_group.create_group('images')
+                for i, tile in enumerate(row['tiles']):
+                    image_path = os.path.join(image_dir, tile)
+                    image = Image.open(image_path)
+                    img_arr = np.array(image)
+                    images_group.create_dataset(f'image_{i}', data=img_arr, compression='gzip')
+
+
+if opt.create_new_data_mapping_h5:
+    # create h5 version of mapping_df for faster IO
+    create_h5_file('mapping_data.h5', mapping_df_train, mapping_df_val, mapping_df_test, opt.input_wsi_path)
+
 ## create k folds from mapping_df
 # def create_train_test_split(mapping_df):
 #     mapping_df_train, mapping_df_test = train_test_split(mapping_df, test_size=0.2, random_state=42)
@@ -149,6 +197,6 @@ if opt.profile:
 # ) as prof:
 
 else:
-    model, optimizer = train_nn(opt, mapping_df, device)
+    model, optimizer = train_nn(opt, 'mapping_data.h5', device)
 # break
 # set_trace()
