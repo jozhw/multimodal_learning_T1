@@ -527,6 +527,7 @@ def test_and_interpret(model, test_loader, cox_loss, device):
                         saliency, _ = torch.max(image.grad.data.abs(), dim=1)
                         # saliencies.append(saliency)
                         plot_saliency_maps(saliency, image, tcga_id, patch_idx)
+                        del saliency
                     else:
                         raise RuntimeError("Gradients have not been computed for one of the images in x_wsi.")
                     patch_idx += 1
@@ -540,11 +541,14 @@ def test_and_interpret(model, test_loader, cox_loss, device):
 
             # print("\n loss (test): ", loss.data.item())
             # test_loss_epoch += loss.data.item() * len(tcga_id)
-            all_predictions.append(outputs.squeeze())
+            all_predictions.append(outputs.squeeze().detach().cpu().numpy())
+            # all_predictions.append(outputs.squeeze())
+            del outputs
+            torch.cuda.empty_cache()
             all_tcga_ids.append(tcga_id)
             all_times.append(days_to_event)
             all_events.append(event_occurred)
-            del outputs
+            model.zero_grad()
             torch.cuda.empty_cache()
         set_trace()
         # test_loss = test_loss_epoch / len(test_loader.dataset)
