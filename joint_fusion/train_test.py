@@ -406,13 +406,62 @@ def print_total_parameters(model):
     print(f"Total parameters: {total_params / 1e6} million")
     print("Number of trainable params: ", sum(p.numel() for p in model.parameters() if p.requires_grad))
 
+def denormalize_image(image, mean, std):
+    mean = np.array(mean)
+    std = np.array(std)
+    image = (image * std) + mean
+    image = np.clip(image, 0, 1)
+    return image
+
+def plot_saliency_maps(saliencies, x_wsi, tcga_id, patch_id):
+    # get the first image and saliency map
+    saliency = saliencies[0].squeeze().cpu().numpy()
+    # image = x_wsi[0].squeeze().permute(1, 2, 0).cpu().numpy()  # convert image to HxWxC and move to cpu
+    image = x_wsi[0].squeeze().permute(1, 2, 0).detach().cpu().numpy()
+    # denormalize the image based on normalization factors used during transformations of the test images
+    mean = [0.70322989, 0.53606487, 0.66096631]
+    std = [0.21716536, 0.26081574, 0.20723464]
+    image = denormalize_image(image, mean, std)
+
+    # normalize the saliency map to [0, 1]
+    saliency = (saliency - saliency.min()) / (saliency.max() - saliency.min())
+
+    plt.figure(figsize=(18, 6))
+
+    plt.subplot(1, 3, 1)
+    plt.imshow(image)
+    plt.title("original patch")
+
+    # overlay saliency map on the image
+    ax = plt.subplot(1, 3, 2)
+    img = ax.imshow(image)
+    saliency_overlay = ax.imshow(saliency, cmap='hot', alpha=0.5)
+    # saliency_overlay = ax.imshow(np.clip(saliency, 0.8, 1), cmap='hot', alpha=0.5)
+    cbar = plt.colorbar(saliency_overlay, ax=ax)
+    cbar.set_label('saliency value', rotation=270, labelpad=15)
+
+    plt.title("saliency map overlay")
+
+    # plot the saliency map alone
+    plt.subplot(1, 3, 3)
+    plt.imshow(saliency, cmap='hot')
+    plt.colorbar(label='saliency value')
+    plt.title("saliency map only")
+
+    save_path = f'./saliency_maps/saliency_overlay_{tcga_id[0]}_{patch_id}.png'
+    plt.savefig(save_path)
+    print(f"saved saliency overlay to {save_path}")
+
+    plt.close()
 
 def test_and_interpret(model, test_loader, cox_loss, device):
     model.eval()
     test_loss_epoch = 0.0
+    all_tcga_ids = []
     all_predictions = []
     all_times = []
     all_events = []
+
 
     # create the directory to save saliency maps if it doesn't exist
     output_dir = "./saliency_maps"
@@ -422,66 +471,100 @@ def test_and_interpret(model, test_loader, cox_loss, device):
     # see WSIEncoder class in generate_Wsi_embeddings.py
 
     # Get the CI and the KM plots for the test set
-    for batch_idx, (tcga_id, days_to_event, event_occurred, x_wsi, x_omic) in enumerate(test_loader):
-        with torch.no_grad():  # disable gradients during data loading and moving to the device
+    excluded_ids = ['TCGA-05-4395', 'TCGA-86-8281'] # contains anomalous time to event and censoring data
+    with torch.no_grad():  # disable gradients during data loading and moving to the device
+        for batch_idx, (tcga_id, days_to_event, event_occurred, x_wsi, x_omic) in enumerate(test_loader):
+            # skip the excluded TCGA IDs
+            if tcga_id[0] in excluded_ids:
+                print(f"Skipping TCGA ID: {tcga_id}")
+                continue
+
             x_wsi = [x.to(device) for x in x_wsi]
             x_omic = x_omic.to(device)
             days_to_event = days_to_event.to(device)
             event_occurred = event_occurred.to(device)
 
-        # enable gradients only after data loading
-        x_wsi = [x.requires_grad_() for x in x_wsi]
+            # enable gradients only after data loading
+            x_wsi = [x.requires_grad_() for x in x_wsi]
 
-        print(f"Batch size: {len(test_loader.dataset)}")
-        print(f"Test Batch index: {batch_idx + 1} out of {np.ceil(len(test_loader.dataset) / opt.test_batch_size)}")
-        print("Days to event: ", days_to_event)
-        print("event occurred: ", event_occurred)
+            print(f"Batch size: {len(test_loader.dataset)}")
+            print(f"Test Batch index: {batch_idx + 1} out of {np.ceil(len(test_loader.dataset) / opt.test_batch_size)}")
+            print("TCGA ID: ", tcga_id)
+            print("Days to event: ", days_to_event)
+            print("event occurred: ", event_occurred)
 
-        # perform the forward pass without torch.no_grad() to allow gradient computation
-        outputs = model(
-            opt,
-            tcga_id,
-            x_wsi=x_wsi,  # list of tensors (one for each tile)
-            x_omic=x_omic,
-        )
+            # perform the forward pass without torch.no_grad() to allow gradient computation
+            with torch.enable_grad():
+                outputs = model(
+                    opt,
+                    tcga_id,
+                    x_wsi=x_wsi,  # list of tensors (one for each tile)
+                    x_omic=x_omic,
+                )
+
+                # Check and print memory usage after each batch
+                allocated_memory = torch.cuda.memory_allocated(device) / (1024 ** 3)  # in GB
+                reserved_memory = torch.cuda.memory_reserved(device) / (1024 ** 3)  # in GB
+
+                print(f"After batch {batch_idx + 1}:")
+                print(f"Allocated memory: {allocated_memory:.2f} GB")
+                print(f"Reserved memory: {reserved_memory:.2f} GB")
+                print(f"Free memory: {torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)} bytes")
+                torch.cuda.empty_cache()
+
+                # set_trace()
+                # backward pass to compute gradients for saliency maps
+                outputs.backward()  # if outputs is not scalar, reduce it to scalar
+
+                # for now, do this only for a single sample
+                # if tcga_id == 'TCGA-73-4659':
+                # saliencies = []  # list of saliency maps corresponding to each image in `x_wsi`
+                patch_idx = 0
+                for image in x_wsi:
+                    if patch_idx >= 10:  # limit to 10 patches
+                        break
+                    if image.grad is not None:
+                        saliency, _ = torch.max(image.grad.data.abs(), dim=1)
+                        # saliencies.append(saliency)
+                        plot_saliency_maps(saliency, image, tcga_id, patch_idx)
+                    else:
+                        raise RuntimeError("Gradients have not been computed for one of the images in x_wsi.")
+                    patch_idx += 1
+                # plot_saliency_maps(saliencies, x_wsi, tcga_id)
+
+
+            # loss = cox_loss(outputs.squeeze(),
+            #                 # predictions are not survival outcomes, rather log-risk scores beta*X
+            #                 days_to_event,
+            #                 event_occurred)  # Cox partial likelihood loss for survival outcome prediction
+
+            # print("\n loss (test): ", loss.data.item())
+            # test_loss_epoch += loss.data.item() * len(tcga_id)
+            all_predictions.append(outputs.squeeze())
+            all_tcga_ids.append(tcga_id)
+            all_times.append(days_to_event)
+            all_events.append(event_occurred)
+            del outputs
+            torch.cuda.empty_cache()
+        set_trace()
+        # test_loss = test_loss_epoch / len(test_loader.dataset)
         # set_trace()
-        # backward pass to compute gradients for saliency maps
-        outputs.backward()  # if outputs is not scalar, reduce it to scalar
-
-        saliencies = []  # list of saliency maps corresponding to each image in `x_wsi`
-        for image in x_wsi:
-            if image.grad is not None:
-                saliency, _ = torch.max(image.grad.data.abs(), dim=1)
-                saliencies.append(saliency)
-            else:
-                raise RuntimeError("Gradients have not been computed for one of the images in x_wsi.")
-            # set_trace()
-
-        loss = cox_loss(outputs.squeeze(),
-                        # predictions are not survival outcomes, rather log-risk scores beta*X
-                        days_to_event,
-                        event_occurred)  # Cox partial likelihood loss for survival outcome prediction
-        # set_trace()
-        print("\n loss (test): ", loss.data.item())
-        test_loss_epoch += loss.data.item() * len(tcga_id)
-        all_predictions.append(outputs.squeeze())
-        all_times.append(days_to_event)
-        all_events.append(event_occurred)
-
-        test_loss = test_loss_epoch / len(test_loader.dataset)
-
-        all_predictions = torch.cat(all_predictions)
-        all_times = torch.cat(all_times)
-        all_events = torch.cat(all_events)
+        all_predictions = torch.stack(all_predictions)
+        all_times = torch.stack(all_times)
+        all_events = torch.stack(all_events)
 
         # convert to numpy arrays for CI calculation
         all_predictions_np = all_predictions.cpu().numpy()
         all_times_np = all_times.cpu().numpy()
         all_events_np = all_events.cpu().numpy()
+        # set_trace()
+        # c_index = concordance_index_censored(all_events_np.astype(bool), all_times_np, all_predictions_np)
+        c_index = concordance_index_censored(all_events_np.astype(bool).flatten(), all_times_np.flatten(),
+                                             all_predictions_np)
+        # # print(f"Test loss: {test_loss}, CI: {c_index[0]}")
+        print(f"CI: {c_index[0]}")
 
-        c_index = concordance_index_censored(all_events_np.astype(bool), all_times_np, all_predictions_np)
-        print(f"Test loss: {test_loss}, CI: {c_index[0]}")
-
+    set_trace()
     # stratify based on the median risk scores
     median_prediction = np.median(all_predictions_np)
     high_risk_idx = all_predictions_np >= median_prediction
@@ -646,7 +729,7 @@ if __name__ == "__main__":
     #                     help='Path to WSI embeddings generated from pretrained pathology foundation model')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size for training')
     parser.add_argument('--val_batch_size', type=int, default=1, help='Batch size for validation')
-    # parser.add_argument('--test_batch_size', type=int, default=1000, help='Batch size for testing')
+    # parser.add_argument('--test_batch_size', type=int, default=1000, help='Batch size for testing (use all samples)')
     parser.add_argument('--test_batch_size', type=int, default=1, help='Batch size for testing')
     parser.add_argument('--input_size_wsi', type=int, default=256, help="input_size for path images")
     parser.add_argument('--embedding_dim_wsi', type=int, default=384, help="embedding dimension for WSI")
