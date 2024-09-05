@@ -59,12 +59,13 @@ parser.add_argument('--checkpoint_dir', type=str,
                     default='/lus/eagle/clone/g2/projects/GeomicVar/tarak/multimodal_learning_T1/joint_fusion/checkpoint_2024-04-20-08-43-52/',
                     help='Path to the checkpoint files from trained VAE for omic embedding generation')
 # parser.add_argument('--output_path', type=str, default='results/output.txt', help='Path to output results file')
-parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training (overall)')
+parser.add_argument('--batch_size', type=int, default=48, help='Batch size for training (overall)')
 parser.add_argument('--val_batch_size', type=int, default=1000,
                     help='Batch size for validation data (using all samples for better Cox loss calculation)')
 parser.add_argument('--test_batch_size', type=int, default=1, help='Batch size for testing')
-parser.add_argument('--lr', type=float, default=0.0001, help='Learning rate')
-parser.add_argument('--lr_decay_iters', type=int, default=100, help='Learning rate decay steps')
+parser.add_argument('--lr', type=float, default=1e-3, help='Initial learning rate')
+parser.add_argument('--step_size', type=int, default=5, help='Learning rate decay steps')
+parser.add_argument('--gamma', type=int, default=0.5, help='StepLR decays the learning rate of each parameter group by gamma every step_size epochs')
 parser.add_argument('--num_epochs', type=int, default=100, help='Number of training epochs')
 parser.add_argument('--gpu_ids', type=str, default='0', help='gpu ids: e.g. 0  0,1,2, 0,2. use -1 for CPU')
 parser.add_argument('--input_size_wsi', type=int, default=256, help="input_size for path images")
@@ -120,10 +121,17 @@ if opt.create_new_data_mapping:
     mapping_df = mapping_df.dropna(subset=['time', 'event_occurred'])
     # remove that from the wsi and rnaseq combined embeddings too
     # rnaseq_df = rnaseq_df.drop(columns=['TCGA-49-6742'])
+    # remove entries with anomalous time_to_death and 'days_to_last_followup' data
+    excluded_ids = ['TCGA-05-4395', 'TCGA-86-8281']  # contains anomalous time to event and censoring data
+    mapping_df = mapping_df[~mapping_df.index.isin(excluded_ids)]
     mapping_df.to_json('mapping_df.json', orient='index')
     rnaseq_df.to_json('rnaseq_df.json', orient='index')
 else:
     mapping_df = pd.read_json(opt.input_mapping_data_path + "mapping_df.json", orient='index')
+    # remove entries with anomalous time_to_death and 'days_to_last_followup' data
+    excluded_ids = ['TCGA-05-4395', 'TCGA-86-8281']  # contains anomalous time to event and censoring data
+    mapping_df = mapping_df[~mapping_df.index.isin(excluded_ids)]
+
 
 # set_trace()
 
