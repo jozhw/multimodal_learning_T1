@@ -23,22 +23,48 @@ from sksurv.metrics import concordance_index_censored
 # from skopt import BayesSearchCV
 # from skopt.space import Real, Categorical, Integer
 import optuna
+import seaborn as sns
+from sklearn.manifold import TSNE
+from umap import UMAP
+from matplotlib.colors import LogNorm
 
-do_hpo = True
-# do_hpo = False
+use_embeddings = 'wsi_omic'  # 'wsi', 'omic', 'wsi_omic'
+visualize_embeddings = False
+do_hpo = False
+# do_hpo = True
 
 input_dir = '/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/early_fusion_inputs/'
 checkpoint_dir = 'checkpoint_2024-04-20-08-43-52'
 # load embeddings from WSI
 wsi_embeddings = pd.read_json(os.path.join(input_dir, 'WSI_embeddings.json'))
-# load embeddings from RNASeq
+# load embeddings from RNASeq (generated from VAE)
 rnaseq_embeddings = pd.read_json(os.path.join(input_dir, 'rnaseq_embeddings_80K.json'))
 
+# keep only the collon columns
+# need to take care of this earlier
+common_columns = wsi_embeddings.columns.intersection(rnaseq_embeddings.columns)
+wsi_embeddings = wsi_embeddings[common_columns]
+rnaseq_embeddings = rnaseq_embeddings[common_columns]
+
+print("wsi_embeddings.shape: ", wsi_embeddings.shape)
+print("rnaseq_embeddings.shape: ", rnaseq_embeddings.shape)
+# set_trace()
 # concatenate embeddings
+tcga_id_count = 0
 combined_embeddings = {}
 for tcga_id in wsi_embeddings.columns:
-    combined_embeddings[tcga_id] = wsi_embeddings[tcga_id].iloc[0] + rnaseq_embeddings[tcga_id].iloc[0]
+    print(tcga_id)
+    tcga_id_count += 1
+    print(tcga_id_count)
+    if use_embeddings == 'wsi':
+        combined_embeddings[tcga_id] = wsi_embeddings[tcga_id].iloc[0]
+    elif use_embeddings == 'omic':
+        combined_embeddings[tcga_id] = rnaseq_embeddings[tcga_id].iloc[0]
+    elif use_embeddings == 'wsi_omic':
+        combined_embeddings[tcga_id] = wsi_embeddings[tcga_id].iloc[0] + rnaseq_embeddings[tcga_id].iloc[0]
 combined_embeddings_df = pd.DataFrame([combined_embeddings])
+# combined_embeddings = wsi_embeddings
+
 # combined embeddings size = 384 + 256 = 640
 
 # load survival outcome from clinical data
@@ -50,12 +76,45 @@ mapping_df['time'] = mapping_df['days_to_death'].fillna(mapping_df['days_to_last
 # NOTE: TCGA-49-6742 seems to have both 'days_to_death' as well as 'days_to_last_followup' as None. So ignoring this for survival analysis
 mapping_df = mapping_df.dropna(subset=['time', 'event_occurred'])
 
+
 # remove that from the wsi and rnaseq combined embeddings too
 combined_embeddings_df = combined_embeddings_df.drop(columns=['TCGA-49-6742'])
 
+# keep only the tcga ids (rows) common to wsi_embeddings and rnaseq_embeddings
+# mapping_df = mapping_df.loc[common_columns]
+# set_trace()
 # converting to entry types recognized by KMF
 mapping_df['event_occurred'] = mapping_df['event_occurred'].map({'Dead': True, 'Alive': False})
 
+# create a df with the embeddings and the time to event vars
+# for only the WSI embeddings
+if visualize_embeddings:
+    embeddings_df = pd.DataFrame({'embeddings': combined_embeddings_df.T[0], 'time': mapping_df['time']})
+    embeddings = np.stack(embeddings_df['embeddings'].values)
+    times = embeddings_df['time'].values
+    tsne = TSNE(n_components=2, random_state=42)
+    embeddings_tsne = tsne.fit_transform(embeddings)
+
+    plt.figure(figsize=(10, 8))
+    sc = plt.scatter(embeddings_tsne[:, 0], embeddings_tsne[:, 1], c=times, cmap='viridis', norm=LogNorm())
+    plt.colorbar(sc, label='Time (days)')
+    plt.title('t-SNE projection of the embeddings, colored by survival time')
+    plt.xlabel('t-SNE 1')
+    plt.ylabel('t-SNE 2')
+    plt.show()
+
+    # umap = UMAP(random_state=42)
+    # embeddings_umap = umap.fit_transform(embeddings)
+    #
+    # plt.figure(figsize=(10, 8))
+    # sc = plt.scatter(embeddings_umap[:, 0], embeddings_umap[:, 1], c=times, cmap='viridis', norm=LogNorm())
+    # plt.colorbar(sc, label='Time (days)')
+    # plt.title('UMAP projection of the embeddings, colored by survival time')
+    # plt.xlabel('UMAP 1')
+    # plt.ylabel('UMAP 2')
+    # plt.show()
+
+# set_trace()
 # # plot histogram of survival time
 # plt.figure(1)
 # plt.hist(mapping_df['time'], bins=20)
@@ -77,23 +136,26 @@ mapping_df_train = mapping_df.loc[mapping_df.index.intersection(train_tcga_ids)]
 mapping_df_validation = mapping_df.loc[mapping_df.index.intersection(validation_tcga_ids)]
 mapping_df_test = mapping_df.loc[mapping_df.index.intersection(test_tcga_ids)]
 
-
 # gradient boosted model
 # prepare structured array for survival data (see https://scikit-survival.readthedocs.io/en/stable/user_guide/00-introduction.html)
 # survival_data = np.array([(event, time) for event, time in zip(mapping_df['event_occurred'], mapping_df['time'])],
 #                          dtype=[('event', bool), ('time', float)])
 # survival_data = Surv.from_arrays(event=mapping_df['event_occurred'], time=mapping_df['time'])
 
-survival_data_train = np.array([(event, time) for event, time in zip(mapping_df_train['event_occurred'], mapping_df_train['time'])],
-                         dtype=[('event', bool), ('time', float)])
+survival_data_train = np.array(
+    [(event, time) for event, time in zip(mapping_df_train['event_occurred'], mapping_df_train['time'])],
+    dtype=[('event', bool), ('time', float)])
 survival_data_train = Surv.from_arrays(event=mapping_df_train['event_occurred'], time=mapping_df_train['time'])
 
-survival_data_validation = np.array([(event, time) for event, time in zip(mapping_df_validation['event_occurred'], mapping_df_validation['time'])],
-                         dtype=[('event', bool), ('time', float)])
-survival_data_validation = Surv.from_arrays(event=mapping_df_validation['event_occurred'], time=mapping_df_validation['time'])
+survival_data_validation = np.array(
+    [(event, time) for event, time in zip(mapping_df_validation['event_occurred'], mapping_df_validation['time'])],
+    dtype=[('event', bool), ('time', float)])
+survival_data_validation = Surv.from_arrays(event=mapping_df_validation['event_occurred'],
+                                            time=mapping_df_validation['time'])
 
-survival_data_test = np.array([(event, time) for event, time in zip(mapping_df_test['event_occurred'], mapping_df_test['time'])],
-                         dtype=[('event', bool), ('time', float)])
+survival_data_test = np.array(
+    [(event, time) for event, time in zip(mapping_df_test['event_occurred'], mapping_df_test['time'])],
+    dtype=[('event', bool), ('time', float)])
 survival_data_test = Surv.from_arrays(event=mapping_df_test['event_occurred'], time=mapping_df_test['time'])
 
 # process the combined embeddings appropriate for model.fit()
@@ -108,17 +170,16 @@ X_train = np.array(X_train_list)
 X_validation = np.array(X_validation_list)
 X_test = np.array(X_test_list)
 
-
 # survival regression
 # instantiate a GBM from scikit survival package (https://scikit-survival.readthedocs.io/en/stable/user_guide/boosting.html)
 # basically this carries out regression using the embeddings as the input features/covariates
 # model = GradientBoostingSurvivalAnalysis(n_estimators=100, learning_rate=1.0, max_depth=1, random_state=0)
-
+# set_trace()
 if do_hpo:
     def objective(trial):
-        n_estimators = trial.suggest_int('n_estimators', 10, 100)
+        n_estimators = trial.suggest_int('n_estimators', 2, 32)
         learning_rate = trial.suggest_float('learning_rate', 0.1, 1.0, log=True)
-        max_depth = trial.suggest_int('max_depth', 1, 5)
+        max_depth = trial.suggest_int('max_depth', 1, 2)
 
         model = GradientBoostingSurvivalAnalysis(
             n_estimators=n_estimators,
@@ -168,7 +229,12 @@ if do_hpo:
     print("Test Concordance Index:", c_index_test)
     model = best_model
 else:
-    model = GradientBoostingSurvivalAnalysis(n_estimators=50, learning_rate=0.01, max_depth=2, random_state=0)
+    model = GradientBoostingSurvivalAnalysis(n_estimators=31,
+                                             learning_rate=0.85,
+                                             max_depth=1,
+                                             # dropout_rate=0.1,
+                                             # subsample=0.7,
+                                             random_state=0)
     # model = GradientBoostingSurvivalAnalysis(n_estimators=92, learning_rate=0.15, max_depth=2, random_state=0)
 
 print("fitting model")
@@ -183,8 +249,10 @@ risk_scores_validation = model.predict(X_validation)
 risk_scores_test = model.predict(X_test)
 
 # model prediction evaluation: concordance index
-c_index_train = concordance_index_censored(mapping_df_train['event_occurred'], mapping_df_train['time'], risk_scores_train)
-c_index_validation = concordance_index_censored(mapping_df_validation['event_occurred'], mapping_df_validation['time'], risk_scores_validation)
+c_index_train = concordance_index_censored(mapping_df_train['event_occurred'], mapping_df_train['time'],
+                                           risk_scores_train)
+c_index_validation = concordance_index_censored(mapping_df_validation['event_occurred'], mapping_df_validation['time'],
+                                                risk_scores_validation)
 c_index_test = concordance_index_censored(mapping_df_test['event_occurred'], mapping_df_test['time'], risk_scores_test)
 
 # (c-index, number of concordant pairs, number of discordant pairs, number of tied pairs, number of uncomparable pairs)
@@ -212,23 +280,56 @@ kmf_low_test = KaplanMeierFitter()
 kmf_test = KaplanMeierFitter()
 # kmf_true = KaplanMeierFitter()
 
-kmf_high_test.fit(durations=mapping_df_test['time'][high_risk_test], event_observed=mapping_df_test['event_occurred'][high_risk_test], label='High Risk')
-kmf_low_test.fit(durations=mapping_df_test['time'][low_risk_test], event_observed=mapping_df_test['event_occurred'][low_risk_test], label='Low Risk')
+kmf_high_test.fit(durations=mapping_df_test['time'][high_risk_test],
+                  event_observed=mapping_df_test['event_occurred'][high_risk_test], label='High Risk')
+kmf_low_test.fit(durations=mapping_df_test['time'][low_risk_test],
+                 event_observed=mapping_df_test['event_occurred'][low_risk_test], label='Low Risk')
 # kmf_test.fit(durations=mapping_df_test['time'], event_observed=mapping_df_test['event_occurred'], label='all')
 # kmf_true.fit()
 
+# kmf_high_test.print_summary(model="untransformed variables", decimals=3)
 
+# set_trace()
 
+# calculate the p-value using the log-rank test
+log_rank_test = logrank_test(
+    mapping_df_test['time'][high_risk_test],
+    mapping_df_test['time'][low_risk_test],
+    event_observed_A=mapping_df_test['event_occurred'][high_risk_test],
+    event_observed_B=mapping_df_test['event_occurred'][low_risk_test],
+)
+
+# p-value from log rank test using the lifelines package
+p_value = log_rank_test.p_value
 
 # survival plots for the GBM predictions
-kmf_high_test.plot_survival_function(color='blue')
-kmf_low_test.plot_survival_function(color='red')
+# kmf_high_test.plot_survival_function(color='blue', at_risk_counts=True, ci_show=False)
+# kmf_low_test.plot_survival_function(color='red', at_risk_counts=True, ci_show=False)
+kmf_high_test.plot_survival_function(color='blue', ci_show=True, show_censors=True, censor_styles={'marker': 'o', 'ms': 6}, alpha=0.1)
+kmf_low_test.plot_survival_function(color='red', ci_show=True, show_censors=True, censor_styles={'marker': 'o', 'ms': 6})
+
+print("kmf_high_test: ", kmf_high_test)
+print("kmf_low_test: ", kmf_low_test)
 # kmf_test.plot_survival_function(color='black')
-plt.title('Survival Analysis: High Risk vs Low Risk based on Predicted Risk Scores')
-plt.xlabel('Time')
-plt.ylabel('Survival Probability')
+# plt.title('Patient stratification: high risk vs low risk groups based on predicted risk scores')
+plt.title(
+    'Patient stratification: high risk vs low risk groups based on predicted risk scores\nLog-rank test p-value: {:.4f}'.format(
+        p_value))
+plt.xlabel('Time (days)')
+plt.xlabel('Time (days)')
+plt.ylabel('Survival probability')
 plt.grid(True)
+plt.ylim([0, 1])
+plt.tight_layout()
 plt.show()
+
+# time dependent ROC
+timepoints = np.linspace(0, max(mapping_df_test['time']), 100)
+roc_values = time_dependent_roc(survival_times, event_observed, predicted_risk_scores, timepoints)
+
+for timepoint, (sensitivity, specificity) in roc_values.items():
+    auc = calculate_auc(sensitivity, specificity)  # Hypothetical function to calculate AUC
+    print(f"Timepoint: {timepoint}, AUC: {auc}")
 
 # stratified survival plots for the GBM predictions
 # kmf_high.plot_survival_function()
