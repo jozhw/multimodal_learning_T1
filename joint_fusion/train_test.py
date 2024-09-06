@@ -5,6 +5,7 @@ import torch
 import os
 import wandb
 import time
+from datetime import datetime
 import matplotlib.pyplot as plt
 import cv2
 from torch import nn
@@ -17,10 +18,13 @@ from torch.cuda.amp import autocast, GradScaler
 from sklearn.model_selection import train_test_split
 from utils import mixed_collate
 from tqdm import tqdm
+from torch.utils.data import ConcatDataset
 
 from datasets import CustomDataset, HDF5Dataset
 from models import MultimodalNetwork, OmicNetwork, print_model_summary
 from generate_wsi_embeddings import CustomDatasetWSI
+
+import h5py
 
 from lifelines import KaplanMeierFitter
 from lifelines.statistics import logrank_test
@@ -41,6 +45,8 @@ from captum.attr import IntegratedGradients, Saliency
 import torchviz
 
 torch.autograd.set_detect_anomaly(True)
+
+current_time = datetime.now().strftime("%y_%m_%d_%H_%M")
 
 
 class CoxLossOld(nn.Module):
@@ -128,7 +134,7 @@ def create_data_loaders(opt, h5_file):
         dataset=HDF5Dataset(opt, h5_file, split='train', mode=opt.input_mode, train_val_test="train"),
         batch_size=opt.batch_size,
         shuffle=True,
-        num_workers=0, #8,
+        num_workers=0,  # 8,
         # prefetch_factor=2,
         pin_memory=True
     )
@@ -137,7 +143,7 @@ def create_data_loaders(opt, h5_file):
         dataset=HDF5Dataset(opt, h5_file, split='val', mode=opt.input_mode, train_val_test="val"),
         batch_size=opt.val_batch_size,
         shuffle=True,
-        num_workers=0, #8,
+        num_workers=0,  # 8,
         # prefetch_factor=2,
         pin_memory=True
     )
@@ -254,6 +260,10 @@ def train_nn(opt, h5_file, device):
         model.train()
         loss_epoch = 0
 
+        # log the learning rate at the start of the epoch
+        current_lr = optimizer.param_groups[0]['lr']
+        wandb.log({"LR": current_lr}, step=epoch)
+
         # model training in batches using the train dataloader
         for batch_idx, (tcga_id, days_to_event, event_occurred, x_wsi, x_omic) in enumerate(train_loader):
             # x_wsi is a list of tensors (one tensor for each tile)
@@ -366,10 +376,10 @@ def train_nn(opt, h5_file, device):
                 all_predictions.append(outputs.squeeze())
                 all_times.append(days_to_event)
                 all_events.append(event_occurred)
-
-                model_path = os.path.join("./saved_models", f"model_epoch_{epoch}.pt") # change the dir name to use date time
-                torch.save(model.state_dict(), model_path)
-                print(f"saved model checkpoint at epoch {epoch} to {model_path}")
+                #
+                # model_path = os.path.join("./saved_models_4sep", f"model_epoch_{epoch}.pt") # change the dir name to use date time
+                # torch.save(model.state_dict(), model_path)
+                # print(f"saved model checkpoint at epoch {epoch} to {model_path}")
 
             val_loss = val_loss_epoch / len(validation_loader.dataset)
             wandb.log({"Loss/validation": val_loss}, step=epoch)
@@ -387,7 +397,10 @@ def train_nn(opt, h5_file, device):
             print(f"Validation loss: {val_loss}, CI: {c_index[0]}")
             wandb.log({"CI/validation": c_index[0]}, step=epoch)
 
-            model_path = os.path.join("./saved_models", f"model_epoch_{epoch}.pt")
+            # model_path = os.path.join("./saved_models_4sep", f"model_epoch_{epoch}.pt")
+            save_dir = f"./saved_models_{current_time}"
+            os.makedirs(save_dir, exist_ok=True)
+            model_path = os.path.join(save_dir, f"model_epoch_{epoch}.pt")
             torch.save(model.state_dict(), model_path)
             print(f"saved model checkpoint at epoch {epoch} to {model_path}")
 
@@ -458,35 +471,46 @@ def plot_saliency_maps(saliencies, x_wsi, tcga_id, patch_id, output_dir):
 
 
 def calc_integrated_gradients(model, opt, tcga_id, x_omic, x_wsi, baseline=None, steps=10):
+    # baseline = None
+    # baseline.shape
+    # torch.Size([1, 19962])
+    # set_trace()
     if baseline is None:
+        print("** using trivial zero baseline for IG **")
         baseline = torch.zeros_like(x_omic).to(x_omic.device)
+    else:
+        print("** Using mean gene expression values over training samples as the baseline for IG **")
+        baseline = torch.from_numpy(baseline).to(x_omic.device)
+        baseline = baseline.float()
+        baseline = baseline * torch.ones_like(x_omic).to(x_omic.device)
+    # set_trace()
     print(f"CALCULATING INTEGRATED GRADIENTS OVER {steps} steps")
     scaled_inputs = [baseline + (float(i) / steps) * (x_omic - baseline) for i in range(steps + 1)]
     gradients = []
-    steps_index= 0
+    steps_index = 0
     for scaled_input in scaled_inputs:
         print("steps_index: ", steps_index)
         scaled_input.requires_grad = True
         with torch.enable_grad():
             output = model(
-                        opt,
-                        tcga_id,
-                        x_wsi=x_wsi,  # list of tensors (one for each tile)
-                        x_omic=scaled_input,
-                    )
+                opt,
+                tcga_id,
+                x_wsi=x_wsi,  # list of tensors (one for each tile)
+                x_omic=scaled_input,
+            )
             print("output: ", output)
             output = output.sum()
             output.backward()
         gradients.append(scaled_input.grad.detach().cpu().numpy())
         steps_index += 1
-    set_trace()
+    # set_trace()
     avg_gradients = np.mean(gradients[:-1], axis=0)
     integrated_grads = (x_omic.detach().cpu().numpy() - baseline.detach().cpu().numpy()) * avg_gradients
 
     return integrated_grads
 
 
-def test_and_interpret(opt, model, test_loader, cox_loss, device):
+def test_and_interpret(opt, model, test_loader, device, baseline=None):
     model.eval()
     test_loss_epoch = 0.0
     all_tcga_ids = []
@@ -495,8 +519,11 @@ def test_and_interpret(opt, model, test_loader, cox_loss, device):
     all_events = []
 
     # create the directory to save saliency maps if it doesn't exist
-    output_dir = "./saliency_maps_4sep"
+    output_dir = "./saliency_maps_6sep"
     os.makedirs(output_dir, exist_ok=True)
+
+    output_dir_IG = "./IG_6sep"
+    os.makedirs(output_dir_IG, exist_ok=True)
 
     # for training, only the last transformer block (block 11) in the WSI encoder was kept trainable
     # see WSIEncoder class in generate_Wsi_embeddings.py
@@ -525,7 +552,7 @@ def test_and_interpret(opt, model, test_loader, cox_loss, device):
             print("Days to event: ", days_to_event)
             print("event occurred: ", event_occurred)
 
-            if not opt.calc_saliency_maps:
+            if opt.calc_saliency_maps is False:
                 outputs = model(
                     opt,
                     tcga_id,
@@ -533,7 +560,7 @@ def test_and_interpret(opt, model, test_loader, cox_loss, device):
                     x_omic=x_omic,
                 )
 
-            if opt.calc_saliency_maps:
+            if opt.calc_saliency_maps is True:
                 # perform the forward pass without torch.no_grad() to allow gradient computation
                 with torch.enable_grad():
                     outputs = model(
@@ -550,7 +577,8 @@ def test_and_interpret(opt, model, test_loader, cox_loss, device):
                     print(f"After batch {batch_idx + 1}:")
                     print(f"Allocated memory: {allocated_memory:.2f} GB")
                     print(f"Reserved memory: {reserved_memory:.2f} GB")
-                    print(f"Free memory: {torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)} bytes")
+                    print(
+                        f"Free memory: {torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)} bytes")
                     torch.cuda.empty_cache()
 
                     # set_trace()
@@ -575,8 +603,12 @@ def test_and_interpret(opt, model, test_loader, cox_loss, device):
                         patch_idx += 1
                     # plot_saliency_maps(saliencies, x_wsi, tcga_id)
 
-            if opt.calc_IG:
-                integrated_grads = calc_integrated_gradients(model, opt, tcga_id, x_omic, x_wsi)
+            if opt.calc_IG is True:
+                integrated_grads = calc_integrated_gradients(model, opt, tcga_id, x_omic, x_wsi, baseline=baseline,
+                                                             steps=10)
+                save_path = os.path.join(output_dir_IG, f"integrated_grads_{tcga_id[0]}.npy")
+                np.save(save_path, integrated_grads)
+                print(f"Saved integrated gradients for {tcga_id[0]} to {save_path}")
             # set_trace()
 
             # loss = cox_loss(outputs.squeeze(),
@@ -596,22 +628,30 @@ def test_and_interpret(opt, model, test_loader, cox_loss, device):
             model.zero_grad()
             torch.cuda.empty_cache()
         # set_trace()
-        # test_loss = test_loss_epoch / len(test_loader.dataset)
+        # # test_loss = test_loss_epoch / len(test_loader.dataset)
         # set_trace()
-        all_predictions = torch.stack(all_predictions)
-        all_times = torch.stack(all_times)
-        all_events = torch.stack(all_events)
+        # all_predictions = torch.stack(all_predictions)
+        # all_times = torch.stack(all_times)
+        # all_events = torch.stack(all_events)
+        #
+        # # convert to numpy arrays for CI calculation
+        # all_predictions_np = all_predictions.cpu().numpy()
+        # all_times_np = all_times.cpu().numpy()
+        # all_events_np = all_events.cpu().numpy()
+        # # set_trace()
+        # # c_index = concordance_index_censored(all_events_np.astype(bool), all_times_np, all_predictions_np)
+        # c_index = concordance_index_censored(all_events_np.astype(bool).flatten(),
+        #                                      all_times_np.flatten(),
+        #                                      all_predictions_np)
+        # # # print(f"Test loss: {test_loss}, CI: {c_index[0]}")
 
-        # convert to numpy arrays for CI calculation
-        all_predictions_np = all_predictions.cpu().numpy()
-        all_times_np = all_times.cpu().numpy()
-        all_events_np = all_events.cpu().numpy()
-        # set_trace()
-        # c_index = concordance_index_censored(all_events_np.astype(bool), all_times_np, all_predictions_np)
-        c_index = concordance_index_censored(all_events_np.astype(bool).flatten(),
-                                             all_times_np.flatten(),
-                                             all_predictions_np)
-        # # print(f"Test loss: {test_loss}, CI: {c_index[0]}")
+        all_predictions_np = [pred.item() for pred in all_predictions]
+        all_events_np = torch.stack(all_events).cpu().numpy()
+        all_events_bool_np = all_events_np.astype(bool)
+        all_times_np = torch.stack(all_times).cpu().numpy()
+
+        c_index = concordance_index_censored(all_events_bool_np.ravel(), all_times_np.ravel(), all_predictions_np)
+
         print(f"CI: {c_index[0]}")
 
     set_trace()
@@ -655,7 +695,7 @@ def test_and_interpret(opt, model, test_loader, cox_loss, device):
     plt.savefig('km_plot_joint_fusion.png', format='png', dpi=300)
     # plt.show()
 
-    set_trace()
+    # set_trace()
 
     # # the flow of the gradients in backprop should be through the downstream MLP and the omic MLP
     #
@@ -766,6 +806,7 @@ def test_and_interpret(opt, model, test_loader, cox_loss, device):
 
     return None
 
+
 if __name__ == "__main__":
     # for inference
     import argparse
@@ -787,11 +828,13 @@ if __name__ == "__main__":
     parser.add_argument('--test_batch_size', type=int, default=1, help='Batch size for testing')
     parser.add_argument('--input_size_wsi', type=int, default=256, help="input_size for path images")
     parser.add_argument('--embedding_dim_wsi', type=int, default=384, help="embedding dimension for WSI")
-    parser.add_argument('--embedding_dim_omic', type=int, default=128, help="embedding dimension for omic")
+    parser.add_argument('--embedding_dim_omic', type=int, default=256, help="embedding dimension for omic")
     parser.add_argument('--input_mode', type=str, default="wsi_omic", help="wsi, omic, wsi_omic")
     parser.add_argument('--fusion_type', type=str, default="joint", help="early, late, joint, joint_omic, unimodal")
-    parser.add_argument('--calc_saliency_maps', type=bool, default=True, help="whether to calculate saliency maps for WSI patches")
+    parser.add_argument('--calc_saliency_maps', type=bool, default=True,
+                        help="whether to calculate saliency maps for WSI patches")
     parser.add_argument('--calc_IG', type=bool, default=True, help="whether to calculate IG for RNASeq data")
+    # Note: True/False have some issues when used in command line
     opt = parser.parse_args()
 
     # mapping_df = pd.read_json(opt.input_mapping_data_path + "mapping_df.json", orient='index')
@@ -809,8 +852,12 @@ if __name__ == "__main__":
     model.to(device)
     cox_loss = CoxLoss()
     # model.load_state_dict(torch.load("./saved_models/model_epoch_98.pt"))
-    model.load_state_dict(torch.load("./saved_models/model_epoch_8.pt"))
-    # model.load_state_dict(torch.load("./saved_models/model_epoch_1.pt"))
+    # model.load_state_dict(torch.load("./saved_models/model_epoch_8.pt"))
+    # model.load_state_dict(torch.load("./saved_models_4sep/model_epoch_20.pt"))
+
+    # model.load_state_dict(torch.load("./saved_models_24_09_05_06_11/model_epoch_21.pt"))
+    # model.load_state_dict(torch.load("./saved_models_24_09_05_18_21/model_epoch_44.pt"))  # start LR = 1e-3
+    model.load_state_dict(torch.load("./saved_models_24_09_05_23_49/model_epoch_169.pt"))  # 169 # start LR = 1e-4
 
     # state_dict = torch.load("./saved_models/model_epoch_98.pt")
     # from collections import OrderedDict
@@ -822,4 +869,58 @@ if __name__ == "__main__":
     # model.load_state_dict(new_state_dict)
 
     train_loader, validation_loader, test_loader = create_data_loaders(opt, 'mapping_data.h5')
-    attributions_saliency, attributions_ig = test_and_interpret(opt, model, test_loader, cox_loss, device)
+    validation_dataset = validation_loader.dataset
+    test_dataset = test_loader.dataset
+    combined_dataset = ConcatDataset([validation_dataset, test_dataset])
+
+    # create a combined loader (validation + test) as the validation data hasn't been used for HPO during training
+    combined_loader = torch.utils.data.DataLoader(
+        dataset=combined_dataset,
+        batch_size=opt.test_batch_size,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=True
+    )
+
+
+    # # get the baseline for x_omic for IG from the training data (mean expression level for all genes)
+    # total_x_omic = None
+    # total_samples = 0
+    #
+    # # loop over train_loader and accumulate the omic data
+    # for batch_idx, (tcga_id, days_to_event, event_occurred, x_wsi, x_omic) in enumerate(train_loader):
+    #     print(f"Looping over batch {batch_idx}")
+    #     if total_x_omic is None:
+    #         total_x_omic = torch.zeros_like(x_omic)
+    #
+    #     total_x_omic += x_omic.sum(dim=0)
+    #     total_samples += x_omic.size(0)
+    #
+    # # compute the mean expression for each gene across all samples
+    # mean_x_omic = total_x_omic / total_samples
+
+    # get the mean expression level for all genes across all the training samples
+
+    def compute_mean_omic_from_h5(file_name):
+        with h5py.File(file_name, 'r') as hdf:
+            train_group = hdf['train']
+            total_rnaseq_data = None
+            total_samples = 0
+
+            for patient_id in train_group.keys():
+                patient_group = train_group[patient_id]
+                rnaseq_data = patient_group['rnaseq_data'][:]
+                if total_rnaseq_data is None:
+                    total_rnaseq_data = np.zeros_like(rnaseq_data)
+                total_rnaseq_data += rnaseq_data
+                total_samples += 1
+            mean_rnaseq_data = total_rnaseq_data / total_samples
+
+        return mean_rnaseq_data
+
+
+    mean_x_omic = compute_mean_omic_from_h5('mapping_data.h5')
+
+    test_and_interpret(opt, model, combined_loader, device, baseline=mean_x_omic)
+    # test_and_interpret(opt, model, combined_loader, device, baseline=None)
+    # test_and_interpret(opt, model, test_loader, device) # remove cox_loss from the arguments
