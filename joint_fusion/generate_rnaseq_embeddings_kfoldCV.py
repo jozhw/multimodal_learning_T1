@@ -169,16 +169,18 @@ def main(opt):
     #     input_dim = x_omic.shape[1]  # assuming x_omic is of shape (batch_size, num_genes)
     #     break
     input_dim = 19962 # remove this hard-coding
-    model = BetaVAE(input_dim=input_dim,
-                    latent_dim=opt.latent_dim,
-                    intermediate_dim=opt.intermediate_dim,
-                    beta=opt.beta)
+    # model = BetaVAE(input_dim=input_dim,
+    #                 latent_dim=opt.latent_dim,
+    #                 intermediate_dim=opt.intermediate_dim,
+    #                 beta=opt.beta)
 
     reconstruction_loss, kl_divergence_loss, val_loss = None, None, None
 
-    if torch.cuda.device_count() > 1:
-        print(f"using {torch.cuda.device_count()} GPUs")
-        model = nn.DataParallel(model)
+    # if torch.cuda.device_count() > 1:
+    #     print(f"using {torch.cuda.device_count()} GPUs")
+    #     model = nn.DataParallel(model)
+
+    # set_trace()
 
     # create multiple folds from the training data
     kf = KFold(n_splits=5, shuffle=True, random_state=42)  # 5-fold CV
@@ -215,6 +217,11 @@ def main(opt):
                         latent_dim=opt.latent_dim,
                         intermediate_dim=opt.intermediate_dim,
                         beta=opt.beta)
+
+        if torch.cuda.device_count() > 1:
+            print(f"using {torch.cuda.device_count()} GPUs")
+            model = nn.DataParallel(model)
+
         # model = BetaVAE(config)
         model = model.to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=opt.lr)
