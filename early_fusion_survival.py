@@ -1,3 +1,6 @@
+# Code to carry out survival prediction using tree based gradient boosted model for multimodal (histology and bulk RNASeq) and unimodal inputs
+# GBM is preferred over NNs for relatively small number of training samples
+
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -12,14 +15,17 @@ from sklearn.model_selection import KFold
 import h5py
 from pdb import set_trace
 
+# whether to carry out hyperparameter optimization for the GBM
 # do_hpo = True
 do_hpo = True
+# number of folds for cross validation
 num_folds = 10
-fusion = True
-only_wsi = False
-only_omic = False
+# whether to use multimodal or unimodal data
+fusion = True  # uses noth histology and rnaseq embeddings
+only_wsi = False # uses only histology embeddings
+only_omic = False # uses only rnaseq embeddings
 
-
+# location of the trained VAE for rnaseq embedding generation
 # checkpoint_dir = 'checkpoint_2024-10-18-06-49-51'
 checkpoint_dir = 'checkpoint_2024-10-18-21-57-09'
 fold_id = 0
