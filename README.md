@@ -89,10 +89,22 @@ python trainer.py --input_path --input_wsi_path --batch_size --lr --lr_decay_ite
 
 
 ## Steps for obtaining survival predictions using early fusion 
+### Dataset creation
 1. Use slideflow to create 256x256 tiles from the WSIs. Use [preprocessing/slideflow_preprocessing.py](https://github.com/DOE-LUCID/multimodal_learning_T1/tree/main/preprocessing/slideflow_preprocessing.py) [To create consistent number of samples from the hand-cleaned tiles from the WSIs with pen marks, use [subsample_tiles.py](https://github.com/DOE-LUCID/multimodal_learning_T1/blob/main/preprocessing/subsample_tiles.py)]
 2. Create 'batchcorrected_combined_rnaseq_TCGA-LUAD.tsv containing the batch corrected TPM (transcripts per million; normalized counts) values 
 3. Create a json file ('mapped_data_*.json') containing the TCGA ID, the corresponding TCGA WSI tile names, RNASeq data, and clinical data (dead/alive, time to death/time to last followup) using [joint-fusion/create_image_molecular_mapping.py](https://github.com/DOE-LUCID/multimodal_learning_T1/blob/main/joint_fusion/create_image_molecular_mapping.py)
-3. Generate slide level embeddings from the WSIs using a pretrained pathology foundation model [joint-fusion/generate_wsi_embeddings.py](https://github.com/DOE-LUCID/multimodal_learning_T1/blob/main/joint_fusion/generate_wsi_embeddings.py)
-4. Train a VAE using 90% of the samples with [joint-fusion/generate_rnaseq_embeddings.py](https://github.com/DOE-LUCID/multimodal_learning_T1/blob/main/joint_fusion/generate_rnaseq_embeddings.py) setting 'training=True'
-5. Generate RNASeq embeddings using [joint-fusion/generate_rnaseq_embeddings.py](https://github.com/DOE-LUCID/multimodal_learning_T1/blob/main/joint_fusion/generate_rnaseq_embeddings.py)
-5. Create file containing the clinical data ('days_to_death', 'days_to_last_followup', 'vital_status' (dead/alive)) from the TCGA bcr xml files (combined_clinical_TCGA-LUAD.csv using [preprocessing/create_combined_clinical_parallel.py](https://github.com/DOE-LUCID/multimodal_learning_T1/blob/main/preprocessing/create_combined_clinical_parallel.py)
+4. Clean up the above json file to retain only the samples of interest, and create a h5 file containing the mapping information using [trainer.py]()
+### Embedding generation for histology and bulk rnaseq modalities
+5. Generate slide level embeddings from the WSIs using a pretrained pathology foundation model [joint-fusion/generate_wsi_embeddings.py](https://github.com/DOE-LUCID/multimodal_learning_T1/blob/main/joint_fusion/generate_wsi_embeddings.py)
+6. Train a VAE using 90% of the samples with [joint-fusion/generate_rnaseq_embeddings_kfoldCV.py](https://github.com/DOE-LUCID/multimodal_learning_T1/blob/main/joint_fusion/generate_rnaseq_embeddings_kfoldCV.py) setting 'training=True'
+7. Generate RNASeq embeddings using [joint-fusion/generate_rnaseq_embeddings_kfoldCV.py](https://github.com/DOE-LUCID/multimodal_learning_T1/blob/main/joint_fusion/generate_rnaseq_embeddings_kfoldCV.py) setting 'inference=True'
+<!--5. Create file containing the clinical data ('days_to_death', 'days_to_last_followup', 'vital_status' (dead/alive)) from the TCGA bcr xml files (combined_clinical_TCGA-LUAD.csv using [preprocessing/create_combined_clinical_parallel.py](https://github.com/DOE-LUCID/multimodal_learning_T1/blob/main/preprocessing/create_combined_clinical_parallel.py) -->
+### Train model for survival prediction using gradient boosted survival tree (preferred over NNs for relatively small number of training samples)
+8. Run [early_fusion_survival.py](https://github.com/DOE-LUCID/multimodal_learning_T1/blob/main/early_fusion_survival.py) for inference using the embeddings created using the above steps
+
+
+## Steps for obtaining survival predictions using joint fusion 
+
+1. Run [joint_fusion/trainer.py]() for training
+2. Run [joint_fusion/train_test.py]() for inference and XAI metrics
+3. 
