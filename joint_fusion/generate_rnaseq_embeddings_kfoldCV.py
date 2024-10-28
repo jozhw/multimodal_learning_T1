@@ -1,4 +1,8 @@
+# code for training VAE and generating embeddings for bulk RNASeq data for early fusion
 # Implement a MLP based VAE to create lower dimensional embeddings of the RNASeq data
+# run directly for generating embeddings for early fusion
+# otherwise, functions used by models.py for joint fusion
+
 # conda activate pytorch_py3p10 on laptop
 # use 'wandb sweep sweep_config.yaml' followed by 'wandb agent <username>/<project_name>/<sweep_id>' [just follow the instructions after 'wandb sweep'] for HPO runs with wandb
 # for running without HPO, simply use "python generate_rnaseq_embeddings.py"
@@ -26,7 +30,7 @@ from datasets import CustomDataset
 import wandb
 from pdb import set_trace
 
-if __name__ == "__main__":
+if __name__ == "__main__": # for early fusion
     from train_test import create_data_loaders
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -35,33 +39,6 @@ if device.type == 'cuda':
     print("Running on GPU")
 else:
     print("Running on CPU")
-
-# # df containing the samples with both WSI and rnaseq data (generated vy trainer.py)
-# mapping_df = pd.read_json(
-#     "./mapping_df.json",
-#     orient='index')
-#
-# h5_file = 'mapping_data.h5'
-#
-# set_trace()
-# ######################### VAE HYPERPARAMETERS ############################
-# lengths = mapping_df['rnaseq_data'].apply(lambda x: len(x))
-# lengths_equal = lengths.all()
-# if lengths_equal:
-#     print("all tcga samples have the same number of genes")
-# else:
-#     print("WARNING: all tcga samples DO NOT have the same number of genes ")
-#
-# input_dim = lengths.iloc[0]  # number of genes (~ 20K)
-# intermediate_dim = 128
-# lr = 1e-4
-# latent_dim = 64  # get from the input opt
-# beta = 0.005  # 0.01   # 0: equivalent to standard autoencoder; 1: equivalent to standard VAE
-
-# train_batch_size = 128
-# val_batch_size = 8
-# test_batch_size = 8
-# num_epochs = 200000
 
 class BetaVAE(nn.Module):
     def __init__(self, input_dim=None, latent_dim=None, intermediate_dim=None, beta=None, config=None):
@@ -116,13 +93,13 @@ def loss_function(recon_x, x, mean, log_var):
 
 
 # function to take a trained VAE and generate embeddings for a new rnaseq dataset
-# essentially, just pass the input through the encoder network
+# essentially, it just passes the input through the trained encoder network
 # for early fusion, these embeddings should be loaded only once (before training of the downstream MLP starts)
 def get_omic_embeddings(x_omic, latest_checkpoint, checkpoint_dir=None):
     print("In get_omic_embeddings()")
     # work directly on the tensor on the device
     # x_omic = torch.log1p(x_omic) # not required as already done in the data loader
-    input_dim = 19962
+    input_dim = 19962 # remove this hard-coded value
 
     model = BetaVAE(input_dim=input_dim,
                     latent_dim=opt.latent_dim,
@@ -135,7 +112,7 @@ def get_omic_embeddings(x_omic, latest_checkpoint, checkpoint_dir=None):
 
     checkpoint_path = os.path.join(checkpoint_dir, latest_checkpoint)
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    # set_trace()
+
     # for some reason 'module' gets added to the names of the model parameters, so adjusting the state dictionary to remove 'module.' prefix
     new_state_dict = {key.replace("module.", ""): value for key, value in checkpoint['model_state_dict'].items()}
     # model.load_state_dict(checkpoint['model_state_dict'])
@@ -152,7 +129,6 @@ def get_omic_embeddings(x_omic, latest_checkpoint, checkpoint_dir=None):
             embeddings.append(mean.cpu().numpy())
     # concatenate all batch embeddings into a single numpy array
     embeddings = np.concatenate(embeddings, axis=0)
-    # set_trace()
     return embeddings
 
 
@@ -169,18 +145,12 @@ def main(opt):
     #     input_dim = x_omic.shape[1]  # assuming x_omic is of shape (batch_size, num_genes)
     #     break
     input_dim = 19962 # remove this hard-coding
-    # model = BetaVAE(input_dim=input_dim,
-    #                 latent_dim=opt.latent_dim,
-    #                 intermediate_dim=opt.intermediate_dim,
-    #                 beta=opt.beta)
 
     reconstruction_loss, kl_divergence_loss, val_loss = None, None, None
 
     # if torch.cuda.device_count() > 1:
     #     print(f"using {torch.cuda.device_count()} GPUs")
     #     model = nn.DataParallel(model)
-
-    # set_trace()
 
     # create multiple folds from the training data
     kf = KFold(n_splits=5, shuffle=True, random_state=42)  # 5-fold CV
@@ -189,6 +159,7 @@ def main(opt):
     total_samples = len(dataset)
     print(f"total training data size: {total_samples} samples")
 
+    # train models over all folds
     for fold, (train_idx, val_idx) in enumerate(kf.split(dataset)):
         print(f"Fold {fold + 1}/{kf.get_n_splits()}")
 
@@ -222,7 +193,6 @@ def main(opt):
             print(f"using {torch.cuda.device_count()} GPUs")
             model = nn.DataParallel(model)
 
-        # model = BetaVAE(config)
         model = model.to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=opt.lr)
         # scheduler = CosineAnnealingLR(optimizer, T_max=opt.num_epochs, eta_min=opt.lr_min)
@@ -256,6 +226,7 @@ def main(opt):
                 optimizer.step()
                 train_loss += loss.item()
 
+            # print training loss, calculate validation loss, and save trained model every 100 epochs
             if epoch % 100 == 0 and epoch > 0:
                 train_loss /= len(train_loader_fold.dataset)
                 print(f"Training loss at epoch {epoch}: {train_loss}")
@@ -277,8 +248,6 @@ def main(opt):
                 val_loss /= len(val_loader_fold.dataset)
                 print(f"Validation loss at epoch {epoch}: {val_loss}")
 
-            # save model and other states every 100 epochs
-            # if epoch % 100 == 0 and epoch > 0:
                 checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_fold_{fold}_epoch_{epoch}.pth")
                 torch.save({
                     'epoch': epoch,
@@ -288,6 +257,7 @@ def main(opt):
                 }, checkpoint_path)
                 print(f"Checkpoint saved at epoch {epoch}, fold {fold}, to {checkpoint_path}")
 
+            # track losses using weights and biases
             wandb.log({"epoch": epoch,
                        "fold": fold,
                        "LR": current_lr,
@@ -298,18 +268,16 @@ def main(opt):
 
             scheduler.step()
 
-            # print(f'epoch {epoch}, train loss: {train_loss}, val loss: {val_loss}')
-
     wandb.finish()
 
 
-# for both training and inference when run directly
+# for early fusion training, and inference (generate embeddings from trained model)
 if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    training = True
-    inference = False
+    training = False
+    inference = True
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--input_wsi_path', type=str,
@@ -328,7 +296,7 @@ if __name__ == "__main__":
     parser.add_argument('--lr_min', type=float, default=1e-6, help='Minimum Learning rate')
     parser.add_argument('--latent_dim', type=int, default=256, help='Dimension of the latent space')
     parser.add_argument('--beta', type=float, default=0.005, help='Beta parameter for VAE')
-    parser.add_argument('--num_epochs', type=int, default=2000, help='Number of epochs for training')
+    parser.add_argument('--num_epochs', type=int, default=4000, help='Number of epochs for training')
 
     opt = parser.parse_args()
 
@@ -339,24 +307,17 @@ if __name__ == "__main__":
 
         main(opt)
 
-    # elif inference:
-    #     # checkpoint_dir = "checkpoint_2024-04-20-08-43-52"
-    #     checkpoint_dir = "checkpoint_2024-09-03-02-17-37"
-    #     latest_checkpoint = 'checkpoint_epoch_700.pth'
-    #
-    #     # custom_dataset = CustomDataset(opt, mapping_df, mode='omic')
-    #     # train_loader = torch.utils.data.DataLoader(dataset=custom_dataset,
-    #     #                                            batch_size=1,
-    #     #                                            shuffle=False, )
-
     elif inference:
         # checkpoint_dir = "checkpoint_2024-09-03-02-17-37"
-        checkpoint_dir = "checkpoint_2024-09-04-07-56-47"  #
-        latest_checkpoint_epoch = 4000 #1500
-        latest_checkpoint = f'checkpoint_epoch_{latest_checkpoint_epoch}.pth'
+        # checkpoint_dir = "checkpoint_2024-09-04-07-56-47"  #
+        # checkpoint_dir = "checkpoint_2024-10-18-06-49-51"
+        checkpoint_dir = "checkpoint_2024-10-18-21-57-09"
+        fold_id = 0
+        latest_checkpoint_epoch = 2800# 1900 #1500
+        latest_checkpoint = f'checkpoint_fold_{fold_id}_epoch_{latest_checkpoint_epoch}.pth'
 
         # load the saved scaler for normalizing x_omic
-        scaler = joblib.load(os.path.join(checkpoint_dir, 'scaler_new.save'))
+        scaler = joblib.load(os.path.join(checkpoint_dir, f'scaler_fold_{fold_id}.save'))
         mean = torch.tensor(scaler.mean_, dtype=torch.float32, device=device)
         scale = torch.tensor(scaler.scale_, dtype=torch.float32, device=device)
 
@@ -378,17 +339,16 @@ if __name__ == "__main__":
             'test': {}
         }
 
+        # choose the datasets for which inference needs to be done
         loaders = [train_loader, val_loader, test_loader]
-        # loaders = [test_loader]
-        split_names = ['train', 'val', 'test']
-        # split_names = ['test']
+        split_names = ['train', 'val', 'test'] # make it consistent with the list in loaders above
 
         # loop over each loader and process the data
         for split_name, loader in zip(split_names, loaders):
             print(f"Processing {split_name} split...")
             for batch_idx, (tcga_id, days_to_event, event_occurred, x_wsi, x_omic) in enumerate(loader):
                 tcga_id = tcga_id[0]  # assuming tcga_id is a batch of size 1
-                print(f"TCGA ID: {tcga_id}, batch_idx: {batch_idx}, out of {len(loader)}")
+                print(f"TCGA ID: {tcga_id}, batch_idx: {batch_idx}, out of {len(loader)} for split {split_name}")
                 x_omic = x_omic.to(device)
                 x_omic = (x_omic - mean) / scale
                 # get the omic embeddings using the checkpoint
@@ -398,12 +358,10 @@ if __name__ == "__main__":
                 # store the embeddings in the corresponding split dictionary
                 split_patient_embeddings[split_name][tcga_id] = embeddings_list
 
-        # set_trace()
-
         # save the embeddings for each split to separate json files
         for split_name in split_names:
             # filename = f"./rnaseq_embeddings_{split_name}_{latest_checkpoint_epoch}.json"
-            filename = os.path.join(checkpoint_dir, f"rnaseq_embeddings_{split_name}_{latest_checkpoint_epoch}.json")
+            filename = os.path.join(checkpoint_dir, f"rnaseq_embeddings_{split_name}_{checkpoint_dir}_fold_{fold_id}_epoch_{latest_checkpoint_epoch}.json")
             with open(filename, 'w') as file:
                 json.dump(split_patient_embeddings[split_name], file)
 
