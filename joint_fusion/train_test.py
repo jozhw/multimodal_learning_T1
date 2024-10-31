@@ -5,13 +5,16 @@ import torch
 import os
 import wandb
 import time
+import argparse
+import json
+import joblib
 from datetime import datetime
 import matplotlib.pyplot as plt
 import cv2
 from torch import nn
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
-from torch.utils.data import RandomSampler, DataLoader
+from torch.utils.data import RandomSampler, DataLoader, Subset
 # import torch.optim.lr_scheduler as lr_scheduler
 from torchsummary import summary
 from torch.cuda.amp import autocast, GradScaler
@@ -19,9 +22,11 @@ from sklearn.model_selection import train_test_split
 from utils import mixed_collate
 from tqdm import tqdm
 from torch.utils.data import ConcatDataset
+from sklearn.preprocessing import StandardScaler
 
 from datasets import CustomDataset, HDF5Dataset
 from models import MultimodalNetwork, OmicNetwork, print_model_summary
+from sklearn.model_selection import KFold
 from generate_wsi_embeddings import CustomDatasetWSI
 
 import h5py
@@ -47,43 +52,6 @@ import torchviz
 torch.autograd.set_detect_anomaly(True)
 
 current_time = datetime.now().strftime("%y_%m_%d_%H_%M")
-
-
-class CoxLossOld(nn.Module):
-    def __init__(self):
-        super(CoxLossOld, self).__init__()
-
-    def forward(self, log_risks, times, censor):
-        """
-        :param log_risks: predictions from the NN
-        :param times: observed survival times (i.e. times to death) for the batch
-        :param censor: censor data, event (death) indicators (1/0)
-        :return: Cox loss (scalar)
-        : NOTE: There's an issue with how the risk-set (inner sum in term 2) is calculated here
-
-        """
-        sorted_times, sorted_indices = torch.sort(times, descending=True)
-        sorted_log_risks = log_risks[sorted_indices]
-        sorted_censor = censor[sorted_indices]
-
-        # sorted_log_risks = sorted_log_risks - torch.max(sorted_log_risks)  # to avoid overflow
-        # Cox partial likelihood loss = log risk for each individual - cumulative risk (i.e., sum of risks of all at-risk individuals)
-        # batching will prevent including all at-risk samples in the second term
-        # if within a batch all samples are censored,  it will lead to a sum over an empty set for the second term
-        # a small number is added to the term inside the log in the second term to handle such cases.
-
-        cox_loss = sorted_log_risks - torch.log(torch.cumsum(torch.exp(sorted_log_risks), dim=0) + 1e-15)
-        cox_loss = - cox_loss * sorted_censor
-        # check the shape of sorted_log_risks
-
-        # risk_set_sum = torch.cumsum(torch.exp(sorted_log_risks),
-        #                             dim=0)  # this is the term within summation for the second term on LHS
-        #
-        # censor_mask = sorted_censor.bool()
-        # cox_loss = -torch.sum(sorted_log_risks[censor_mask] - torch.log(risk_set_sum))
-        # cox_loss /= torch.sum(events)  # should this be done?
-
-        return cox_loss.mean()
 
 
 class CoxLoss(nn.Module):
@@ -163,252 +131,241 @@ def create_data_loaders(opt, h5_file):
 def train_nn(opt, h5_file, device):
     wandb.init(project="multimodal_survival_analysis", entity='tnnandi')
     config = wandb.config
+    current_time = datetime.now()
+    checkpoint_dir = "checkpoint_" + current_time.strftime("%Y-%m-%d-%H-%M-%S")
+    os.makedirs(checkpoint_dir, exist_ok=True)
 
-    model = MultimodalNetwork(embedding_dim_wsi=opt.embedding_dim_wsi,
-                              embedding_dim_omic=opt.embedding_dim_omic,
-                              mode=opt.input_mode,
-                              fusion_type=opt.fusion_type)
-    # model should return None for the absent modality in the unimodal case
+    train_loader, _, test_loader = create_data_loaders(opt, h5_file)
+    # create multiple folds from the training data
+    kf = KFold(n_splits=opt.n_folds, shuffle=True, random_state=6)  # k-fold CV where k = opt.n_folds
+    dataset = train_loader.dataset  # use only the training dataset for CV during training [both the validation and test splits can be used for testing]
 
-    if torch.cuda.device_count() > 1:
-        print(f"Using {torch.cuda.device_count()} GPUs")
-        model = nn.DataParallel(model)
+    total_samples = len(dataset)
+    print(f"total training data size: {total_samples} samples")
 
-    model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=opt.lr)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=opt.step_size, gamma=opt.gamma)
-    cox_loss = CoxLoss()
+    # train models for each fold
+    for fold, (train_idx, val_idx) in enumerate(kf.split(dataset)):
+        print(f"Fold {fold + 1}/{kf.get_n_splits()}")
 
-    # logging the initial model summary and configuration
-    if hasattr(model, 'module'):
-        model_to_log = model.module
-    else:
-        model_to_log = model
-    # set_trace()
-    # print(f"Model mode: {model.mode}, fusion_type: {model.fusion_type}")
-    # the original model is now accessible through the .module attribute of the DataParallel wrapper
-    if hasattr(model, 'module'):  # when using DataParallel
-        print(f"Model mode: {model.module.mode}, fusion_type: {model.module.fusion_type}")
-    else:
-        print(f"Model mode: {model.mode}, fusion_type: {model.fusion_type}")
-    # set_trace()
-    # if model.wsi_net is not None:
-    print("##############  WSINetwork Summary  ##################")
-    # print_model_summary(model.wsi_net)
-    if hasattr(model, 'module'):
-        print_model_summary(model.module.wsi_net)
-    else:
-        print_model_summary(model.wsi_net)
+        # create train and validation subsets (from the training data itself)
+        train_subset = Subset(dataset, train_idx)
+        val_subset = Subset(dataset, val_idx)
 
-    # if model.omic_net is not None:
-    print("\n ##############  OmicNetwork Summary  ##############")
-    # print_model_summary(model.omic_net)
-    if hasattr(model, 'module'):
-        print_model_summary(model.module.omic_net)
-    else:
-        print_model_summary(model.omic_net)
+        # create data loaders for this fold
+        train_loader_fold = DataLoader(train_subset,
+                                       batch_size=opt.batch_size,
+                                       num_workers=4,
+                                       pin_memory=True,
+                                       shuffle=True,
+                                       drop_last=True)
+        val_loader_fold = DataLoader(val_subset,
+                                     batch_size=opt.val_batch_size,
+                                     shuffle=False)
 
-    print("\n ##############  MultimodalNetwork Summary ##############")
-    if hasattr(model, 'module'):
-        print_model_summary(model.module)
-    else:
-        print_model_summary(model)
-    # print_total_parameters(model)
+        # initialize model, optimizer, and scheduler for this fold
+        model = MultimodalNetwork(embedding_dim_wsi=opt.embedding_dim_wsi,
+                                  embedding_dim_omic=opt.embedding_dim_omic,
+                                  mode=opt.input_mode,
+                                  fusion_type=opt.fusion_type)
 
-    if opt.use_gradient_accumulation:
-        accumulation_steps = 10
-    if opt.use_mixed_precision:
-        scaler = GradScaler()
+        if torch.cuda.device_count() > 1:
+            print(f"Using {torch.cuda.device_count()} GPUs")
+            model = nn.DataParallel(model)
 
-    # # the mapping_df below should be split into 'train', 'validation', and 'test', with only the former 2 used for training
-    # # custom_dataset = CustomDataset(opt, mapping_df, split='train', mode=opt.input_mode)
-    # # split mapping_df into train/val/test sets
-    # mapping_df_train, temp_df = train_test_split(mapping_df, test_size=0.3, random_state=42)
-    # mapping_df_val, mapping_df_test = train_test_split(temp_df, test_size=0.5, random_state=42)
-    #
-    # print(f"Training set size: {mapping_df_train.shape[0]}")
-    # print(f"Validation set size: {mapping_df_val.shape[0]}")
-    # print(f"Test set size: {mapping_df_test.shape[0]}")
-    #
-    # custom_dataset_train = CustomDataset(opt, mapping_df_train, mode=opt.input_mode)
-    # custom_dataset_validation = CustomDataset(opt, mapping_df_validation, mode=opt.input_mode)
-    # custom_dataset_test = CustomDataset(opt, mapping_df_test, mode=opt.input_mode)
-    # # set_trace()
-    # train_loader = torch.utils.data.DataLoader(dataset=custom_dataset_train,
-    #                                            batch_size=opt.batch_size,
-    #                                            shuffle=True, )
-    # # collate_fn=mixed_collate)
-    #
-    # validation_loader = torch.utils.data.DataLoader(dataset=custom_dataset_train,
-    #                                                 batch_size=opt.batch_size,
-    #                                                 shuffle=True, )
-    # # collate_fn=mixed_collate)
-    #
-    # test_loader = torch.utils.data.DataLoader(dataset=custom_dataset_test,
-    #                                           batch_size=opt.batch_size,
-    #                                           shuffle=True, )
-    # # collate_fn=mixed_collate)
+        model.to(device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=opt.lr)
+        # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=opt.step_size, gamma=opt.gamma)
+        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.999)
+        cox_loss = CoxLoss()
 
-    # # use a separate train_loader for early fusion that should only handle the embeddings read from the files
-    # if opt.fusion_type == 'early':
+        # initialize and fit the scaler incrementally on training data
+        print("fitting scaler [train_test.py]")
+        scaler = StandardScaler()
+        for batch_idx, (tcga_id, _, _, _, x_omic) in enumerate(train_loader_fold):
+            print(f"fitting batch index {batch_idx} of {len(train_loader_fold)} batches")
+            x_omic = x_omic.cpu().numpy()
+            scaler.partial_fit(x_omic)
 
-    train_loader, validation_loader, test_loader = create_data_loaders(opt, h5_file)
+        # save the scaler for the current fold
+        scaler_path = os.path.join(checkpoint_dir, f'scaler_fold_{fold}.save')
+        joblib.dump(scaler, scaler_path)
+        print(f"Scaler saved for fold {fold} at {scaler_path}")
 
-    for epoch in tqdm(range(0, opt.num_epochs)):
-        print(f"Epoch: {epoch + 1} out of {opt.num_epochs}")
-        start_train_time = time.time()
-        model.train()
-        loss_epoch = 0
+        # training loop
+        for epoch in tqdm(range(0, opt.num_epochs)):
+            print(f"**********  Fold {fold} out of {opt.n_folds},  Epoch: {epoch + 1} out of {opt.num_epochs}")
+            start_train_time = time.time()
+            model.train()
+            # # added to reduce memory requirement
+            # if isinstance(model, torch.nn.DataParallel):
+            #     model.module.gradient_checkpointing_enable()
+            # else:
+            #     model.gradient_checkpointing_enable()
+            loss_epoch = 0
 
-        # log the learning rate at the start of the epoch
-        current_lr = optimizer.param_groups[0]['lr']
-        wandb.log({"LR": current_lr}, step=epoch)
+            # log the learning rate at the start of the epoch
+            current_lr = optimizer.param_groups[0]['lr']
+            wandb.log({"LR": current_lr}, step=epoch)
 
-        # model training in batches using the train dataloader
-        for batch_idx, (tcga_id, days_to_event, event_occurred, x_wsi, x_omic) in enumerate(train_loader):
-            # x_wsi is a list of tensors (one tensor for each tile)
-            print(f"Batch size: {opt.batch_size}")
-            print(f"Batch index: {batch_idx + 1} out of {np.ceil(len(train_loader.dataset) / opt.batch_size)}")
-            x_wsi = [x.to(device) for x in x_wsi]
-            x_omic = x_omic.to(device)
-            days_to_event = days_to_event.to(device)
-            # days_to_last_followup = days_to_last_followup.to(device)
-            event_occurred = event_occurred.to(device)
-            print("Days to event: ", days_to_event)
-            print("event occurred: ", event_occurred)
-
-            optimizer.zero_grad()
-
-            if opt.use_mixed_precision:
-                with autocast():  # should wrap only the forward pass including the loss calculation
-                    predictions = model(x_wsi=x_wsi,  # list of tensors (one for each tile)
-                                        x_omic=x_omic)
-                    loss = cox_loss(predictions.squeeze(),
-                                    days_to_death,
-                                    event_occurred)
-                    print("\n loss: ", loss.data.item())
-                    loss_epoch += loss.data.item()
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                print(" Not using mixed precision")
-                # model for survival outcome (uses Cox PH partial log likelihood as the loss function)
-                # the model output should be considered as beta*X to be used in the Cox loss function
-
-                # for early fusion, the model class should use the inputs from here by the generated embeddings
-                start_time = time.time()
-                predictions = model(opt,
-                                    tcga_id,
-                                    x_wsi=x_wsi,  # list of tensors (one for each tile)
-                                    x_omic=x_omic,
-                                    )
-                step1_time = time.time()
-                # need to correct the loss calculation to include the time to last followup
-                loss = cox_loss(predictions.squeeze(),
-                                # predictions are not survival outcomes, rather log-risk scores beta*X
-                                days_to_event,
-                                event_occurred)  # Cox partial likelihood loss for survival outcome prediction
-                print("\n loss (train): ", loss.data.item())
-                step2_time = time.time()
-                loss_epoch += loss.data.item() * len(
-                    tcga_id)  # multiplying loss by batch size for accurate epoch averaging
-                loss.backward(
-                    retain_graph=True if epoch == 0 and batch_idx == 0 else False)  # tensors retained to allow backpropagation for torchhviz
-                optimizer.step()
-
-                step3_time = time.time()
-                print(
-                    f"(in train_nn) Step 1: {step1_time - start_time:.4f}s, Step 2: {step2_time - step1_time:.4f}s, Step 3: {step3_time - step2_time:.4f}s")
-
-                # if epoch == 0 and batch_idx == 0:
-                #     # Note: graphviz is fine for small graphs, but for large graphs it becomes cumbersome so instead opting TensorBoard for the latter
-                #     # graph = torchviz.make_dot(loss, params=dict(model.named_parameters()))
-                #     # file_path = os.path.abspath("data_flow_graph")
-                #     # graph.render(file_path, format="png")
-                #     # print(f"Graph saved as {file_path}.png. You can open it manually.")
-                #
-                #     writer.add_graph(model_to_log, [x_wsi[0], x_omic])
-                #     print(f"Computation graph saved to TensorBoard logs at {log_dir}")
-
-        train_loss = loss_epoch / len(train_loader.dataset)  # average training loss per sample for the epoch
-        wandb.log({"Loss/train": train_loss}, step=epoch)
-        scheduler.step()  # step scheduler after each epoch
-        print("\n train loss over epoch: ", train_loss)
-        end_train_time = time.time()
-        train_duration = end_train_time - start_train_time
-        wandb.log({"Time/train": train_duration}, step=epoch)
-
-        start_val_time = time.time()
-
-        # get predictions on the validation dataset (to keep track of validation loss during training)
-        model.eval()
-        val_loss_epoch = 0.0
-        all_predictions = []
-        all_times = []
-        all_events = []
-
-        # if (epoch + 1) % 1:
-        with torch.no_grad():  # inference on the validation data
-            for batch_idx, (tcga_id, days_to_event, event_occurred, x_wsi, x_omic) in enumerate(validation_loader):
+            # model training in batches for the train dataloader for the current fold
+            for batch_idx, (tcga_id, days_to_event, event_occurred, x_wsi, x_omic) in enumerate(train_loader_fold):
                 # x_wsi is a list of tensors (one tensor for each tile)
-                print(f"Batch size: {len(validation_loader.dataset)}")
-                print(
-                    f"Validation Batch index: {batch_idx + 1} out of {np.ceil(len(validation_loader.dataset) / opt.val_batch_size)}")
+                print(f"Total training samples in fold: {len(train_loader_fold.dataset)}")
+                print(f"Batch size: {opt.batch_size}")
+                print(f"Batch index: {batch_idx + 1} out of {np.ceil(len(train_loader_fold.dataset) / opt.batch_size)}")
                 x_wsi = [x.to(device) for x in x_wsi]
                 x_omic = x_omic.to(device)
                 days_to_event = days_to_event.to(device)
+                # days_to_last_followup = days_to_last_followup.to(device)
                 event_occurred = event_occurred.to(device)
                 print("Days to event: ", days_to_event)
                 print("event occurred: ", event_occurred)
-                outputs = model(opt,
-                                tcga_id,
-                                x_wsi=x_wsi,  # list of tensors (one for each tile)
-                                x_omic=x_omic,
-                                )
-                loss = cox_loss(outputs.squeeze(),
-                                # predictions are not survival outcomes, rather log-risk scores beta*X
-                                days_to_event,
-                                event_occurred)  # Cox partial likelihood loss for survival outcome prediction
-                # set_trace()
-                print("\n loss (validation): ", loss.data.item())
-                val_loss_epoch += loss.data.item() * len(tcga_id)
-                all_predictions.append(outputs.squeeze())
-                all_times.append(days_to_event)
-                all_events.append(event_occurred)
-                #
-                # model_path = os.path.join("./saved_models_4sep", f"model_epoch_{epoch}.pt") # change the dir name to use date time
-                # torch.save(model.state_dict(), model_path)
-                # print(f"saved model checkpoint at epoch {epoch} to {model_path}")
 
-            val_loss = val_loss_epoch / len(validation_loader.dataset)
-            wandb.log({"Loss/validation": val_loss}, step=epoch)
+                optimizer.zero_grad()
 
-            all_predictions = torch.cat(all_predictions)
-            all_times = torch.cat(all_times)
-            all_events = torch.cat(all_events)
+                if opt.use_mixed_precision:
+                    with autocast():  # should wrap only the forward pass including the loss calculation
+                        predictions = model(x_wsi=x_wsi,  # list of tensors (one for each tile)
+                                            x_omic=x_omic)
+                        loss = cox_loss(predictions.squeeze(),
+                                        days_to_death,
+                                        event_occurred)
+                        print("\n loss: ", loss.data.item())
+                        loss_epoch += loss.data.item()
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    print(" Not using mixed precision")
+                    # model for survival outcome (uses Cox PH partial log likelihood as the loss function)
+                    # the model output should be considered as beta*X to be used in the Cox loss function
 
-            # convert to numpy arrays for CI calculation
-            all_predictions_np = all_predictions.cpu().numpy()
-            all_times_np = all_times.cpu().numpy()
-            all_events_np = all_events.cpu().numpy()
+                    start_time = time.time()
+                    predictions = model(opt,
+                                        tcga_id,
+                                        x_wsi=x_wsi,  # list of tensors (one for each tile)
+                                        x_omic=x_omic,
+                                        )
+                    # print(f"predictions: {predictions} from train_test.py")
+                    step1_time = time.time()
+                    loss = cox_loss(predictions.squeeze(),
+                                    # predictions are not survival outcomes, rather log-risk scores beta*X
+                                    days_to_event,
+                                    event_occurred)  # Cox partial likelihood loss for survival outcome prediction
+                    print("\n loss (train): ", loss.data.item())
+                    step2_time = time.time()
+                    loss_epoch += loss.data.item()  # * len(tcga_id)  # multiplying loss by batch size for accurate epoch averaging
+                    # backpropagate loss through the entire model arch upto the inputs
+                    loss.backward(
+                        retain_graph=True if epoch == 0 and batch_idx == 0 else False)  # tensors retained to allow backpropagation for torchhviz (for visualizing the graph)
+                    optimizer.step()
+                    torch.cuda.empty_cache()
 
-            c_index = concordance_index_censored(all_events_np.astype(bool), all_times_np, all_predictions_np)
-            print(f"Validation loss: {val_loss}, CI: {c_index[0]}")
-            wandb.log({"CI/validation": c_index[0]}, step=epoch)
+                    step3_time = time.time()
+                    print(
+                        f"(in train_nn) Step 1: {step1_time - start_time:.4f}s, Step 2: {step2_time - step1_time:.4f}s, Step 3: {step3_time - step2_time:.4f}s")
 
-            # model_path = os.path.join("./saved_models_4sep", f"model_epoch_{epoch}.pt")
-            save_dir = f"./saved_models_{current_time}"
-            os.makedirs(save_dir, exist_ok=True)
-            model_path = os.path.join(save_dir, f"model_epoch_{epoch}.pt")
-            torch.save(model.state_dict(), model_path)
-            print(f"saved model checkpoint at epoch {epoch} to {model_path}")
+                    # if epoch == 0 and batch_idx == 0:
+                    #     # Note: graphviz is fine for small graphs, but for large graphs it becomes cumbersome so instead opting TensorBoard for the latter
+                    #     # graph = torchviz.make_dot(loss, params=dict(model.named_parameters()))
+                    #     # file_path = os.path.abspath("data_flow_graph")
+                    #     # graph.render(file_path, format="png")
+                    #     # print(f"Graph saved as {file_path}.png. You can open it manually.")
+                    #
+                    #     writer.add_graph(model_to_log, [x_wsi[0], x_omic])
+                    #     print(f"Computation graph saved to TensorBoard logs at {log_dir}")
 
-            end_val_time = time.time()
-            val_duration = end_val_time - start_val_time
-            wandb.log({"Time/validation": val_duration}, step=epoch)
+            train_loss = loss_epoch / len(train_loader_fold.dataset)  # average training loss per sample for the epoch
+            wandb.log({"Loss/train": train_loss}, step=epoch)
+            scheduler.step()  # step scheduler after each epoch
+            print("\n train loss over epoch: ", train_loss)
+            end_train_time = time.time()
+            train_duration = end_train_time - start_train_time
+            wandb.log({"Time/train": train_duration}, step=epoch)
 
-    return model, optimizer
+            # calculate validation loss and calculate CI using validation data for this fold, and save model every 50 epochs
+            if epoch % 50 == 0 and epoch > 0:
+                train_loss /= len(train_loader_fold.dataset)
+                print(f"Training loss at epoch {epoch}: {train_loss}")
+
+                checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_fold_{fold}_epoch_{epoch}.pth")
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                }, checkpoint_path)
+                print(f"Checkpoint saved at epoch {epoch}, fold {fold}, to {checkpoint_path}")
+
+                start_val_time = time.time()
+
+                # get predictions on the validation dataset
+                model.eval()
+                val_loss_epoch = 0.0
+                all_predictions = []
+                all_times = []
+                all_events = []
+
+                with torch.no_grad():  # inference on the validation data
+                    for batch_idx, (tcga_id, days_to_event, event_occurred, x_wsi, x_omic) in enumerate(
+                            val_loader_fold):
+                        # x_wsi is a list of tensors (one tensor for each tile)
+                        print(f"Batch size: {len(val_loader_fold.dataset)}")
+                        print(
+                            f"Validation Batch index: {batch_idx + 1} out of {np.ceil(len(val_loader_fold.dataset) / opt.val_batch_size)}")
+                        x_wsi = [x.to(device) for x in x_wsi]
+                        x_omic = x_omic.to(device)
+                        days_to_event = days_to_event.to(device)
+                        event_occurred = event_occurred.to(device)
+                        print("Days to event: ", days_to_event)
+                        print("event occurred: ", event_occurred)
+                        outputs = model(opt,
+                                        tcga_id,
+                                        x_wsi=x_wsi,  # list of tensors (one for each tile)
+                                        x_omic=x_omic,
+                                        )
+                        loss = cox_loss(outputs.squeeze(),
+                                        # predictions are not survival outcomes, rather log-risk scores beta*X
+                                        days_to_event,
+                                        event_occurred)  # Cox partial likelihood loss for survival outcome prediction
+                        print("\n loss (validation): ", loss.data.item())
+                        val_loss_epoch += loss.data.item() * len(tcga_id)
+                        all_predictions.append(outputs.squeeze())
+                        all_times.append(days_to_event)
+                        all_events.append(event_occurred)
+
+                        # model_path = os.path.join("./saved_models_4sep", f"model_epoch_{epoch}.pt") # change the dir name to use date time
+                        # torch.save(model.state_dict(), model_path)
+                        # print(f"saved model checkpoint at epoch {epoch} to {model_path}")
+
+                    val_loss = val_loss_epoch / len(val_loader_fold.dataset)
+                    wandb.log({"Loss/validation": val_loss}, step=epoch)
+
+                    all_predictions = torch.cat(all_predictions)
+                    all_times = torch.cat(all_times)
+                    all_events = torch.cat(all_events)
+
+                    # convert to numpy arrays for CI calculation
+                    all_predictions_np = all_predictions.cpu().numpy()
+                    all_times_np = all_times.cpu().numpy()
+                    all_events_np = all_events.cpu().numpy()
+
+                    c_index = concordance_index_censored(all_events_np.astype(bool), all_times_np, all_predictions_np)
+                    print(f"Validation loss: {val_loss}, CI: {c_index[0]}")
+                    wandb.log({"CI/validation": c_index[0]}, step=epoch)
+
+                    # # # model_path = os.path.join("./saved_models_4sep", f"model_epoch_{epoch}.pt")
+                    # save_dir = f"./saved_models_{current_time}"
+                    # os.makedirs(save_dir, exist_ok=True)
+                    model_path = os.path.join(checkpoint_dir, f"model_fold_{fold}_epoch_{epoch}.pt")
+                    torch.save(model.state_dict(), model_path)
+                    print(f"saved model checkpoint for fold {fold} at epoch {epoch} to {model_path}")
+
+                    end_val_time = time.time()
+                    val_duration = end_val_time - start_val_time
+                    wandb.log({"Time/validation": val_duration}, step=epoch)
+
+        return model, optimizer
 
 
 def print_total_parameters(model):
@@ -533,7 +490,6 @@ def test_and_interpret(opt, model, test_loader, device, baseline=None):
     # remove these ids during the input json/h5 file creation
     with torch.no_grad():
         for batch_idx, (tcga_id, days_to_event, event_occurred, x_wsi, x_omic) in enumerate(test_loader):
-            # skip the excluded TCGA IDs
             if tcga_id[0] in excluded_ids:
                 print(f"Skipping TCGA ID: {tcga_id}")
                 continue
@@ -871,9 +827,9 @@ if __name__ == "__main__":
     train_loader, validation_loader, test_loader = create_data_loaders(opt, 'mapping_data.h5')
     validation_dataset = validation_loader.dataset
     test_dataset = test_loader.dataset
-    combined_dataset = ConcatDataset([validation_dataset, test_dataset])
 
     # create a combined loader (validation + test) as the validation data hasn't been used for HPO during training
+    combined_dataset = ConcatDataset([validation_dataset, test_dataset])
     combined_loader = torch.utils.data.DataLoader(
         dataset=combined_dataset,
         batch_size=opt.test_batch_size,
@@ -899,8 +855,7 @@ if __name__ == "__main__":
     # # compute the mean expression for each gene across all samples
     # mean_x_omic = total_x_omic / total_samples
 
-    # get the mean expression level for all genes across all the training samples
-
+    # get the mean expression level for all genes across all the training samples to be used as baseline for x_omic for IG
     def compute_mean_omic_from_h5(file_name):
         with h5py.File(file_name, 'r') as hdf:
             train_group = hdf['train']

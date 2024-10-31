@@ -65,7 +65,7 @@ parser.add_argument('--checkpoint_dir', type=str,
                     default='/lus/eagle/clone/g2/projects/GeomicVar/tarak/multimodal_learning_T1/joint_fusion/checkpoint_2024-04-20-08-43-52/',
                     help='Path to the checkpoint files from trained VAE for omic embedding generation')
 # parser.add_argument('--output_path', type=str, default='results/output.txt', help='Path to output results file')
-parser.add_argument('--batch_size', type=int, default=48, help='Batch size for training (overall)')
+parser.add_argument('--batch_size', type=int, default=16, help='Batch size for training (overall)')
 parser.add_argument('--val_batch_size', type=int, default=1000,
                     help='Batch size for validation data (using all samples for better Cox loss calculation)')
 parser.add_argument('--test_batch_size', type=int, default=1, help='Batch size for testing')
@@ -83,7 +83,7 @@ parser.add_argument('--fusion_type', type=str, default="joint",
                     help="early, late, joint, joint_omic, unimodal")  # "joint_omic" only trains the omic embedding generator jointly with the downstream combined model
 parser.add_argument('--profile', type=str, default=False, help="whether to profile or not")
 parser.add_argument('--use_mixed_precision', type=str, default=False,
-                    help="whether to use mixed precision calculations")
+                    help="whether to use mixed precision calculations (currently unstable)")
 parser.add_argument('--use_gradient_accumulation', type=str, default=False, help="whether to use gradient accumulation")
 
 opt = parser.parse_args()
