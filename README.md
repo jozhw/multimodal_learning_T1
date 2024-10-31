@@ -45,12 +45,12 @@ where $h_0$ is the baseline hazard function, and $\boldsymbol{\beta}$ is the vec
 
 
 ## Running the code
-
+<!--
 ``` sh
 python trainer.py --input_path --input_wsi_path --batch_size --lr --lr_decay_iters --num_epochs --gpu_ids --input_size_wsi --embedding_dim_wsi --embedding_dim_omic --input_modes --fusion_type --profile --use_mixed_precision --use_gradient_accumulation
 
 ```
-
+-->
 
 | Input Arguments      | Explanation                                             | Type and Default Value                                                               |
 |----------------------|---------------------------------------------------------|--------------------------------------------------------------------------------------|
@@ -105,6 +105,6 @@ python trainer.py --input_path --input_wsi_path --batch_size --lr --lr_decay_ite
 
 ## Steps for obtaining survival predictions using joint fusion 
 
-1. Run [joint_fusion/trainer.py]() for training
-2. Run [joint_fusion/train_test.py]() for inference and XAI metrics
-3. 
+1. Execute the steps listed for dataset creation in the previous section
+2. Run [joint_fusion/trainer.py](https://github.com/DOE-LUCID/multimodal_learning_T1/blob/main/joint_fusion/trainer.py) for training
+2. Run [joint_fusion/train_test.py](https://github.com/DOE-LUCID/multimodal_learning_T1/blob/main/joint_fusion/train_test.py) for inference and XAI metrics
