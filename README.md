@@ -1,18 +1,35 @@
 # Multimodal data fusion strategies for LUCID thrust 1
-Code for multimodal model training using multiple data fusion techniques for LUCID (Low-dose Understanding, Cellular Insights, and Molecular Discoveries). Even though LUCID specifically focuses on low dose settings, in the absence of clean LDR-induced cancer specific datasets (that should be made available shortly), we are using comparable datasets from the public TCGA database. 
+Code for multimodal model training using multiple data fusion 
+techniques for LUCID (Low-dose Understanding, Cellular Insights, 
+and Molecular Discoveries). 
+Even though LUCID specifically focuses on low dose settings, 
+in the absence of clean LDR-induced cancer specific datasets 
+(that should be made available shortly), 
+we are using comparable datasets from the public TCGA database. 
 
+<!--
 ## Table of content
 
 - [Task](#task)
 - [Data used](#data-used)
-- [Training methodlogy](#training-methodology)
+- [Training methodology](#training-methodology)
 - [Running the code](#running-the-code)
 - [Code structure](#code-structure)
+- 
 
 ## Task
+-->
+The objective is to develop a deep learning framework to 
+predict cancer related times to events using matched 
+multimodal samples. Currently, we are using 
+whole slide image (WSI) and tabular gene expression (bulk RNASeq)
+data from the lung adenocarcinoma samples from the TCGA database 
+(TCGA-LUAD). 
+The code is being developed in a modular framework so that 
+it can be easily extended to handle more input data modalities
+when needed. 
 
-The objective is to develop a deep learning framework to predict cancer-related times to events using matched multimodal samples. Currently, we are using whole slide image (WSI) and tabular gene expression (bulk RNASeq) data from the lung adenocarcinoma samples from the TCGA database (TCGA-LUAD). The code is being developed in a modular framework so that it can be easily extended to handle more input data modalities when the need arises. 
-
+<!--
 ## Data used:
 
 1. Histology data [Whole Slide Images (WSI)] <br />
@@ -21,28 +38,122 @@ The objective is to develop a deep learning framework to predict cancer-related 
 2. Tabular gene expression (bulk RNA-seq) data <br />
 
 [//]: # (These data have been collected from https://drive.google.com/drive/folders/14TwYYsBeAnJ8ljkvU5YbIHHvFPltUVDr)
-
+-->
 
 ## Training methodology
-Embeddings are generated from the WSI data and the tabular molecular features using a CNN and a MLP, respectively, that are fused to be used as input for a downstream MLP that has its final node predicting the log-risk score (log of the hazard ratio) for the Cox log partial likelihood function representing the loss function. In the joint fusion approach, all the models are trained simultaneously using the loss function.
-We are also exploring other methods for embedding generation, including attention based encoder models.
+Embeddings are generated from the histology whole slide images and 
+the tabular gene expression data that are fused to be used as 
+input for a downstream task specific model that 
+uses the Cox-PH partial likelihood loss function, to predict the risk scores for patients.
 
-- **Embedding generation from WSI data** (at the tile level)
-    - The original WSIs are too large to be used with standard CNN based models. Hence, they are split into smaller non-overlapping tiles (of 256 x 256 resolution) that are fed to a [pretrained histology foundation model](https://lunit-io.github.io/research/publications/pathology_ssl/) that generates 384 dimensional embedding (a hyperparameter that needs to be tuned for the best model performance). The model has been trained on 20994
-WSIs from the TCGA dataset, and 15672 from the TULIP dataset, utilizing a self supervised learning framework (DINO:
-Knowledge distillation with no labels) using vision transformers
-- **Embedding generation from the gene expression data**
-    - The original gene expression count data, owing to its very high dimensionality (≈ 20K) is not suitable for directly being
+Embeddings from the RNASeq and WSI modalities are learnt using two fusion strategies 
+1. Early Fusion
+   - The embedding generation strategies for the two modalities are independent of each other and the downstream task.
+   - The embeddings are generated separately and then used as inputs to a downstream task-specific model.
+   - Simpler to train due to a relatively low number of trainable parameters.
+
+2. Joint Fusion
+    - Embeddings from both modalities are trained simultaneously with the downstream task model.
+    - Enables the embeddings to become more informed by each other and the survival prediction task (stronger coupling).
+    - More computationally expensive to train.
+
+
+<!--
+In the joint fusion approach, all the models are trained 
+simultaneously using the loss function.
+We are also exploring other methods for embedding generation, 
+including attention based encoder models.
+-->
+
+**Generation of the WSI embeddings**
+
+The original WSIs are too large to be used with standard 
+CNN/transformer based models. 
+Hence, they are split into smaller non-overlapping tiles 
+(of 256 x 256 pixel resolution) that are fed to a 
+[pretrained histology foundation model](https://lunit-io.github.io/research/publications/pathology_ssl/) 
+that generates 384 dimensional embedding. The foundation model 
+has been trained on 37K WSIs from public and private databases, using DINO, a self-supervised learning framework with a 
+vision transformer (ViT-small) architecture.
+Patch level embeddings are averaged to obtain WSI level 
+embeddings 
+(can be improved to use attention based multiple 
+instance learning).
+For early fusion, patch level embeddings are generated 
+keeping the FM entirely frozen.
+For joint fusion, the last transformer block of the FM is unfrozen and trained together with the bulk RNASeq embedding generator
+
+**Embedding generation from the gene expression data**
+
+The original gene expression count data, owing to its very high dimensionality (≈ 20K) is not suitable for directly being
 ingested by a neural network. We generate lower dimensional embeddings for the gene expression data from the latent space
-of a trained VAE
-- **Fusing embeddings from all modalities** for downstream MLP/GBM training for cancer-specific time to event prediction
-- **Loss function and model training**
-    - The Cox proportional hazards model is used to relate survival time (or time to death for the uncensored events) with the predictor variables (covariates). The model assumes that the hazard function (the instantaneous rate of occurrence of the event) for any individual can be expressed as the product of an unknown baseline hazard function and an exponential function of linear combinations of predictor variables.
-    - The goal of survival prediction model is to predict the likelihood that a patient $i$ will survive till a certain time $t$, for a set of covariates $\boldsymbol{X_i}$ ($X$ is written in bold to clarify that it is a vector, and the subscript $i$ is for the patient ID). The hazard function $h(t|\boldsymbol{X_i})$ is defined as $h(t|X_i) = h_0(t)e^{\boldsymbol{\beta}^\top \boldsymbol{X_i}}$ 
-where $h_0$ is the baseline hazard function, and $\boldsymbol{\beta}$ is the vector of coefficients for the covariates, that is assumed to be the same for all patients. To calculate the model parameters $\boldsymbol{\beta}$, the negative log likelihood (NLL) of $h(t|\boldsymbol{X_i})$ is minimized in Cox regression $$L(\mathbf{\beta}) = \sum_{i \in E} \left[ \mathbf{\beta}^\top \mathbf{X_i} - \log \left( \sum_{j \in \Omega_i} \exp(\mathbf{\beta}^\top \mathbf{X}_j) \right) \right]$$, where the outer summation is done over the set of individuals for whom the event of interest (for this case, death) has been observed, and the inner summation is over all individuals in the risk set $\Omega_i$ at the time of event for individual $i$.
-    - The output node of the final MLP (that uses the fused embeddings as the input) is allowed to predict $\boldsymbol{\beta}^\top \boldsymbol{X_i}$, i.e., the log risk of the event for individual $i$ based on their covariates. In Eq \ref{eq:loss_function}, this output is denoted by $f_\theta(\boldsymbol{X_i})$ in the loss function
-      $$L(\boldsymbol{\theta}) = \sum_{i \in E} \left[ f_\theta(\boldsymbol{X_i}) - \log \left( \sum_{j \in \Omega_i} \exp(f_\theta(\boldsymbol{X_j})) \right) \right]$$
+of a variational autoencoder (VAE) trained to generate 
+256-dimensional embeddings of the ~20K dimensional gene 
+expression data.
+For early fusion, the VAE is trained on 70% of the samples 
+(training set), and embeddings generated from the trained model 
+are used for test set predictions on the remaining samples.
+For joint fusion, the VAE is trained simultaneously with 
+a portion of the WSI foundation model to generate embeddings 
+that are informed by the survival prediction task
 
+**Learning from modality specific embeddings** 
+
+Early Fusion:
+- Gradient boosted model (GBM) [with decision trees as base learners] with Cox partial likelihood loss
+- GBM outperforms neural networks (NN) for relatively small number of training samples
+
+
+Joint Fusion:
+- NN with Cox partial likelihood loss
+- NNs allow backpropagation of task-specific loss to the inputs that allow 
+updation of the embeddings from the two modalities in the learning process
+calculation of explainability metrics. 
+
+A schematic of the two fusion approaches is shown below:
+
+![multimodal_framework](images/MM_framework.PNG)
+
+
+**Loss function and model training**
+
+The Cox proportional hazards model is used to relate survival time 
+(or time to death for the uncensored events) with the predictor variables (covariates). 
+The model assumes that the hazard function (the instantaneous rate of occurrence of the event) 
+for any individual can be expressed as the product of an unknown baseline hazard function 
+and an exponential function of linear combinations of predictor variables.
+
+- The goal of survival prediction model is to predict the 
+likelihood that a patient $i$ will survive till a certain time $t$, for a set of covariates
+$\boldsymbol{X_i}$ ($\boldsymbol{X}$ is written in bold to clarify that it is a vector, 
+and the subscript $i$ is for the patient ID). 
+The hazard function $h(t|\boldsymbol{X_i})$ is defined as:
+
+$$h(t|\boldsymbol{X_i}) = h_0(t) e^{\boldsymbol{\beta}^\top \boldsymbol{X_i}} $$
+
+  where $h_0$ is the baseline hazard function, and $\boldsymbol{\beta}$ is the vector of coefficients for the covariates, that is assumed to be the same for all patients.
+
+- To calculate the model parameters $\boldsymbol{\beta}$, the negative log likelihood (NLL) of $h(t|\boldsymbol{X_i})$ is minimized in Cox regression:
+
+$$L(\boldsymbol{\beta}) = \sum_{i \in E} \left[ \boldsymbol{\beta}^\top \boldsymbol{X_i} - \log \left( \sum_{j \in \Omega_i} \exp(\boldsymbol{\beta}^\top \boldsymbol{X}_j) \right) \right], $$
+
+  where the outer summation is done over the set of individuals for whom the event of interest (for this case, death) has been observed, and the inner summation is over all individuals in the risk set $\Omega_i$ at the time of event for individual $i$.
+
+- The output of the downstream model (that uses the fused embeddings as the input) is allowed to predict $\boldsymbol{\beta}^\top \boldsymbol{X_i}$, i.e., the log risk of the event for individual $i$ based on their covariates. In the loss function, this output is denoted by $f_\theta(\boldsymbol{X_i})$:
+
+$$L(\boldsymbol{\theta}) = \sum_{i \in E} \left[ f_\theta(\boldsymbol{X_i}) - \log \left( \sum_{j \in \Omega_i} \exp(f_\theta(\boldsymbol{X_j})) \right) \right] $$
+
+<!--
+The Cox proportional hazards model is used to relate survival time (or time to death for the uncensored events) with the predictor variables (covariates). The model assumes that the hazard function (the instantaneous rate of occurrence of the event) for any individual can be expressed as the product of an unknown baseline hazard function and an exponential function of linear combinations of predictor variables.
+    - The goal of survival prediction model is to predict the likelihood that a patient $i$ will survive till a certain time $t$, for a set of covariates $\boldsymbol{X_i}$ ($X$ is written in bold to clarify that it is a vector, and the subscript $i$ is for the patient ID). The hazard function $h(t|\boldsymbol{X_i})$ is defined as $h(t|X_i) = h_0(t)e^{\boldsymbol{\beta}^\top \boldsymbol{X_i}}$ 
+where $h_0$ is the baseline hazard function, and $\boldsymbol{\beta}$ is the vector of coefficients for the covariates, that is assumed to be the same for all patients. 
+To calculate the model parameters 
+$\boldsymbol{\beta}$, the negative log likelihood (NLL) of $h(t|\boldsymbol{X_i})$ is minimized in Cox regression 
+$L(\mathbf{\beta}) = \sum_{i \in E} \left[ \mathbf{\beta}^\top \mathbf{X_i} - \log \left( \sum_{j \in \Omega_i} \exp(\mathbf{\beta}^\top \mathbf{X}_j) \right) \right]$, 
+where the outer summation is done over the set of individuals for whom the event of interest (for this case, death) has been observed, and the inner summation is over all individuals in the risk set $\Omega_i$ at the time of event for individual $i$.
+    - The output of the downstream model (that uses the fused embeddings as the input) is allowed to predict $\boldsymbol{\beta}^\top \boldsymbol{X_i}$, i.e., the log risk of the event for individual $i$ based on their covariates. In Eq \ref{eq:loss_function}, this output is denoted by $f_\theta(\boldsymbol{X_i})$ in the loss function
+      $$L(\boldsymbol{\theta}) = \sum_{i \in E} \left[ f_\theta(\boldsymbol{X_i}) - \log \left( \sum_{j \in \Omega_i} \exp(f_\theta(\boldsymbol{X_j})) \right) \right]$$
+-->
 
 ## Running the code
 <!--
@@ -70,7 +181,7 @@ python trainer.py --input_path --input_wsi_path --batch_size --lr --lr_decay_ite
 | --use_mixed_precision| whether to use mixed precision calculations            | type=str, default=False                                                               |
 | --use_gradient_accumulation | whether to use gradient accumulation               | type=str, default=False                                                               |
 
-
+<!--
 ## Code structure:
 
 1. [joint-fusion/trainer.py](https://github.com/DOE-LUCID/multimodal_learning_T1/blob/main/joint_fusion/trainer.py): The driver code that uses the WSI (tile level) and gene expression mapping information to call the function that carries out the model training
@@ -86,7 +197,7 @@ python trainer.py --input_path --input_wsi_path --batch_size --lr --lr_decay_ite
 1. mapping_df.json : Dictionary containing 'days_to_death', 'days_to_last_followup', 'event_occurred' (dead/alive), WSI tiles, the RNASeq data, and 'time' ('days_to_death' for ). Created using [joint-fusion/trainer.py](https://github.com/DOE-LUCID/multimodal_learning_T1/blob/main/joint_fusion/trainer.py) from the mapping file generated by [joint-fusion/create_image_molecular_mapping.py](https://github.com/DOE-LUCID/multimodal_learning_T1/blob/main/joint_fusion/create_image_molecular_mapping.py)
 2. rnaseq_df.json
 3. 
-
+--> 
 
 ## Steps for obtaining survival predictions using early fusion 
 ### Dataset creation
