@@ -14,7 +14,9 @@ import cv2
 from joblib import Parallel, delayed
 import h5py
 from multiprocessing import Manager
+import ast
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class CustomDatasetOld(Dataset):
     def __init__(self, opt, mapping_df, split=None, mode='wsi', train_val_test="train"):
@@ -237,26 +239,29 @@ class CustomDataset(Dataset):
         os.makedirs(self.cache_dir, exist_ok=True)
 
         # transformations/augmentations for WSI data
-        if self.train_val_test == "train":
-            # the flips and jitter transformations may not be required as we are using the pretrained lunit dino model
-            self.transforms = transforms.Compose([
-                # transforms.RandomHorizontalFlip(0.5),
-                # transforms.RandomVerticalFlip(0.5),
-                # transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.05, hue=0.01),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.70322989, 0.53606487, 0.66096631],
-                                     std=[0.21716536, 0.26081574, 0.20723464])  # from lunit
-            ])
-        else:
-            self.transforms = transforms.Compose([
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.70322989, 0.53606487, 0.66096631],
-                                     std=[0.21716536, 0.26081574, 0.20723464]),
-            ])
-
+        # not required: already available in the functions for loading the models in generate_wsi_embeddings.py
+        # if self.train_val_test == "train":
+        #     # the flips and jitter transformations may not be required as we are using the pretrained lunit dino model
+        #     self.transforms = transforms.Compose([
+        #         # transforms.RandomHorizontalFlip(0.5),
+        #         # transforms.RandomVerticalFlip(0.5),
+        #         # transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.05, hue=0.01),
+        #         transforms.ToTensor(),
+        #         transforms.Normalize(mean=[0.70322989, 0.53606487, 0.66096631],
+        #                              std=[0.21716536, 0.26081574, 0.20723464])  # from lunit
+        #     ])
+        # else:
+        #     self.transforms = transforms.Compose([
+        #         transforms.ToTensor(),
+        #         transforms.Normalize(mean=[0.70322989, 0.53606487, 0.66096631],
+        #                              std=[0.21716536, 0.26081574, 0.20723464]),
+        #     ])
+        # self.transforms = transforms.Compose([transforms.ToTensor()])
+        self.transforms = transforms.ToTensor()
         # log transform for rnaseq data
-        self.mapping_df['rnaseq_data'] = self.mapping_df['rnaseq_data'].apply(
-            lambda x: np.log1p(np.array(list(x.values()))))
+        # not required for SPECTRA processed data
+        # self.mapping_df['rnaseq_data'] = self.mapping_df['rnaseq_data'].apply(
+        #     lambda x: np.log1p(np.array(list(x.values()))))
 
     def __getitem__(self, index):
         start_time = time.time()
@@ -266,8 +271,8 @@ class CustomDataset(Dataset):
 
         sample = self.mapping_df.iloc[index]
         tcga_id = self.mapping_df.index[index]
-        days_to_death = sample['days_to_death']
-        days_to_last_followup = sample['days_to_last_followup']
+        # days_to_death = sample['days_to_death']
+        # days_to_last_followup = sample['days_to_last_followup']
         days_to_event = sample['time']
         event_occurred = 1 if sample['event_occurred'] == 'Dead' else 0
         tiles = sample['tiles']
@@ -281,6 +286,11 @@ class CustomDataset(Dataset):
             try:
                 if os.path.exists(cached_image_path):
                     cached_image = torch.load(cached_image_path)
+                    # set_trace()
+                    # cached_image = self.transforms(cached_image)
+                    if not isinstance(cached_image, torch.Tensor):
+                        # print("Skipping ToTensor(), already a tensor [for uni]")
+                        cached_image = self.transforms(cached_image)
                 else:
                     raise FileNotFoundError
             except (FileNotFoundError, RuntimeError):
@@ -288,23 +298,33 @@ class CustomDataset(Dataset):
                 image = cv2.imread(image_path)
                 if image is None:
                     raise FileNotFoundError(f"Image {tile} not found at {image_path}")
+
+                # check if the tiles are in RGB and BGR format and convert to RGB if required
+
+
                 image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                 image = Image.fromarray(image)
                 cached_image = self.transforms(image)
+                # cached_image = transforms.ToTensor()(image).to(device).requires_grad_()
                 torch.save(cached_image, cached_image_path)
             cached_images.append(cached_image)
 
         step2_time = time.time()
-
         cached_images = torch.stack(cached_images)
 
-        rnaseq_data = sample['rnaseq_data']
-        x_omic = torch.tensor(rnaseq_data, dtype=torch.float32)
+        # rnaseq_data = sample['rnaseq_data']
+        # set_trace()
+        rnaseq_data = ast.literal_eval(sample['rnaseq_data'])
+        # set_trace()
+        rnaseq_values = np.array(list(rnaseq_data.values()), dtype=np.float32)
+        # convert to PyTorch tensor and enable gradient flow
+        x_omic = torch.from_numpy(rnaseq_values).requires_grad_()
+        # x_omic = torch.tensor(rnaseq_data, dtype=torch.float32)
 
         step3_time = time.time()
 
         # Timing print statements
-        # print(f"Index: {index}, Step 1: {step1_time - start_time:.4f}s, Step 2: {step2_time - step1_time:.4f}s, Step 3: {step3_time - step2_time:.4f}s")
+        print(f"Index: {index}, Step 1: {step1_time - start_time:.4f}s, Step 2: {step2_time - step1_time:.4f}s, Step 3: {step3_time - step2_time:.4f}s")
 
         return tcga_id, days_to_event, event_occurred, cached_images, x_omic
 
