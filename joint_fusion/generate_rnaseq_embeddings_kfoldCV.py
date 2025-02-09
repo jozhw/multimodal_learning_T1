@@ -17,7 +17,7 @@ import argparse
 import joblib
 import json
 from sklearn.model_selection import KFold
-from torch.optim.lr_scheduler import CosineAnnealingLR, ExponentialLR, StepLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, ExponentialLR, StepLR, ReduceLROnPlateau
 from torch.utils.data import TensorDataset, DataLoader, Subset
 from torchsummary import summary
 from torch.nn import functional as F
@@ -36,9 +36,9 @@ if __name__ == "__main__": # for early fusion
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 # os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 if device.type == 'cuda':
-    print("Running on GPU")
+    print("Running on GPU [from generate_rnaseq_embeddings_kfoldCV.py]")
 else:
-    print("Running on CPU")
+    print("Running on CPU [from generate_rnaseq_embeddings_kfoldCV.py]")
 
 class BetaVAE(nn.Module):
     def __init__(self, input_dim=None, latent_dim=None, intermediate_dim=None, beta=None, config=None):
@@ -56,14 +56,14 @@ class BetaVAE(nn.Module):
 
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, intermediate_dim),
-            nn.BatchNorm1d(intermediate_dim),
+            # nn.BatchNorm1d(intermediate_dim), # removed to avoid inconsistencies between training and inference; also not required for shallow NNs
             nn.LeakyReLU(),
             nn.Linear(intermediate_dim, latent_dim * 2)  # *2 for mean and log_var
         )
 
         self.decoder = nn.Sequential(
             nn.Linear(latent_dim, intermediate_dim),
-            nn.BatchNorm1d(intermediate_dim),
+            # nn.BatchNorm1d(intermediate_dim),
             nn.LeakyReLU(),
             nn.Linear(intermediate_dim, input_dim)
             # nn.Sigmoid()  # assuming data is normalized between 0 and 1
@@ -87,8 +87,13 @@ class BetaVAE(nn.Module):
 
 
 def loss_function(recon_x, x, mean, log_var):
-    reconstruction_loss = F.mse_loss(recon_x, x, reduction='sum')
-    kl_div_loss = -0.5 * torch.sum(1 + log_var - mean.pow(2) - log_var.exp())  # See Geron Eq 17-4
+    # reconstruction_loss = F.mse_loss(recon_x, x, reduction='sum')
+    # kl_div_loss = -0.5 * torch.sum(1 + log_var - mean.pow(2) - log_var.exp())  # See Geron Eq 17-4
+
+    # using mean over sum for stability
+    reconstruction_loss = F.mse_loss(recon_x, x, reduction='mean')
+    kl_div_loss = -0.5 * torch.mean(1 + log_var - mean.pow(2) - log_var.exp())
+
     return reconstruction_loss, kl_div_loss
 
 
@@ -98,8 +103,8 @@ def loss_function(recon_x, x, mean, log_var):
 def get_omic_embeddings(x_omic, latest_checkpoint, checkpoint_dir=None):
     print("In get_omic_embeddings()")
     # work directly on the tensor on the device
-    # x_omic = torch.log1p(x_omic) # not required as already done in the data loader
-    input_dim = 19962 # remove this hard-coded value
+    # set_trace()
+    input_dim = 9222 # remove this hard-coded value
 
     model = BetaVAE(input_dim=input_dim,
                     latent_dim=opt.latent_dim,
@@ -113,7 +118,7 @@ def get_omic_embeddings(x_omic, latest_checkpoint, checkpoint_dir=None):
     checkpoint_path = os.path.join(checkpoint_dir, latest_checkpoint)
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
-    # for some reason 'module' gets added to the names of the model parameters, so adjusting the state dictionary to remove 'module.' prefix
+    # 'module' gets added to the names of the model parameters, so adjusting the state dictionary to remove 'module.' prefix
     new_state_dict = {key.replace("module.", ""): value for key, value in checkpoint['model_state_dict'].items()}
     # model.load_state_dict(checkpoint['model_state_dict'])
     model.load_state_dict(new_state_dict)
@@ -137,14 +142,10 @@ def main(opt):
     wandb.init(project="rnaseq_vae", entity="tnnandi")
     config = wandb.config
     config = None  # remove this when using the sweep_config.yaml file
-
-    h5_file = 'mapping_data.h5'
-    train_loader, _, _ = create_data_loaders(opt, h5_file)
-    # # determine input dimension from the first batch of omic data
-    # for _, _, _, _, x_omic in train_loader:
-    #     input_dim = x_omic.shape[1]  # assuming x_omic is of shape (batch_size, num_genes)
-    #     break
-    input_dim = 19962 # remove this hard-coding
+    # h5_file = opt.input_h5_file
+    # h5_file = 'mapping_data.h5'
+    train_loader, _, _ = create_data_loaders(opt)
+    input_dim = 9222 #19962 # remove this hard-coding
 
     reconstruction_loss, kl_divergence_loss, val_loss = None, None, None
 
@@ -154,7 +155,7 @@ def main(opt):
 
     # create multiple folds from the training data
     kf = KFold(n_splits=5, shuffle=True, random_state=42)  # 5-fold CV
-    dataset = train_loader.dataset  # use the training dataset for CV
+    dataset = train_loader.dataset  # use the training dataset for CV  # both the val and test datasets will be used as the held out dataset
 
     total_samples = len(dataset)
     print(f"total training data size: {total_samples} samples")
@@ -174,13 +175,13 @@ def main(opt):
         val_loader_fold = DataLoader(val_subset,
                                        batch_size=opt.batch_size,
                                        shuffle=False,)
-
+        # set_trace()
         # number of samples and batches for the current fold
         num_samples = len(train_subset)
         num_batches = len(train_loader_fold)
         num_samples_val = len(val_subset)
         print(f"Number of samples in training fold {fold}: {num_samples}, in validation fold: {num_samples_val}")
-        print(f"Number of batches in training fold {fold}: {num_batches}")
+        print(f"Number of batches in training fold {fold}: {num_batches}") # this can be one when batch size is 256 because the number of elements in a fold = 244
 
         # initialize model, optimizer, scheduler for each fold
         # **reinitialize model for each fold**
@@ -189,19 +190,21 @@ def main(opt):
                         intermediate_dim=opt.intermediate_dim,
                         beta=opt.beta)
 
-        if torch.cuda.device_count() > 1:
-            print(f"using {torch.cuda.device_count()} GPUs")
-            model = nn.DataParallel(model)
+        # if torch.cuda.device_count() > 1:
+        #     print(f"using {torch.cuda.device_count()} GPUs")
+        #     model = nn.DataParallel(model)
 
         model = model.to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=opt.lr)
         # scheduler = CosineAnnealingLR(optimizer, T_max=opt.num_epochs, eta_min=opt.lr_min)
-        scheduler = ExponentialLR(optimizer, gamma=0.999)
+        # scheduler = ExponentialLR(optimizer, gamma=0.999)
+        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.8, patience=5,verbose=True)
 
         # initialize and fit the scaler incrementally on training data
         print("fitting scaler")
         scaler = StandardScaler()
         for batch_idx, (tcga_id, _, _, _, x_omic) in enumerate(train_loader_fold):
+            # print(f"fitting batch_index: {batch_idx}")
             x_omic = x_omic.cpu().numpy()
             scaler.partial_fit(x_omic)
 
@@ -210,26 +213,46 @@ def main(opt):
         joblib.dump(scaler, scaler_path)
         print(f"Scaler saved for fold {fold} at {scaler_path}")
 
+        # early stopping based on validation loss
+        # monitor the validation loss and stop training if it doesn't improve for a certain number of validation steps (patience)
+        patience = 15
+        best_val_loss = float('inf')
+        validation_checks_without_improvement = 0
+
         for epoch in range(opt.num_epochs):
             current_lr = optimizer.param_groups[0]['lr']
             print(f"Epoch {epoch+1}/{opt.num_epochs}, Fold {fold}, LR: {current_lr:.10f}")
             model.train()
             train_loss = 0.0
             for batch_idx, (tcga_id, _, _, _, x_omic) in enumerate(train_loader_fold):
-                print("batch_index: ", batch_idx)
+                # print("batch_index: ", batch_idx)
                 optimizer.zero_grad()
-                x_omic = x_omic.to(device)
+                # x_omic = x_omic.to(device)
+                x_omic = x_omic.cpu().numpy()
+                # print(f"Unnormalized training data mean and std: {np.mean(x_omic)}, std: {np.std(x_omic)}")
+                x_omic = scaler.transform(x_omic)  # scale the training data
+                # print(f"Normalized training data mean and std: {np.mean(x_omic)}, std: {np.std(x_omic)}")
+                x_omic = torch.tensor(x_omic, dtype=torch.float32).to(device)
                 recon_batch, mean, log_var = model(x_omic)
+                # set_trace()
+                # print(f"Training output mean and std: {recon_batch.mean().item()}, std: {recon_batch.std().item()}")
                 reconstruction_loss, kl_divergence_loss = loss_function(recon_batch, x_omic, mean, log_var)
+                # print(f"Reconstruction loss: {reconstruction_loss}, KL divergence loss: {kl_divergence_loss}")
                 loss = reconstruction_loss + opt.beta * kl_divergence_loss
                 loss.backward()
                 optimizer.step()
-                train_loss += loss.item()
+                train_loss += loss.item()  # accumulate batch losses
+
+            # train_loss /= len(train_loader_fold.dataset)
+            # normalize by number of batches (not dataset size as the loss function implementation already does normalization by dataset size)
+            train_loss /= len(train_loader_fold)
+            print(f"Training loss at Fold {fold}, epoch {epoch + 1}/{opt.num_epochs}: {train_loss}. LR: {current_lr:.10f}")
 
             # print training loss, calculate validation loss, and save trained model every 100 epochs
             if epoch % 100 == 0 and epoch > 0:
-                train_loss /= len(train_loader_fold.dataset)
-                print(f"Training loss at epoch {epoch}: {train_loss}")
+                # train_loss /= len(train_loader_fold.dataset)
+                # # print(f"Training loss at epoch {epoch}: {train_loss}")
+                # print(f"Training loss at Fold {fold}, epoch {epoch+1}/{opt.num_epochs}: {train_loss}. LR: {current_lr:.10f}")
 
                 # validation step (in eval mode)
                 model.eval()
@@ -243,10 +266,31 @@ def main(opt):
                         recon_batch, mean, log_var = model(x_omic)
                         reconstruction_loss, kl_divergence_loss = loss_function(recon_batch, x_omic, mean, log_var)
                         loss = reconstruction_loss + opt.beta * kl_divergence_loss
-                        val_loss += loss.item()
+                        val_loss += loss.item() # accumulate batch losses
 
-                val_loss /= len(val_loader_fold.dataset)
-                print(f"Validation loss at epoch {epoch}: {val_loss}")
+                # val_loss /= len(val_loader_fold.dataset)
+                # normalize by number of batches (not dataset size as the loss function implementation already does normalization by dataset size)
+                val_loss /= len(val_loader_fold)
+                print(f"*********** Validation loss at epoch {epoch}: {val_loss} ********************")
+
+                # early stopping logic
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    validation_checks_without_improvement = 0
+                    # Save the best model checkpoint
+                    best_checkpoint_path = os.path.join(checkpoint_dir, f"best_model_fold_{fold}.pth")
+                    torch.save({
+                        'epoch': epoch,
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict(),
+                    }, best_checkpoint_path)
+                    print(f"Best model saved at epoch {epoch} with validation loss {val_loss}")
+                else:
+                    validation_checks_without_improvement += 1
+                    if validation_checks_without_improvement >= patience:
+                        print(f"Early stopping triggered at epoch {epoch}. No improvement for {patience} epochs.")
+                        break  # exit the training loop
 
                 checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_fold_{fold}_epoch_{epoch}.pth")
                 torch.save({
@@ -257,6 +301,10 @@ def main(opt):
                 }, checkpoint_path)
                 print(f"Checkpoint saved at epoch {epoch}, fold {fold}, to {checkpoint_path}")
 
+                scheduler.step(val_loss) # for ReduceLROnPlateau as it adjusts the LR based on the validation loss # can be adjusted only when val_loss is calculated
+            # scheduler.step()  # for CosineAnnealingLR, StepLR, ExponentialLR etc as these follow a predefined schedule independent of the model performance
+
+
             # track losses using weights and biases
             wandb.log({"epoch": epoch,
                        "fold": fold,
@@ -265,8 +313,6 @@ def main(opt):
                        "val_loss": val_loss,
                        "reconstruction_loss": reconstruction_loss.item() if reconstruction_loss is not None else float('nan'),
                        "kl_div_loss": kl_divergence_loss.item() if kl_divergence_loss is not None else float('nan'),})
-
-            scheduler.step()
 
     wandb.finish()
 
@@ -277,24 +323,26 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     training = False
-    inference = True
+    inference = not training
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--input_wsi_path', type=str,
-                        # default='/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/preprocessing/TCGA_WSI/batch_corrected/processed_svs/tiles/256px_9.9x/combined_tiles/', # on laptop
-                        default='/lus/eagle/clone/g2/projects/GeomicVar/tarak/multimodal_learning_T1/preprocessing/TCGA_WSI/LUAD_all/svs_files/FFPE_tiles/tiles/256px_9.9x/combined_tiles/',
-                        help='Path to input WSI tiles',
-                        )
+    # parser.add_argument('--input_wsi_path', type=str,
+    #                     # default='/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/preprocessing/TCGA_WSI/batch_corrected/processed_svs/tiles/256px_9.9x/combined_tiles/', # on laptop
+    #                     default='/lus/eagle/clone/g2/projects/GeomicVar/tarak/multimodal_learning_T1/preprocessing/TCGA_WSI/LUAD_all/svs_files/FFPE_tiles/tiles/256px_9.9x/combined_tiles/',
+    #                     help='Path to input WSI tiles',
+    #                     )
+    parser.add_argument('--input_h5_file', type=str, default='./mapping_data_29Jan.h5', help='h5 file with train, validation and test splits')
     parser.add_argument('--batch_size', type=int, default=256, help='batch size for training (overall)')
     parser.add_argument('--val_batch_size', type=int, default=1000,
                         help='Batch size for validation data (using all samples for better Cox loss calculation)')
     parser.add_argument('--test_batch_size', type=int, default=1, help='Batch size for testing')
-    parser.add_argument('--input_size_wsi', type=int, default=256, help="input_size for path images")
-    parser.add_argument('--input_mode', type=str, default="wsi_omic", help="wsi, omic, wsi_omic")
-    parser.add_argument('--intermediate_dim', type=int, default=512, help='Dimension of intermediate layers')
-    parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate (this is the max LR for the scheduler)')
+    # parser.add_argument('--input_size_wsi', type=int, default=256, help="input_size for path images")
+    parser.add_argument('--input_mode', type=str, default="omic", help="wsi, omic, wsi_omic")
+
+    parser.add_argument('--intermediate_dim', type=int, default=2048, help='Dimension of intermediate layers')
+    parser.add_argument('--latent_dim', type=int, default=1024, help='Dimension of the latent space')
+    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate (this is the max LR for the scheduler)')
     parser.add_argument('--lr_min', type=float, default=1e-6, help='Minimum Learning rate')
-    parser.add_argument('--latent_dim', type=int, default=256, help='Dimension of the latent space')
     parser.add_argument('--beta', type=float, default=0.005, help='Beta parameter for VAE')
     parser.add_argument('--num_epochs', type=int, default=4000, help='Number of epochs for training')
 
@@ -311,9 +359,13 @@ if __name__ == "__main__":
         # checkpoint_dir = "checkpoint_2024-09-03-02-17-37"
         # checkpoint_dir = "checkpoint_2024-09-04-07-56-47"  #
         # checkpoint_dir = "checkpoint_2024-10-18-06-49-51"
-        checkpoint_dir = "checkpoint_2024-10-18-21-57-09"
-        fold_id = 0
-        latest_checkpoint_epoch = 2800# 1900 #1500
+        # checkpoint_dir = "checkpoint_2024-10-18-21-57-09"
+
+        # checkpoint_dir = "checkpoint_2025-02-09-00-51-38"
+        # checkpoint_dir = "checkpoint_2025-02-09-02-10-20"
+        checkpoint_dir = "checkpoint_2025-02-09-03-08-09"
+        fold_id = 3 #0
+        latest_checkpoint_epoch = 3400 #1500 #600 # 200 #3400 #3300# 1900 #1500
         latest_checkpoint = f'checkpoint_fold_{fold_id}_epoch_{latest_checkpoint_epoch}.pth'
 
         # load the saved scaler for normalizing x_omic
@@ -321,16 +373,17 @@ if __name__ == "__main__":
         mean = torch.tensor(scaler.mean_, dtype=torch.float32, device=device)
         scale = torch.tensor(scaler.scale_, dtype=torch.float32, device=device)
 
-        h5_file = 'mapping_data.h5'
-        train_loader, val_loader, test_loader = create_data_loaders(opt, h5_file)
+        # h5_file = 'mapping_data.h5'
+        # h5_file = opt.input_h5_file
+        train_loader, val_loader, test_loader = create_data_loaders(opt)
 
         # force batch size of 1 for each loader for inference
         train_loader = torch.utils.data.DataLoader(dataset=train_loader.dataset,
-                                                   batch_size=1)
+                                                   batch_size=100)
         val_loader   = torch.utils.data.DataLoader(dataset=val_loader.dataset,
-                                                   batch_size=1)
+                                                   batch_size=30)
         test_loader  = torch.utils.data.DataLoader(dataset=test_loader.dataset,
-                                                   batch_size=1)
+                                                   batch_size=30)
 
         # initialize a dictionary to store embeddings for each split
         split_patient_embeddings = {
@@ -341,22 +394,37 @@ if __name__ == "__main__":
 
         # choose the datasets for which inference needs to be done
         loaders = [train_loader, val_loader, test_loader]
-        split_names = ['train', 'val', 'test'] # make it consistent with the list in loaders above
+        split_names = ['train', 'val', 'test'] # make it consistent with the list in the dataloaders above
 
-        # loop over each loader and process the data
+        # # loop over each loader and process the data
+        # for split_name, loader in zip(split_names, loaders):
+        #     print(f"Processing {split_name} split...")
+        #     for batch_idx, (tcga_id, days_to_event, event_occurred, x_wsi, x_omic) in enumerate(loader):
+        #         tcga_id = tcga_id[0]  # assuming tcga_id is a batch of size 1
+        #         print(f"TCGA ID: {tcga_id}, batch_idx: {batch_idx}, out of {len(loader)} for split {split_name}")
+        #         x_omic = x_omic.to(device)
+        #         x_omic = (x_omic - mean) / scale
+        #         # get the omic embeddings using the checkpoint
+        #         embeddings = get_omic_embeddings(x_omic, latest_checkpoint, checkpoint_dir=checkpoint_dir)
+        #         embeddings_list = embeddings.tolist() if isinstance(embeddings, np.ndarray) else embeddings
+        #
+        #         # store the embeddings in the corresponding split dictionary
+        #         split_patient_embeddings[split_name][tcga_id] = embeddings_list
+
         for split_name, loader in zip(split_names, loaders):
             print(f"Processing {split_name} split...")
             for batch_idx, (tcga_id, days_to_event, event_occurred, x_wsi, x_omic) in enumerate(loader):
-                tcga_id = tcga_id[0]  # assuming tcga_id is a batch of size 1
-                print(f"TCGA ID: {tcga_id}, batch_idx: {batch_idx}, out of {len(loader)} for split {split_name}")
+                print(f"Processing batch {batch_idx} out of {len(loader)} for split {split_name}")
                 x_omic = x_omic.to(device)
                 x_omic = (x_omic - mean) / scale
-                # get the omic embeddings using the checkpoint
+
+                # Get omic embeddings using the checkpoint
                 embeddings = get_omic_embeddings(x_omic, latest_checkpoint, checkpoint_dir=checkpoint_dir)
                 embeddings_list = embeddings.tolist() if isinstance(embeddings, np.ndarray) else embeddings
 
-                # store the embeddings in the corresponding split dictionary
-                split_patient_embeddings[split_name][tcga_id] = embeddings_list
+                # Store embeddings in the corresponding split dictionary
+                for i, id_ in enumerate(tcga_id):
+                    split_patient_embeddings[split_name][id_] = embeddings_list[i]
 
         # save the embeddings for each split to separate json files
         for split_name in split_names:
