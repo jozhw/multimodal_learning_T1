@@ -25,7 +25,7 @@ np.random.seed(seed_value)
 
 timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 use_system = 'cluster' # cluster or laptop
-do_hpo = False
+do_hpo = True
 # do_hpo = False
 check_PH_assumptions = False
 plot_embs = False
@@ -34,7 +34,7 @@ drop_outliers = False # drop the very high values of survival duration in the da
 do_bootstrap = True
 kronecker_product_fusion = False
 hadamard_product_fusion = False
-mode = 'only_rnaseq' # 'rnaseq_wsi', 'only_rnaseq', 'only_wsi'
+mode = 'only_wsi' # 'rnaseq_wsi', 'only_rnaseq', 'only_wsi'
 
 # on laptop
 if use_system == 'laptop':
@@ -121,8 +121,8 @@ class IdentityScaler(BaseEstimator, TransformerMixin):
 print("scaling rnaseq embeddings")
 # scaler_rna = MinMaxScaler(feature_range=(-1, 1))
 # scaler = RobustScaler()
-# scaler_rna = StandardScaler()
-scaler_rna = IdentityScaler()
+scaler_rna = StandardScaler()
+# scaler_rna = IdentityScaler()
 train_embs_normalized = pd.DataFrame(scaler_rna.fit_transform(train_embs), index=train_embs.index) # fit only using the training data
 test_validation_embs_normalized = pd.DataFrame(scaler_rna.transform(test_validation_embs),
                                                index=test_validation_embs.index)
@@ -131,8 +131,8 @@ test_validation_embs_normalized = pd.DataFrame(scaler_rna.transform(test_validat
 print("scaling WSI embeddings")
 # scaler_wsi = MinMaxScaler(feature_range=(-1, 1))
 # scaler = RobustScaler()
-# scaler_wsi = StandardScaler()
-scaler_wsi = IdentityScaler()
+scaler_wsi = StandardScaler()
+# scaler_wsi = IdentityScaler()
 # train_wsi_embs = wsi_embs.loc[train_embs.index]  # Select only training samples
 # # train_wsi_embs_normalized = pd.DataFrame(scaler_wsi.fit_transform(list(train_wsi_embs["slide_embedding"])), index=train_wsi_embs.index)
 # # test_validation_wsi_embs_normalized = pd.DataFrame(scaler_wsi.transform(list(wsi_embs.loc[test_validation_embs.index]["slide_embedding"])),
