@@ -10,6 +10,10 @@ from sksurv.ensemble import GradientBoostingSurvivalAnalysis
 from sksurv.util import Surv
 from sksurv.metrics import concordance_index_censored
 import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import multiprocessing
 import random
 import optuna
 import datetime
@@ -17,6 +21,10 @@ from sklearn.model_selection import KFold
 from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils import resample
+import torchtuples as tt
+from pycox.models import CoxPH
+# from pycox.evaluation import concordance_index
+import argparse
 from pdb import set_trace
 
 seed_value = 42  
@@ -25,36 +33,75 @@ np.random.seed(seed_value)
 
 timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 use_system = 'cluster' # cluster or laptop
-do_hpo = True
-# do_hpo = False
-check_PH_assumptions = False
-plot_embs = False
-plot_survival = False
-drop_outliers = False # drop the very high values of survival duration in the data
-do_bootstrap = True
-kronecker_product_fusion = False
-hadamard_product_fusion = False
-mode = 'only_wsi' # 'rnaseq_wsi', 'only_rnaseq', 'only_wsi'
+
+# check_PH_assumptions = False
+# plot_embs = False
+# plot_survival = False
+# drop_outliers = False # drop the very high values of survival duration in the data
+# do_bootstrap = True
+# kronecker_product_fusion = False
+# hadamard_product_fusion = False
+# attention_fusion = True
+# do_hpo = True
+# apply_pca = False
+# use_model = 'gbst' # 'snn', 'gbst'  # gradient boosted survival tree or survival neural network
+# mode = 'rnaseq_wsi' # 'rnaseq_wsi', 'only_rnaseq', 'only_wsi'
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Model training and evaluation parameters')
+    
+    # Add arguments with appropriate defaults matching your configuration
+    parser.add_argument('--check_PH_assumptions', action='store_true', 
+                        help='Check proportional hazards assumptions')
+    parser.add_argument('--plot_embs', action='store_true',
+                        help='Plot embeddings')
+    parser.add_argument('--plot_survival', action='store_true',
+                        help='Plot survival curves')
+    parser.add_argument('--drop_outliers', action='store_true',
+                        help='Drop very high values of survival duration in the data')
+    parser.add_argument('--do_bootstrap', action='store_true', default=True,
+                        help='Perform bootstrap resampling')
+    parser.add_argument('--kronecker_product_fusion', action='store_true',
+                        help='Use Kronecker product for feature fusion')
+    parser.add_argument('--hadamard_product_fusion', action='store_true',
+                        help='Use Hadamard product for feature fusion')
+    parser.add_argument('--attention_fusion', action='store_true', default=True,
+                        help='Use attention mechanism for feature fusion')
+    parser.add_argument('--do_hpo', action='store_true', default=True,
+                        help='Perform hyperparameter optimization')
+    parser.add_argument('--apply_pca', action='store_true',
+                        help='Apply PCA dimensionality reduction')
+    parser.add_argument('--use_model', type=str, default='snn', choices=['snn', 'gbst'],
+                        help='Model type: gradient boosted survival tree (gbst) or survival neural network (snn)')
+    parser.add_argument('--mode', type=str, default='only_wsi', 
+                        choices=['rnaseq_wsi', 'only_rnaseq', 'only_wsi'],
+                        help='Data modality to use')
+    
+    return parser.parse_args()
+
+args = parse_args()
 
 # on laptop
 if use_system == 'laptop':
     input_dir = '/mnt/c/Users/tnandi/Downloads/multimodal_lucid/multimodal_lucid/early_fusion_inputs/'
-    # id = "2025-02-09-22-42-55_fold_3_epoch_1700"
-    # id = "2025-02-13-17-57-25_fold_3_epoch_3900" # probably the HPO run names were messed up due to overwriting (ran on 8 GPUs)
-    # id = "2025-02-14-07-29-39_fold_2_epoch_2500"
-    id = "2025-02-14-07-29-39_fold_2_epoch_1500"
+    # id = "2025-02-27-01-12-39_fold_1_epoch_1000"
 
 if use_system == 'cluster':
     # on polaris
     input_dir = '/lus/eagle/clone/g2/projects/GeomicVar/tarak/multimodal_learning_T1/early_fusion_inputs/'
-    # id = "2025-02-09-22-42-55_fold_3_epoch_1700"
-    # id = "2025-02-13-17-57-25_fold_3_epoch_3900"
-    id = "2025-02-14-07-29-39_fold_2_epoch_1500"
+    # id = "2025-02-27-01-12-39_fold_1_epoch_3000" # working
+    id = "2025-02-27-01-41-45_fold_1_epoch_3000" # rnaseq and wsi embeddings distributions more similar
 
 # file paths for rnaseq embeddings (generated using generate_rnaseq_embeddings_kfoldCV.py)
 train_file = os.path.join(input_dir, f"rnaseq_embeddings_train_checkpoint_{id}.json")
 val_file = os.path.join(input_dir, f"rnaseq_embeddings_val_checkpoint_{id}.json")
 test_file = os.path.join(input_dir, f"rnaseq_embeddings_test_checkpoint_{id}.json")
+
+train_file = os.path.join(input_dir, f"rnaseq_embeddings_train_checkpoint_hp_subset_{id}.json")
+val_file = os.path.join(input_dir, f"rnaseq_embeddings_val_checkpoint_hp_subset_{id}.json")
+test_file = os.path.join(input_dir, f"rnaseq_embeddings_test_checkpoint_hp_subset_{id}.json")
+
 
 # load the rnaseq embeddings
 train_embs = pd.read_json(train_file).T
@@ -71,16 +118,36 @@ test_validation_embs = pd.concat([val_embs, test_embs], axis=0)  # concatenate a
 test_validation_tcga_ids = list(val_embs.index) + list(test_embs.index)
 print("Test + Validation embeddings shape (RNASeq):", test_validation_embs.shape)
 
-# load embeddings from WSI and rnaseq
-print("loading WSI tile level embeddings")
+print("Loading WSI data")
+# set_trace()
 # wsi_embs = pd.read_json(os.path.join(input_dir, 'WSI_embeddings_average_uni_29Jan.rounded.json')).T
-wsi_embs = pd.read_json(os.path.join(input_dir, 'WSI_embeddings_average_uni_30Jan_1000tiles.rounded.json')).T
+# wsi_embs = pd.read_json(os.path.join(input_dir, 'WSI_embeddings_average_uni_30Jan_1000tiles.rounded.json')).T
+
+# save as parquet file
+# wsi_embs = pd.read_json(os.path.join(input_dir, 'WSI_embeddings_uni_31Jan_1000tiles.truncated.json'), lines=True).T
+# wsi_embs.to_parquet(os.path.join(input_dir, 'WSI_embeddings_uni_31Jan_1000tiles.truncated.json.parquet'))
+# set_trace()
+# Then in future loads, use:
+wsi_embs = pd.read_parquet(os.path.join(input_dir, 'WSI_embeddings_uni_31Jan_1000tiles.truncated.json.parquet'))
+
+# check shapes
+# embedding_shapes = wsi_embs.iloc[:, 0].apply(lambda x: np.array(x).shape)
+# unique_shapes = embedding_shapes.unique()
 # get the slide level embeddings by averaging the tile level embeddings
 print("obtaining slide level embeddings by averaging the tile level embeddings")
-wsi_embs["slide_level_embedding"] = wsi_embs.apply(lambda row: np.mean(np.stack(row.values), axis=0), axis=1)
-wsi_embs = wsi_embs[["slide_level_embedding"]].rename(columns={"slide_level_embedding": "slide_embedding"})
 
-# edited to handle the scenario where the TCGA samples for the WSI embeddings are a subset of the RNASeq embeddings  
+# wsi_embs["slide_level_embedding"] = wsi_embs.apply(lambda row: np.mean(np.stack(row.values), axis=0), axis=1)
+# wsi_embs = wsi_embs[["slide_level_embedding"]].rename(columns={"slide_level_embedding": "slide_embedding"})
+
+wsi_embs["slide_embedding"] = wsi_embs.iloc[:, 0].apply(lambda x: np.mean(x, axis=0))
+wsi_embs = wsi_embs.drop(columns=[0])
+
+# remove the problematic WSIs (with penmarks etc)
+exclude_ids_wsi = ['TCGA-86-6851', 'TCGA-86-7701', 'TCGA-86-7711', 'TCGA-86-7713', 'TCGA-86-7714', 'TCGA-86-7953', 'TCGA-86-7954', 'TCGA-86-7955', 
+                  'TCGA-86-8055', 'TCGA-86-8056', 'TCGA-86-8073', 'TCGA-86-8074', 'TCGA-86-8075', 'TCGA-86-8076', 'TCGA-86-8278', 'TCGA-86-8279', 
+                  'TCGA-86-8280', 'TCGA-86-A4P7', 'TCGA-86-A4P8']
+wsi_embs = wsi_embs.drop(index=exclude_ids_wsi, errors='ignore')
+
 # find common indices between the rnaseq and WSI embeddings
 common_train_indices = train_embs.index.intersection(wsi_embs.index)
 common_test_validation_indices = test_validation_embs.index.intersection(wsi_embs.index)
@@ -96,6 +163,26 @@ test_validation_wsi_embs = wsi_embs.loc[common_test_validation_indices]
 print("Train embeddings shape (WSI):", train_wsi_embs.shape)
 print("Test + Validation embeddings shape (WSI):", test_validation_wsi_embs.shape)
 # print("Test embeddings shape (WSI):", test_embs.shape)
+
+
+class AttentionFusion(nn.Module): # keeps fused embedding at 1024; learns how much to weight features within both modalities, and prevents over-reliance on one modality
+    def __init__(self, emb_dim=1024):
+        super(AttentionFusion, self).__init__()
+        self.rna_transform = nn.Linear(emb_dim, emb_dim)
+        self.wsi_transform = nn.Linear(emb_dim, emb_dim)
+
+        self.attention = nn.Linear(emb_dim*2, 2)   
+
+    def forward(self, rna_emb, wsi_emb):
+        rna_proj = F.relu(self.rna_transform(rna_emb))
+        wsi_proj = F.relu(self.wsi_transform(wsi_emb))
+
+        combined = torch.cat([rna_proj, wsi_proj], dim=1)
+        attn_weights = F.softmax(self.attention(combined), dim=1)
+        fused_embedding = (rna_proj * attn_weights[:, [0]]) + (wsi_proj * attn_weights[:, [1]])
+
+        return fused_embedding, attn_weights
+
 
 
 # embeddings from the wsi and the rnaseq modality may have different min/max values
@@ -143,7 +230,7 @@ scaler_wsi = StandardScaler()
 # train_wsi_embs_normalized = pd.DataFrame(scaler_wsi.fit_transform(train_wsi_embs_array), index=train_wsi_embs.index)
 # test_validation_wsi_embs_normalized = pd.DataFrame(scaler_wsi.transform(test_validation_wsi_embs_array), index=test_validation_embs.index)
 
-
+# set_trace()
 # ensure non-empty arrays before stacking
 if not train_wsi_embs.empty:
     train_wsi_embs_array = np.stack(train_wsi_embs["slide_embedding"].values)
@@ -159,8 +246,8 @@ else:
 
 # concatenate normalized embeddings to obtain multimodal embeddings
 print("concatenating embeddings")
-if mode == 'rnaseq_wsi':
-    if kronecker_product_fusion:
+if args.mode == 'rnaseq_wsi':
+    if args.kronecker_product_fusion:
         from sklearn.decomposition import PCA
 
         # Define reduced dimension size
@@ -185,22 +272,60 @@ if mode == 'rnaseq_wsi':
         print(f"Kronecker-fused training set shape: {X_train.shape}")
         print(f"Kronecker-fused test/validation set shape: {X_test_validation.shape}")
 
-    elif hadamard_product_fusion:
+    elif args.hadamard_product_fusion:
         # Element-wise multiplication (Hadamard product)
         X_train = train_embs_normalized * train_wsi_embs_normalized  
-        X_test_validation = test_validation_embs_normalized * test_validation_wsi_embs_normalized  
+        X_test_validation = test_validation_embs_normalized * test_validation_wsi_embs_normalized
+
+    # elif args.attention_fusion:  # keeps the fused embedding dimension at 1024 (and not 2048) to prevent overfitting
+
+    #     pass
+
 
     else:
         X_train = pd.concat([train_embs_normalized, train_wsi_embs_normalized], axis=1)
         X_test_validation = pd.concat([test_validation_embs_normalized, test_validation_wsi_embs_normalized], axis=1)
-elif mode == 'only_wsi':
+
+        # scaler_joint = StandardScaler()
+        # X_train = pd.DataFrame(
+        #     scaler_joint.fit_transform(X_train),
+        #     index=X_train.index,
+        #     columns=X_train.columns
+        # )
+
+        # # Apply transformation to the test/validation data
+        # X_test_validation = pd.DataFrame(
+        #     scaler_joint.transform(X_test_validation),
+        #     index=X_test_validation.index,
+        #     columns=X_test_validation.columns
+        # )
+
+        # if apply_pca:
+        #     # apply PCA
+        #     from sklearn.decomposition import PCA
+        #     pca = PCA(n_components=128)  # reduces from 2048 to 128 dimensions, adding regularization
+
+        #     X_train = pd.DataFrame(
+        #     pca.fit_transform(X_train),
+        #     index=X_train.index,
+        #     columns=[f'PC{i+1}' for i in range(128)]
+        #     )
+
+        #     X_test_validation = pd.DataFrame(
+        #         pca.transform(X_test_validation),
+        #         index=X_test_validation.index,
+        #         columns=[f'PC{i+1}' for i in range(128)]
+        #     )
+        #     set_trace()
+# set_trace()
+elif args.mode == 'only_wsi':
     X_train = pd.concat([train_wsi_embs_normalized], axis=1)
     X_test_validation = pd.concat([test_validation_wsi_embs_normalized], axis=1)
-if mode == 'only_rnaseq':
+if args.mode == 'only_rnaseq':
     X_train = pd.concat([train_embs_normalized], axis=1)
     X_test_validation = pd.concat([test_validation_embs_normalized], axis=1)
 
-if plot_embs:
+if args.plot_embs:
     def plot_embedding_statistics(rna_embs, wsi_embs, split):
         """
         Plots the statistical distributions (min, max, mean, std) of RNA-Seq and WSI embeddings.
@@ -262,7 +387,7 @@ if plot_embs:
         plt.show()
 
     
-    # plot_embedding_statistics(test_validation_embs_normalized, test_validation_wsi_embs_normalized)
+    # plot_embedding_statistics(test_validation_embs_array, test_validation_wsi_embs_array)
     plot_embedding_statistics(train_embs, pd.DataFrame(train_wsi_embs_array, index=train_wsi_embs.index), "train")
     # set_trace()
     plot_embedding_distributions(train_embs, pd.DataFrame(train_wsi_embs_array, index=train_wsi_embs.index), "train")
@@ -270,19 +395,21 @@ if plot_embs:
     # plot_embedding_distributions(train_embs_normalized, train_wsi_embs_normalized)
 
     set_trace()
+
+
 # load survival data
 print("loading survival data")
 # mapping_df = pd.read_json(os.path.join(input_dir, 'mapping_df_29Jan.json')).T
-mapping_df = pd.read_json(os.path.join(input_dir, 'mapping_df_30Jan_1000tiles.json')).T
+mapping_df = pd.read_json(os.path.join(input_dir, 'mapping_df_31Jan_1000tiles.json')).T
 # convert the 'event_occurred' values to 0 and 1 for compatibility with Sksurv
 # mapping_df['event_occurred'] = mapping_df['event_occurred'].map({'Dead': 1, 'Alive': 0}).astype(int)
 mapping_df['event_occurred'] = mapping_df['event_occurred'].map({'Dead': 1, 'Alive': 0}).astype(bool)
-
+# set_trace()
 # prepare train and test survival data
 train_survival = mapping_df.loc[common_train_indices]
 test_validation_survival = mapping_df.loc[common_test_validation_indices]
 
-if drop_outliers:
+if args.drop_outliers:
     # Inspect the top survival times
     print(mapping_df["time"].describe())
     filtered_mapping_df = mapping_df[mapping_df["time"] <= 4000]
@@ -309,7 +436,7 @@ test_validation_survival["event_occurred"] = test_validation_survival["event_occ
 train_surv = Surv.from_arrays(train_survival["event_occurred"].values, train_survival["time"].values)
 test_validation_surv = Surv.from_arrays(test_validation_survival["event_occurred"].values, test_validation_survival["time"].values)
 
-if plot_survival:
+if args.plot_survival:
     plt.figure(figsize=(8, 6))
     
     # Kaplan-Meier Fitter for train data
@@ -335,7 +462,7 @@ if plot_survival:
     # Show the plot
     plt.show()
 
-if check_PH_assumptions:
+if args.check_PH_assumptions:
     def check_ph_assumption(data, dataset_name):
         """Check proportional hazards assumption using median survival time for given dataset."""
         print(f"\nChecking Proportional Hazards Assumption for {dataset_name}...\n")
@@ -371,94 +498,256 @@ if check_PH_assumptions:
 
 # set_trace()
 # HPO with optuna
-print(f" ********  Training for mode: {mode}  **********")
-if do_hpo:
-    def objective(trial):
-        # # n_estimators = trial.suggest_int('n_estimators', 10, 100)
-        n_estimators = trial.suggest_int('n_estimators', 10, 100)
-        learning_rate = trial.suggest_float('learning_rate', 0.01, 0.1, log=True)
-        max_depth = trial.suggest_int('max_depth', 1, 3)    # 1,5
+print(f" ********  Training for mode: {args.mode}  **********")
 
-        # n_estimators = trial.suggest_int('n_estimators', 10, 500)
-        # learning_rate = trial.suggest_float('learning_rate', 0.005, 0.5, log=True)
-        # max_depth = trial.suggest_int('max_depth', 1, 10) 
 
-        model = GradientBoostingSurvivalAnalysis(n_estimators=n_estimators,
-                                                 learning_rate=learning_rate,
-                                                 max_depth=max_depth,
-                                                 max_features='sqrt', # remove it?
-                                                 random_state=seed_value)  
-        print(f"X_train shape: {X_train.shape}, train_surv shape: {train_surv.shape}")
-        kf = KFold(n_splits=5, shuffle=True, random_state=seed_value)  # 5-fold CV : 45
-        c_indices = []
-
-        for fold, (train_index, val_index) in enumerate(kf.split(X_train)):
-            X_train_fold, X_val_fold = X_train.iloc[train_index], X_train.iloc[val_index]
-            survival_train_fold = train_surv[train_index]
-            survival_val_fold = train_surv[val_index]
-
-            model.fit(X_train_fold, survival_train_fold)
-            risk_scores_val = model.predict(X_val_fold)
-
-            # Compute concordance index on validation fold
-            c_index_val = concordance_index_censored(
-                survival_val_fold["event"], # name changed internally by sksurv
-                survival_val_fold["time"],
-                risk_scores_val
-            )[0]
-            c_indices.append(c_index_val)
-
-            # # Optuna pruning (stops unpromising trials early based on the performance of the first few validation sets)
-            # trial.report(np.mean(c_indices), fold)
-            # if trial.should_prune():
-            #     raise optuna.exceptions.TrialPruned()
+if args.use_model == 'gbst':
+    if args.do_hpo:
+        def objective(trial):
             
-            # # Aggressive Pruning
-            # if fold >= 2 and np.mean(c_indices) < 0.55:
-            #     raise optuna.exceptions.TrialPruned()
+            # # n_estimators = trial.suggest_int('n_estimators', 10, 100)
+            n_estimators = trial.suggest_int('n_estimators', 10, 100)
+            learning_rate = trial.suggest_float('learning_rate', 0.01, 0.1, log=True)
+            max_depth = trial.suggest_int('max_depth', 1, 3)    # 1,5
+
+            model = GradientBoostingSurvivalAnalysis(n_estimators=n_estimators,
+                                                    learning_rate=learning_rate,
+                                                    max_depth=max_depth,
+                                                    #  max_features='sqrt', # remove it?
+                                                    max_features=0.5, 
+                                                    #  max_features=max_features,
+                                                    random_state=seed_value,
+                                                    )  
+            print(f"X_train shape: {X_train.shape}, train_surv shape: {train_surv.shape}")
+            kf = KFold(n_splits=5, shuffle=True, random_state=seed_value)  # 5-fold CV : 45
+            c_indices = []
+
+            for fold, (train_index, val_index) in enumerate(kf.split(X_train)):
+                X_train_fold, X_val_fold = X_train.iloc[train_index], X_train.iloc[val_index]
+                survival_train_fold = train_surv[train_index]
+                survival_val_fold = train_surv[val_index]
+                # set_trace()
+                X_train_fold_np = X_train_fold.to_numpy()
+                X_val_fold_np = X_val_fold.to_numpy()
+
+                model.fit(X_train_fold_np, survival_train_fold)
+                risk_scores_val = model.predict(X_val_fold_np)
+
+                # Compute concordance index on validation fold
+                c_index_val = concordance_index_censored(
+                    survival_val_fold["event"], # name changed internally by sksurv
+                    survival_val_fold["time"],
+                    risk_scores_val
+                )[0]
+                c_indices.append(c_index_val)
+                
+            return np.mean(c_indices)  # average CI across folds
+
+        num_cpu_cores = multiprocessing.cpu_count()
+        study = optuna.create_study(direction='maximize')
+        study.optimize(objective, n_trials=200, n_jobs=num_cpu_cores)
+        best_params = study.best_params
+        model = GradientBoostingSurvivalAnalysis(**best_params)
+        # train the model
+        model.fit(X_train, train_surv)
+    else:
+        print("training using model configuration determined from HPO")
+        # model = GradientBoostingSurvivalAnalysis(n_estimators=31, learning_rate=0.85, max_depth=1, random_state=0)
+        # model = GradientBoostingSurvivalAnalysis(n_estimators=20, learning_rate=0.05, max_depth=3, random_state=0)
+        if mode == 'rnaseq_wsi':
+            # model = GradientBoostingSurvivalAnalysis(n_estimators=70, 
+            #                                         learning_rate=0.01, 
+            #                                         max_depth=2, 
+            #                                         max_features='sqrt',
+            #                                         random_state=seed_value)
+            model = GradientBoostingSurvivalAnalysis(n_estimators=68, 
+                                                    learning_rate=0.011, 
+                                                    max_depth=2, 
+                                                    max_features='sqrt',
+                                                    random_state=seed_value)
+        elif mode == 'only_rnaseq':
+            # model = GradientBoostingSurvivalAnalysis(n_estimators=39, 
+            #                                 learning_rate=0.0542, 
+            #                                 max_depth=2, 
+            #                                 max_features='sqrt',
+            #                                 random_state=seed_value)
+
+            model = GradientBoostingSurvivalAnalysis(n_estimators=39, 
+                                            learning_rate=0.04305, 
+                                            max_depth=2, 
+                                            max_features='sqrt',
+                                            random_state=seed_value)        
+
+        elif mode == 'only_wsi':
+            # model = GradientBoostingSurvivalAnalysis(n_estimators=10, 
+            #                                 learning_rate=0.025, 
+            #                                 max_depth=3, 
+            #                                 max_features='sqrt',
+            #                                 random_state=seed_value)      
+
+            model = GradientBoostingSurvivalAnalysis(n_estimators=38, 
+                                            learning_rate=0.023, 
+                                            max_depth=3, 
+                                            max_features='sqrt',
+                                            random_state=seed_value)   
+
+elif args.use_model == 'snn':
+    # Import numpy for array operations
+    import numpy as np
+    # Define Survival Neural Network
+    def create_snn(input_dim, num_nodes=[32, 32], dropout=0.1):
+        # Using the correct parameter order: in_features, num_nodes, out_features, batch_norm, dropout
+        model = tt.practical.MLPVanilla(
+            in_features=input_dim,
+            num_nodes=num_nodes,
+            out_features=1,
+            batch_norm=True,
+            dropout=dropout
+        )
+        
+        # Set model to use float32 instead of float64
+        model = model.float()
+        net = CoxPH(model, tt.optim.Adam(lr=1e-3))
+        # net.float()  # Ensure the model uses float32 precision
+        return net
+
+    if args.do_hpo:
+        def objective(trial):
+            # Hyperparameters to optimize
+            # num_nodes_1 = trial.suggest_int('num_nodes_1', 8, 16)
+            # num_nodes_2 = trial.suggest_int('num_nodes_2', 16, 128)
+            # dropout = trial.suggest_float('dropout', 0.1, 0.5)
+            # batch_size = trial.suggest_categorical('batch_size', [16, 32, 64])
+            # epochs = trial.suggest_int('epochs', 50, 200)
+
+            num_nodes_1 = trial.suggest_categorical('num_nodes_1', [8, 16, 32])
+            num_nodes_2 = trial.suggest_categorical('num_nodes_2', [8, 16, 32])
+            dropout = trial.suggest_categorical('dropout', [0.1, 0.3, 0.5])
+            batch_size = trial.suggest_categorical('batch_size', [64, 128])
+            epochs = trial.suggest_categorical('epochs', [150])
+
+            print(f"\n{'='*20} Trial {trial.number} {'='*20}")
+            print(f"\nStarting trial {trial.number}: num_nodes=({num_nodes_1}, {num_nodes_2}), dropout={dropout}, batch_size={batch_size}, epochs={epochs}")
             
-        return np.mean(c_indices)  # average CI across folds
+            # Create model with trial parameters
+            model = create_snn(
+                input_dim=X_train.shape[1],
+                num_nodes=[num_nodes_1, num_nodes_2],
+                dropout=dropout
+            )
+            
+            print(f"X_train shape: {X_train.shape}, train_surv shape: {train_surv.shape}")
+            kf = KFold(n_splits=5, shuffle=True, random_state=seed_value)  # 5-fold CV
+            c_indices = []
 
-    study = optuna.create_study(direction='maximize')
-    study.optimize(objective, n_trials=100)
-    best_params = study.best_params
-    model = GradientBoostingSurvivalAnalysis(**best_params)
-else:
-    print("training using model configuration determined from HPO")
-    # model = GradientBoostingSurvivalAnalysis(n_estimators=31, learning_rate=0.85, max_depth=1, random_state=0)
-    # model = GradientBoostingSurvivalAnalysis(n_estimators=20, learning_rate=0.05, max_depth=3, random_state=0)
-    if mode == 'rnaseq_wsi':
-        model = GradientBoostingSurvivalAnalysis(n_estimators=70, 
-                                                learning_rate=0.01, 
-                                                max_depth=2, 
-                                                max_features='sqrt',
-                                                random_state=seed_value)
-    elif mode == 'only_rnaseq':
-        model = GradientBoostingSurvivalAnalysis(n_estimators=39, 
-                                        learning_rate=0.0542, 
-                                        max_depth=2, 
-                                        max_features='sqrt',
-                                        random_state=seed_value)
-    elif mode == 'only_wsi':
-        model = GradientBoostingSurvivalAnalysis(n_estimators=10, 
-                                        learning_rate=0.025, 
-                                        max_depth=3, 
-                                        max_features='sqrt',
-                                        random_state=seed_value)        
+            for fold, (train_index, val_index) in enumerate(kf.split(X_train)):
+                print(f"\n--- Trial {trial.number}, Fold {fold}/5 ---")
+                X_train_fold, X_val_fold = X_train.iloc[train_index], X_train.iloc[val_index]
+                survival_train_fold = train_surv[train_index]
+                survival_val_fold = train_surv[val_index]
+                
+                # Copy arrays to ensure contiguous memory layout and consistent data type
+                X_train_fold_np = np.array(X_train_fold.to_numpy(), copy=True, dtype=np.float32)
+                X_val_fold_np = np.array(X_val_fold.to_numpy(), copy=True, dtype=np.float32)
+
+                # Format data for PyTorch training - ensure arrays are contiguous and of consistent data type
+                y_train_fold = (
+                    np.array(survival_train_fold["time"], copy=True, dtype=np.float32),
+                    np.array(survival_train_fold["event"], copy=True, dtype=np.float32)
+                )
+                
+                # Train the model
+                model.fit(
+                    X_train_fold_np, 
+                    y_train_fold, 
+                    batch_size=batch_size, 
+                    epochs=epochs, 
+                    verbose=False
+                )
+                
+                # Get predictions on validation fold
+                risk_scores_val = model.predict(X_val_fold_np).flatten()
+                c_index_val = concordance_index_censored(survival_val_fold["event"], survival_val_fold["time"], risk_scores_val)[0]
+                print(f"Fold {fold} completed. C-index: {c_index_val:.4f}")
+                c_indices.append(c_index_val)
+
+            avg_c_index = np.mean(c_indices)
+            print(f"\n*** Trial {trial.number} completed. Average C-index: {avg_c_index:.4f} ***")
+            print(f"{'='*55}\n")
+
+            return avg_c_index
+                
+            # return np.mean(c_indices)  # average CI across folds
+
+        num_cpu_cores = multiprocessing.cpu_count()
+        study = optuna.create_study(direction='maximize')
+        study.optimize(objective, n_trials=100, n_jobs=num_cpu_cores)
+        best_params = study.best_params
+        
+        # Train the model with best parameters on full training data
+        model = create_snn(
+            input_dim=X_train.shape[1],
+            num_nodes=[best_params['num_nodes_1'], best_params['num_nodes_2']],
+            dropout=best_params['dropout']
+        )
+        
+        # Format full training data - ensure arrays are contiguous and of consistent data type
+        y_train = (
+            np.array(train_surv["time"], copy=True, dtype=np.float32),
+            np.array(train_surv["event"], copy=True, dtype=np.float32)
+        )
+        X_train_np = np.array(X_train.to_numpy(), copy=True, dtype=np.float32)
+        
+        # Train the model
+        model.fit(
+            X_train_np, 
+            y_train, 
+            batch_size=best_params['batch_size'], 
+            epochs=best_params['epochs'], 
+            verbose=True
+        )
+    else:
+        print("training using model configuration determined from HPO")
+        model = create_snn(
+            input_dim=X_train.shape[1],
+            num_nodes=[64, 32],
+            dropout=0.2
+        )
+        batch_size = 32
+        epochs = 150
+
+        # Format full training data - ensure arrays are contiguous
+        y_train = (
+            np.array(train_surv["time"], copy=True),
+            np.array(train_surv["event"], copy=True)
+        )
+        X_train_np = np.array(X_train.to_numpy(), copy=True)
+        
+        # Train the model
+        model.fit(
+            X_train_np, 
+            y_train, 
+            batch_size=batch_size, 
+            epochs=epochs, 
+            verbose=True
+        )
 
 
-
-
-# train the model
-model.fit(X_train, train_surv)
+# set_trace()
+# # train the model
+# model.fit(X_train, train_surv)
 
 # predict risk scores
+if args.use_model == 'snn':
+    X_train = np.array(X_train.to_numpy(), copy=True, dtype=np.float32)
+    X_test_validation = np.array(X_test_validation.to_numpy(), copy=True, dtype=np.float32)
+    
 risk_scores_train = model.predict(X_train)
 risk_scores_test = model.predict(X_test_validation)
 
 # compute concordance indices
-c_index_train = concordance_index_censored(train_survival["event_occurred"], train_survival["time"], risk_scores_train)[0]
-c_index_test = concordance_index_censored(test_validation_survival["event_occurred"], test_validation_survival["time"], risk_scores_test)[0]
+c_index_train = concordance_index_censored(train_survival["event_occurred"], train_survival["time"], risk_scores_train.flatten())[0]
+c_index_test = concordance_index_censored(test_validation_survival["event_occurred"], test_validation_survival["time"], risk_scores_test.flatten())[0]
 
 print(f"Train Concordance Index: {c_index_train:.4f}")
 print(f"Test Concordance Index: {c_index_test:.4f}")
@@ -470,18 +759,18 @@ low_risk = risk_scores_test < median_risk
 
 kmf_high = KaplanMeierFitter()
 kmf_low = KaplanMeierFitter()
-
-kmf_high.fit(test_validation_survival["time"][high_risk], test_validation_survival["event_occurred"][high_risk], label="High Risk")
-kmf_low.fit(test_validation_survival["time"][low_risk], test_validation_survival["event_occurred"][low_risk], label="Low Risk")
+# set_trace()
+kmf_high.fit(test_validation_survival["time"][high_risk.flatten()], test_validation_survival["event_occurred"][high_risk.flatten()], label="High Risk")
+kmf_low.fit(test_validation_survival["time"][low_risk.flatten()], test_validation_survival["event_occurred"][low_risk.flatten()], label="Low Risk")
 
 # compute log-rank p-value
-logrank_p_value = logrank_test(test_validation_survival["time"][high_risk], 
-                               test_validation_survival["time"][low_risk],
-                               test_validation_survival["event_occurred"][high_risk], 
-                               test_validation_survival["event_occurred"][low_risk]).p_value
+logrank_p_value = logrank_test(test_validation_survival["time"][high_risk.flatten()], 
+                               test_validation_survival["time"][low_risk.flatten()],
+                               test_validation_survival["event_occurred"][high_risk.flatten()], 
+                               test_validation_survival["event_occurred"][low_risk.flatten()]).p_value
 
 print(f"log-rank test p-value: {logrank_p_value:.4f}")
-
+# set_trace()
 plt.figure()
 # kmf_high.plot()
 # kmf_low.plot()
@@ -493,11 +782,12 @@ plt.ylim(top=1, bottom=0)
 plt.xlabel("Time (days)")
 plt.ylabel("Survival Probability")
 plt.grid(True)
-plt.savefig(f"{mode}_{timestamp}.png", dpi=300, bbox_inches='tight')
+plt.savefig(f"{args.mode}_{timestamp}.png", dpi=300, bbox_inches='tight')
 plt.show()
 
+set_trace()
 
-if do_bootstrap:
+if args.do_bootstrap:
     n_bootstraps = 100
     rng = np.random.RandomState(seed=seed_value)
     c_indices = []
