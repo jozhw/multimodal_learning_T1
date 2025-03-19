@@ -234,3 +234,26 @@ python trainer.py --input_path --input_wsi_path --batch_size --lr --lr_decay_ite
 1. Execute the steps listed for dataset creation in the previous section
 2. Run [joint_fusion/trainer.py](https://github.com/DOE-LUCID/multimodal_learning_T1/blob/main/joint_fusion/trainer.py) for training
 2. Run [joint_fusion/train_test.py](https://github.com/DOE-LUCID/multimodal_learning_T1/blob/main/joint_fusion/train_test.py) for inference and XAI metrics -->
+
+## Representative results
+
+### Kaplan-Meier (KM) Plots
+
+| Only WSI | Only RNA-Seq |
+|----------|-------------|
+| ![Only WSI](images/only_wsi_2025-03-03_08-22-01.png) | ![Only RNA-Seq](images/only_rnaseq_2025-03-03_08-16-24.png) |
+<!-- | **(a) Only WSI** | **(b) Only RNA-Seq** | -->
+
+| Simple Fusion | Crossmodal Fusion |
+|--------------|-------------------|
+| ![Simple Fusion](images/rnaseq_wsi_2025-03-03_03-11-00.png) | ![Crossmodal Fusion](images/constrastive_2025-03-10_21-02-45.png) |
+<!-- | **(c) Simple Fusion** | **(d) Crossmodal Fusion** | -->
+
+### Bootstrapped Concordance Indices
+<!-- ![multimodal_framework](images/cindex_comparison_modalities.png) -->
+<img src="images/cindex_comparison_modalities.png" alt="multimodal framework" width="400">
+
+
+### Time dependent AUC
+<!-- ![multimodal_framework](images/cindex_comparison_modalities.png) -->
+<img src="images/AUC_comparison.new.png" alt="multimodal framework" width="600">
