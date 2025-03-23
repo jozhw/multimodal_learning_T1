@@ -246,14 +246,14 @@ python trainer.py --input_path --input_wsi_path --batch_size --lr --lr_decay_ite
 
 | Simple Fusion | Crossmodal Fusion |
 |--------------|-------------------|
-| ![Simple Fusion](images/rnaseq_wsi_2025-03-03_03-11-00.png) | ![Crossmodal Fusion](images/constrastive_2025-03-10_21-02-45.png) |
+| ![Simple Fusion](images/rnaseq_wsi_2025-03-03_03-11-00.png) | ![Crossmodal Fusion](images/constrastive_2025-03-23_01-07-47.png) |
 <!-- | **(c) Simple Fusion** | **(d) Crossmodal Fusion** | -->
 
 ### Bootstrapped Concordance Indices
 <!-- ![multimodal_framework](images/cindex_comparison_modalities.png) -->
-<img src="images/cindex_comparison_modalities.png" alt="multimodal framework" width="400">
+<img src="images/cindex_comparison_modalities.updated.png" alt="multimodal framework" width="400">
 
 
 ### Time dependent AUC
 <!-- ![multimodal_framework](images/cindex_comparison_modalities.png) -->
-<img src="images/AUC_comparison.new.png" alt="multimodal framework" width="600">
+<img src="images/AUC_comparison.updated.png" alt="multimodal framework" width="600">
