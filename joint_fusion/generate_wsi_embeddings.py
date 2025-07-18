@@ -104,6 +104,9 @@ class CustomDatasetWSI(Dataset):
             if not isinstance(tile, torch.Tensor):
                 tile = self.transform(tile)
 
+            if self.wsi_fm == "lunit_DINO":
+                tile = self.transform(tile)
+
         return tile
 
 
