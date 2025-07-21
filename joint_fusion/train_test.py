@@ -132,8 +132,18 @@ def train_nn(opt, h5_file, device):
     wandb.init(project="multimodal_survival_analysis", entity='tnnandi')
     config = wandb.config
     current_time = datetime.now()
-    checkpoint_dir = "checkpoint_" + current_time.strftime("%Y-%m-%d-%H-%M-%S")
-    os.makedirs(checkpoint_dir, exist_ok=True)
+    # if user provided timestamp then use for consistency
+    if opt.timestamp:
+
+        checkpoint_dir = "checkpoints/checkpoint_" + opt.timestamp
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+    else:
+
+        checkpoint_dir = "checkpoints/checkpoint_" + current_time.strftime(
+            "%Y-%m-%d-%H-%M-%S"
+        )
+        os.makedirs(checkpoint_dir, exist_ok=True)
 
     train_loader, _, test_loader = create_data_loaders(opt, h5_file)
     # create multiple folds from the training data

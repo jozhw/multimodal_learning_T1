@@ -347,7 +347,9 @@ if __name__ == "__main__":
 
     if training:
         current_time = datetime.now()
-        checkpoint_dir = "checkpoint_" + current_time.strftime("%Y-%m-%d-%H-%M-%S")
+        checkpoint_dir = "checkpoints/checkpoint_" + current_time.strftime(
+            "%Y-%m-%d-%H-%M-%S"
+        )
         os.makedirs(checkpoint_dir, exist_ok=True)
 
         main(opt)
@@ -365,11 +367,13 @@ if __name__ == "__main__":
         # checkpoint_dir = "checkpoint_2025-02-14-09-42-38"
         # checkpoint_dir = "checkpoint_2025-02-26-18-55-53"
 
-        checkpoint_dir = "checkpoint_2025-02-26-23-27-29"
-        checkpoint_dir = "checkpoint_hp_subset_2025-02-27-02-11-14"
-        checkpoint_dir = "checkpoint_hp_subset_2025-02-27-01-12-39" # working
-        checkpoint_dir = "checkpoint_hp_subset_2025-02-27-01-41-45"
-        fold_id = 1 
+        checkpoint_dir = "checkpoints/checkpoint_2025-02-26-23-27-29"
+        checkpoint_dir = "checkpoints/checkpoint_hp_subset_2025-02-27-02-11-14"
+        checkpoint_dir = (
+            "checkpoints/checkpoint_hp_subset_2025-02-27-01-12-39"  # working
+        )
+        checkpoint_dir = "checkpoints/checkpoint_hp_subset_2025-02-27-01-41-45"
+        fold_id = 1
         # latest_checkpoint_epoch = 2500 #3900 #1700 #1500 #600 # 200 #3400 #3300# 1900 #1500
         latest_checkpoint_epoch = 3000 #1000 # 2000  
         latest_checkpoint = f'checkpoint_fold_{fold_id}_epoch_{latest_checkpoint_epoch}.pth'

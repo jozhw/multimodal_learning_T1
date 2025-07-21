@@ -350,7 +350,9 @@ if __name__ == "__main__":
 
     if training:
         current_time = datetime.now()
-        checkpoint_dir = "checkpoint_" + current_time.strftime("%Y-%m-%d-%H-%M-%S")
+        checkpoint_dir = "checkpoints/checkpoint_" + current_time.strftime(
+            "%Y-%m-%d-%H-%M-%S"
+        )
         os.makedirs(checkpoint_dir, exist_ok=True)
 
         main(opt)
@@ -363,10 +365,10 @@ if __name__ == "__main__":
 
         # checkpoint_dir = "checkpoint_2025-02-09-00-51-38"
         # checkpoint_dir = "checkpoint_2025-02-09-02-10-20"
-        checkpoint_dir = "checkpoint_2025-02-09-03-08-09"
         fold_id = 3 #0
         latest_checkpoint_epoch = 3400 #1500 #600 # 200 #3400 #3300# 1900 #1500
         latest_checkpoint = f'checkpoint_fold_{fold_id}_epoch_{latest_checkpoint_epoch}.pth'
+        checkpoint_dir = "checkpoints/checkpoint_2025-02-09-03-08-09"
 
         # load the saved scaler for normalizing x_omic
         scaler = joblib.load(os.path.join(checkpoint_dir, f'scaler_fold_{fold_id}.save'))
