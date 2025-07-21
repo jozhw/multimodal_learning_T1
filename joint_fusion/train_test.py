@@ -153,9 +153,26 @@ def train_nn(opt, h5_file, device):
     total_samples = len(dataset)
     print(f"total training data size: {total_samples} samples")
 
+    num_folds = opt.n_folds
+    num_epochs = opt.num_epochs
+    # keep track to get average CI and Loss for all folds and epoch for validation
+    ci_all = []
+    loss_all = []
+
+    # for the ci_average_by...
+    ci_average_by_epoch = np.zeros(opt.num_epochs, dtype=np.float32)
+    loss_average_by_epoch = np.zeros(opt.num_epochs, dtype=np.float32)
+
     # train models for each fold
+    # need to keep fold index at 0 for the sake of the averaging by epoch
     for fold, (train_idx, val_idx) in enumerate(kf.split(dataset)):
+
         print(f"Fold {fold + 1}/{kf.get_n_splits()}")
+        print_gpu_memory_usage()  # Monitor memory at start of each fold
+
+        # CI and Loss tracker within fold so for epochs
+        ci_fold = []
+        loss_fold = []
 
         # create train and validation subsets (from the training data itself)
         train_subset = Subset(dataset, train_idx)
@@ -359,23 +376,60 @@ def train_nn(opt, h5_file, device):
                     all_predictions_np = all_predictions.cpu().numpy()
                     all_times_np = all_times.cpu().numpy()
                     all_events_np = all_events.cpu().numpy()
+                    event_rate = all_events_np.mean()
 
                     c_index = concordance_index_censored(all_events_np.astype(bool), all_times_np, all_predictions_np)
                     print(f"Validation loss: {val_loss}, CI: {c_index[0]}")
-                    wandb.log({"CI/validation": c_index[0]}, step=epoch)
-
-                    # # # model_path = os.path.join("./saved_models_4sep", f"model_epoch_{epoch}.pt")
-                    # save_dir = f"./saved_models_{current_time}"
-                    # os.makedirs(save_dir, exist_ok=True)
-                    model_path = os.path.join(checkpoint_dir, f"model_fold_{fold}_epoch_{epoch}.pt")
-                    torch.save(model.state_dict(), model_path)
-                    print(f"saved model checkpoint for fold {fold} at epoch {epoch} to {model_path}")
 
                     end_val_time = time.time()
                     val_duration = end_val_time - start_val_time
-                    wandb.log({"Time/validation": val_duration}, step=epoch)
 
-        return model, optimizer
+                    ci_all.append(c_index[0])
+                    loss_all.append(val_loss)
+                    ci_fold.append(c_index[0])
+                    loss_fold.append(val_loss)
+
+                    # since fold starts indexing at 0
+                    ci_average_by_epoch[epoch] = (
+                        (fold) * ci_average_by_epoch[epoch] + c_index[0]
+                    ) / (fold + 1)
+                    loss_average_by_epoch[epoch] = (
+                        fold * loss_average_by_epoch[epoch] + val_loss
+                    ) / (fold + 1)
+
+                    epoch_metrics = {
+                        # Losses
+                        "Loss/train_epoch": train_loss,
+                        "Loss/val_epoch": val_loss,
+                        # Performance metrics
+                        "CI/validation": c_index[0],
+                        "Event_rate/validation": event_rate,
+                        # Performance by folds
+                        "CI/validation/fold/avg": sum(ci_fold) / len(ci_fold),
+                        "Loss/validation/fold/avg": sum(loss_fold) / len(loss_fold),
+                        # Performance by epoch
+                        "CI/validation/epoch/avg": ci_average_by_epoch[epoch],
+                        "Loss/validation/epoch/avg": loss_average_by_epoch[epoch],
+                        # Performance on average
+                        "CI/validation/all/avg": sum(ci_all) / len(ci_all),
+                        "Loss/validation/all/avg": sum(loss_all) / len(loss_all),
+                        # Model predictions analysis
+                        "Predictions/mean": all_predictions_np.mean(),
+                        "Predictions/std": all_predictions_np.std(),
+                        "Predictions/min": all_predictions_np.min(),
+                        "Predictions/max": all_predictions_np.max(),
+                        # Time tracking
+                        "Time/train_epoch": train_duration,
+                        "Time/val_epoch": val_duration,
+                        "Time/total_epoch": train_duration + val_duration,
+                        # Learning rate
+                        "LR": optimizer.param_groups[0]["lr"],
+                        # Metadata
+                        "fold": fold,
+                        "epoch": epoch,
+                    }
+                    # Log all metrics
+                    wandb.log(epoch_metrics)
 
 
 def print_total_parameters(model):
