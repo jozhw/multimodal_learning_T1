@@ -131,6 +131,10 @@ class MultimodalNetwork(nn.Module):
         # if self.fusion_type not in ['early', 'joint_omic']: # guard against calling and inferencing using WSI encoder for early fusion or joint_omic fusion
         #     self.wsi_encoder = WSIEncoder()
 
+        # set learnable weights with the ideal from early fusion
+        self.omic_weight = nn.Parameter(torch.tensor(0.8))
+        self.wsi_weight = nn.Parameter(torch.tensor(0.2))
+
         if self.mode != "wsi_omic":
             self.fusion_type = None
         print(f"Initializing with mode={mode}, fusion_type={fusion_type}")
@@ -141,7 +145,13 @@ class MultimodalNetwork(nn.Module):
             self.omic_net = OmicNetwork(embedding_dim_omic)
             # self.wsi_encoder = WSIEncoder()
             # Note: the above networks won't be used for early fusion
-            embedding_dim = self.wsi_net.embedding_dim + self.omic_net.embedding_dim
+            # Refactor: adjust the embedding_dim to do some sort of weighted average for now, but later implement it to be dynamic
+            # In the refactor implement a class for different joint embedding generations to see which is best.
+            # embedding_dim = self.wsi_net.embedding_dim + self.omic_net.embedding_dim
+            embedding_dim = min(self.wsi_net.embedding_dim, self.omic_net.embedding_dim)
+
+            self.wsi_projection = nn.Linear(embedding_dim_wsi, embedding_dim)
+            self.omic_projection = nn.Linear(embedding_dim_omic, embedding_dim)
 
         elif self.mode == "wsi":
             self.wsi_net = WSINetwork(embedding_dim_wsi)
@@ -249,7 +259,17 @@ class MultimodalNetwork(nn.Module):
             if not isinstance(omic_embedding, torch.Tensor):
                 omic_embedding = torch.tensor(omic_embedding).to(device)
             # combined_embedding = torch.cat((wsi_embedding_tensor, omic_embedding_tensor), dim=1)
-            combined_embedding = torch.cat((wsi_embedding, omic_embedding), dim=1)
+            # combined_embedding = torch.cat((wsi_embedding, omic_embedding), dim=1)
+            # weighted embedding
+            wsi_projected = self.wsi_projection(wsi_embedding)
+            omic_projected = self.omic_projection(omic_embedding)
+            total_weight = self.omic_weight + self.wsi_weight
+            normalized_rna = self.omic_weight / total_weight
+            normalized_wsi = self.wsi_weight / total_weight
+            combined_embedding = (
+                normalized_rna * omic_projected + normalized_wsi * wsi_projected
+            )
+
         step2_time = time.time()
         # combined_embedding = torch.tensor(combined_embedding).to(device) # removed to avoid graph disconnect during backprop
         print("combined_embedding.shape: ", combined_embedding.shape)
