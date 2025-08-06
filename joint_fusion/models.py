@@ -123,17 +123,21 @@ class OmicNetwork(nn.Module):  # MLP for WSI tile-level embedding generation
 
 
 class MultimodalNetwork(nn.Module):
-    def __init__(self, embedding_dim_wsi, embedding_dim_omic, mode, fusion_type):
+    def __init__(self, embedding_dim_wsi, embedding_dim_omic, mode, fusion_type, joint_embedding_type="weighted_avg"):
         super(MultimodalNetwork, self).__init__()
 
         self.mode = mode  # wsi_omic, wsi or omic
         self.fusion_type = fusion_type
-        # if self.fusion_type not in ['early', 'joint_omic']: # guard against calling and inferencing using WSI encoder for early fusion or joint_omic fusion
-        #     self.wsi_encoder = WSIEncoder()
 
-        # set learnable weights with the ideal from early fusion
-        self.omic_weight = nn.Parameter(torch.tensor(0.8))
-        self.wsi_weight = nn.Parameter(torch.tensor(0.2))
+        # NOTE: Initial weights or final weights are choosen from the results from early fusion
+
+        if joint_embedding_type="weighted_avg_dynamic":
+            self.omic_weight = nn.Parameter(torch.tensor(0.8))
+            self.wsi_weight = nn.Parameter(torch.tensor(0.2))
+        else: 
+            # NOTE: Default, even if concatenation because does not take that much memory
+            self.omic_weight = 0.8
+            self.wsi_weight = 0.2
 
         if self.mode != "wsi_omic":
             self.fusion_type = None
@@ -143,15 +147,16 @@ class MultimodalNetwork(nn.Module):
         if self.mode == "wsi_omic":
             self.wsi_net = WSINetwork(embedding_dim_wsi)
             self.omic_net = OmicNetwork(embedding_dim_omic)
-            # self.wsi_encoder = WSIEncoder()
-            # Note: the above networks won't be used for early fusion
-            # Refactor: adjust the embedding_dim to do some sort of weighted average for now, but later implement it to be dynamic
-            # In the refactor implement a class for different joint embedding generations to see which is best.
-            # embedding_dim = self.wsi_net.embedding_dim + self.omic_net.embedding_dim
-            embedding_dim = min(self.wsi_net.embedding_dim, self.omic_net.embedding_dim)
 
-            self.wsi_projection = nn.Linear(embedding_dim_wsi, embedding_dim)
-            self.omic_projection = nn.Linear(embedding_dim_omic, embedding_dim)
+            # Don't create linear projection if non-weighted as not needed for concatenation
+            if joint_embedding_type == "concatenate":
+
+                embedding_dim = self.wsi_net.embedding_dim + self.omic_net.embedding_dim
+            else:
+                embedding_dim = min(self.wsi_net.embedding_dim, self.omic_net.embedding_dim)
+
+                self.wsi_projection = nn.Linear(embedding_dim_wsi, embedding_dim)
+                self.omic_projection = nn.Linear(embedding_dim_omic, embedding_dim)
 
         elif self.mode == "wsi":
             self.wsi_net = WSINetwork(embedding_dim_wsi)
@@ -166,12 +171,14 @@ class MultimodalNetwork(nn.Module):
         else:
             raise ValueError(f"Mode not recognized: {self.mode}")
 
-        # embedding_dim = embedding_dim_omic
         print(
             "Embedding dimension based on which the dimension of the input of the downstream MLP is set: ",
             embedding_dim,
         )
-        # downstream MLP for fused data (directly tied to the Cox loss)
+
+        # Downstream MLP for fused data (directly tied to the Cox loss)
+
+        # ADD: change intermed dimension or add more layers
         self.fused_mlp = nn.Sequential(
             nn.Linear(embedding_dim, 256), nn.ReLU(), nn.Linear(256, 1)
         )
@@ -183,6 +190,7 @@ class MultimodalNetwork(nn.Module):
     def forward(self, opt, tcga_id, x_wsi=None, x_omic=None):
         # print("x_wsi: ", x_wsi) # contains float values and not the image files here
         # print("x_omic: ", x_omic)
+
         start_time = time.time()
         # print("fusion type: ", self.fusion_type)
         if self.fusion_type == "joint":
@@ -242,7 +250,6 @@ class MultimodalNetwork(nn.Module):
 
         print("input mode: ", self.mode)
 
-        # concatenate embeddings
         if self.mode == "wsi":
             combined_embedding = wsi_embedding
         elif self.mode == "omic":
@@ -250,28 +257,52 @@ class MultimodalNetwork(nn.Module):
         elif self.mode == "wsi_omic" and (
             self.fusion_type == "joint_omic" or self.fusion_type == "joint"
         ):
+
             # set_trace()
-            # wsi_embedding_tensor = torch.tensor(wsi_embedding)
-            # omic_embedding_tensor = torch.tensor(omic_embedding)
-            # Do not re-create tensors from embeddings if they are already tensors
+
+            # WARNING: Do not re-create tensors from embeddings if they are already tensors, otherwise there may be a graph disconnect on backprop
+
             if not isinstance(wsi_embedding, torch.Tensor):
                 wsi_embedding = torch.tensor(wsi_embedding).to(device)
             if not isinstance(omic_embedding, torch.Tensor):
                 omic_embedding = torch.tensor(omic_embedding).to(device)
-            # combined_embedding = torch.cat((wsi_embedding_tensor, omic_embedding_tensor), dim=1)
-            # combined_embedding = torch.cat((wsi_embedding, omic_embedding), dim=1)
-            # weighted embedding
-            wsi_projected = self.wsi_projection(wsi_embedding)
-            omic_projected = self.omic_projection(omic_embedding)
-            total_weight = self.omic_weight + self.wsi_weight
-            normalized_rna = self.omic_weight / total_weight
-            normalized_wsi = self.wsi_weight / total_weight
-            combined_embedding = (
-                normalized_rna * omic_projected + normalized_wsi * wsi_projected
-            )
+
+            if (
+                opt.joint_embedding == "weighted_avg"
+                or opt.joint_embedding == "weighted_avg_dynamic"
+            ):
+
+                wsi_projected = self.wsi_projection(wsi_embedding)
+                omic_projected = self.omic_projection(omic_embedding)
+                total_weight = self.omic_weight + self.wsi_weight
+                normalized_rna = self.omic_weight / total_weight
+                normalized_wsi = self.wsi_weight / total_weight
+                combined_embedding = (
+                    normalized_rna * omic_projected + normalized_wsi * wsi_projected
+                )
+
+            elif opt.joint_embedding == "concatenate":
+
+                combined_embedding = torch.cat(
+                    (wsi_embedding_tensor, omic_embedding_tensor), dim=1
+                )
+                combined_embedding = torch.cat((wsi_embedding, omic_embedding), dim=1)
+
+            else:
+
+                print("Defaulting to weighted non-dynamic joint embedding...")
+
+                wsi_projected = self.wsi_projection(wsi_embedding)
+                omic_projected = self.omic_projection(omic_embedding)
+                total_weight = self.omic_weight + self.wsi_weight
+                normalized_rna = self.omic_weight / total_weight
+                normalized_wsi = self.wsi_weight / total_weight
+                combined_embedding = (
+                    normalized_rna * omic_projected + normalized_wsi * wsi_projected
+                )
 
         step2_time = time.time()
-        # combined_embedding = torch.tensor(combined_embedding).to(device) # removed to avoid graph disconnect during backprop
+
         print("combined_embedding.shape: ", combined_embedding.shape)
         # use combined embedding with downstream MLP for getting the output that enters the loss function
         step3_time = time.time()
