@@ -202,9 +202,6 @@ def train_nn(opt, h5_file, device):
 
     num_folds = opt.n_folds
     num_epochs = opt.num_epochs
-    # keep track to get average CI and Loss for all folds and epoch for validation
-    ci_all = []
-    loss_all = []
 
     # for the ci_average_by...
     ci_average_by_epoch = np.zeros(opt.num_epochs, dtype=np.float32)
@@ -216,10 +213,6 @@ def train_nn(opt, h5_file, device):
 
         print(f"Fold {fold + 1}/{kf.get_n_splits()}")
         print_gpu_memory_usage()  # Monitor memory at start of each fold
-
-        # CI and Loss tracker within fold so for epochs
-        ci_fold = []
-        loss_fold = []
 
         # create train and validation subsets (from the training data itself)
         train_subset = Subset(dataset, train_idx)
@@ -483,50 +476,64 @@ def train_nn(opt, h5_file, device):
                     end_val_time = time.time()
                     val_duration = end_val_time - start_val_time
 
-                    ci_all.append(c_index[0])
-                    loss_all.append(val_loss)
-                    ci_fold.append(c_index[0])
-                    loss_fold.append(val_loss)
-
                     # since fold starts indexing at 0
                     ci_average_by_epoch[epoch] = (
-                        (fold) * ci_average_by_epoch[epoch] + c_index[0]
-                    ) / (fold + 1)
+                        (fold_idx) * ci_average_by_epoch[epoch] + c_index[0]
+                    ) / (fold_idx + 1)
                     loss_average_by_epoch[epoch] = (
-                        fold * loss_average_by_epoch[epoch] + val_loss
-                    ) / (fold + 1)
+                        fold_idx * loss_average_by_epoch[epoch] + val_loss
+                    ) / (fold_idx + 1)
 
-                    epoch_metrics = {
-                        # Losses
-                        "Loss/train_epoch": train_loss,
-                        "Loss/val_epoch": val_loss,
-                        # Performance metrics
-                        "CI/validation": c_index[0],
-                        "Event_rate/validation": event_rate,
-                        # Performance by folds
-                        "CI/validation/fold/avg": sum(ci_fold) / len(ci_fold),
-                        "Loss/validation/fold/avg": sum(loss_fold) / len(loss_fold),
-                        # Performance by epoch
-                        "CI/validation/epoch/avg": ci_average_by_epoch[epoch],
-                        "Loss/validation/epoch/avg": loss_average_by_epoch[epoch],
-                        # Performance on average
-                        "CI/validation/all/avg": sum(ci_all) / len(ci_all),
-                        "Loss/validation/all/avg": sum(loss_all) / len(loss_all),
-                        # Model predictions analysis
-                        "Predictions/mean": all_predictions_np.mean(),
-                        "Predictions/std": all_predictions_np.std(),
-                        "Predictions/min": all_predictions_np.min(),
-                        "Predictions/max": all_predictions_np.max(),
-                        # Time tracking
-                        "Time/train_epoch": train_duration,
-                        "Time/val_epoch": val_duration,
-                        "Time/total_epoch": train_duration + val_duration,
-                        # Learning rate
-                        "LR": optimizer.param_groups[0]["lr"],
-                        # Metadata
-                        "fold": fold,
-                        "epoch": epoch,
-                    }
+                    mode = (
+                        model.module.mode
+                        if isinstance(model, nn.DataParallel)
+                        else model.mode
+                    )
+                    if mode == "wsi_omic":
+
+                        epoch_metrics = {
+                            # Losses
+                            "Loss/train_epoch": train_loss,
+                            "Loss/val_epoch": val_loss,
+                            # Performance metrics
+                            "CI/validation": c_index[0],
+                            "Event_rate/validation": event_rate,
+                            # Performance by epoch
+                            "CI/validation/epoch/avg": ci_average_by_epoch[epoch],
+                            "Loss/validation/epoch/avg": loss_average_by_epoch[epoch],
+                            # Time tracking
+                            "Time/train_epoch": train_duration,
+                            "Time/val_epoch": val_duration,
+                            "Time/total_epoch": train_duration + val_duration,
+                            # Learning rate
+                            "LR": optimizer.param_groups[0]["lr"],
+                            # Metadata
+                            "fold": fold_idx,
+                            "epoch": epoch,
+                            "wsi_weight": model.module.wsi_weight.item(),
+                            "omic_weight": model.module.omic_weight.item(),
+                        }
+                    else:
+                        epoch_metrics = {
+                            # Losses
+                            "Loss/train_epoch": train_loss,
+                            "Loss/val_epoch": val_loss,
+                            # Performance metrics
+                            "CI/validation": c_index[0],
+                            "Event_rate/validation": event_rate,
+                            # Performance by epoch
+                            "CI/validation/epoch/avg": ci_average_by_epoch[epoch],
+                            "Loss/validation/epoch/avg": loss_average_by_epoch[epoch],
+                            # Time tracking
+                            "Time/train_epoch": train_duration,
+                            "Time/val_epoch": val_duration,
+                            "Time/total_epoch": train_duration + val_duration,
+                            # Learning rate
+                            "LR": optimizer.param_groups[0]["lr"],
+                            # Metadata
+                            "fold": fold_idx,
+                            "epoch": epoch,
+                        }
                     # Log all metrics
                     wandb.log(epoch_metrics)
 
