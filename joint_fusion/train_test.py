@@ -1,7 +1,11 @@
 import random
+import math
 import gc
 from tqdm import tqdm
 import numpy as np
+import numpy.typing as npt
+import pandas as pd
+import typing as tp
 import torch
 import os
 import wandb
@@ -11,6 +15,7 @@ import json
 import joblib
 from datetime import datetime
 import matplotlib.pyplot as plt
+import seaborn as sns
 import cv2
 from torch import nn
 import torch.backends.cudnn as cudnn
@@ -25,11 +30,11 @@ from sklearn.model_selection import train_test_split
 from utils import mixed_collate
 from tqdm import tqdm
 from torch.utils.data import ConcatDataset
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, KBinsDiscretizer
 
 from datasets import CustomDataset, HDF5Dataset
 from models import MultimodalNetwork, OmicNetwork, print_model_summary
-from sklearn.model_selection import KFold
+from sklearn.model_selection import StratifiedKFold
 from generate_wsi_embeddings import CustomDatasetWSI
 
 import h5py
@@ -856,9 +861,10 @@ def train_nn(opt, h5_file, device, plot_distributions=True):
             "batch_size": opt.batch_size,
             "val_batch_size": opt.val_batch_size,
             "lr": opt.lr,
-            "gamma": opt.gamma,
             "fusion_type": opt.fusion_type,
+            "joint_embedding": opt.joint_embedding,
             "input_mode": opt.input_mode,
+            "stratified_cv": True,
         },
     )
     if opt.scheduler == "cosine_warmer":
@@ -894,7 +900,8 @@ def train_nn(opt, h5_file, device, plot_distributions=True):
         )
 
     current_time = datetime.now()
-    # if user provided timestamp then use for consistency
+
+    # If user provided timestamp then use for consistency
     if opt.timestamp:
 
         checkpoint_dir = "checkpoints/checkpoint_" + opt.timestamp
@@ -908,10 +915,6 @@ def train_nn(opt, h5_file, device, plot_distributions=True):
         os.makedirs(checkpoint_dir, exist_ok=True)
 
     train_loader, _, test_loader = create_data_loaders(opt, h5_file)
-    # create multiple folds from the training data
-    kf = KFold(
-        n_splits=opt.n_folds, shuffle=True, random_state=6
-    )  # k-fold CV where k = opt.n_folds
     dataset = (
         train_loader.dataset
     )  # use only the training dataset for CV during training [both the validation and test splits can be used for testing]
@@ -919,25 +922,82 @@ def train_nn(opt, h5_file, device, plot_distributions=True):
     total_samples = len(dataset)
     print(f"total training data size: {total_samples} samples")
 
+    # Extract survival data for stratification
+    print("Extracting survival data for startified CV...")
+    times, events = extract_survival_data(dataset)
+
+    print(f"Survival data summary:")
+    print(f"  - Total samples: {len(times)}")
+    print(f"  - Events: {events.sum()} ({events.mean():.1%})")
+    print(f"  - Censored: {len(events) - events.sum()} ({1 - events.mean():.1%})")
+    print(f"  - Median survival time: {np.median(times):.1f} days")
+    print(f"  - Time range: {times.min():.1f} - {times.max():.1f} days")
+
+    try:
+        folds = create_stratified_survival_folds(
+            times=times, events=events, n_splits=opt.n_folds
+        )
+        print(f"Successfully created {len(folds)} stratified folds")
+
+    except Exception as e:
+        print(f"Error creating stratified folds: {e}")
+        # Fallback to regular k-fold if stratified fails
+        from sklearn.model_selection import KFold
+
+        kf = KFold(n_splits=opt.n_folds, shuffle=True, random_state=6)
+        folds = list(kf.split(np.arange(len(dataset))))
+        print("Falling back to regular K-Fold CV")
+
     num_folds = opt.n_folds
     num_epochs = opt.num_epochs
 
-    # for the ci_average_by...
+    # Obtain Validation CI and Loss avg at each epoch
     ci_average_by_epoch = np.zeros(opt.num_epochs, dtype=np.float32)
     loss_average_by_epoch = np.zeros(opt.num_epochs, dtype=np.float32)
 
-    # train models for each fold
     # need to keep fold index at 0 for the sake of the averaging by epoch
-    for fold, (train_idx, val_idx) in enumerate(kf.split(dataset)):
+    # Main fold iteration loop
+    for fold_idx, (train_idx, val_idx) in enumerate(folds):
+        print(f"\n{'='*60}")
+        print(f"FOLD {fold_idx + 1}/{len(folds)}")
+        print(f"{'='*60}")
 
-        print(f"Fold {fold + 1}/{kf.get_n_splits()}")
+        # Print fold statistics
+        print(f"Training samples: {len(train_idx)}")
+        print(f"Validation samples: {len(val_idx)}")
+
+        # Extract survival data for this fold to verify stratification
+        times_train_fold = times[train_idx]
+        events_train_fold = events[train_idx]
+        times_val_fold = times[val_idx]
+        events_val_fold = events[val_idx]
+
+        train_event_rate = events_train_fold.mean()
+        val_event_rate = events_val_fold.mean()
+
+        print(f"Train event rate: {train_event_rate:.3f}")
+        print(f"Validation event rate: {val_event_rate:.3f}")
+        print(f"Train median time: {np.median(times_train_fold):.1f} days")
+        print(f"Validation median time: {np.median(times_val_fold):.1f} days")
+
+        # Plot distributions if requested
+        if plot_distributions:
+            plot_survival_distributions(
+                times_train_fold,
+                events_train_fold,
+                times_val_fold,
+                events_val_fold,
+                fold_idx,
+                save_dir=os.path.join(checkpoint_dir, "fold_distributions"),
+            )
+
         print_gpu_memory_usage()  # Monitor memory at start of each fold
 
-        # create train and validation subsets (from the training data itself)
+        # Create subsets for this fold
         train_subset = Subset(dataset, train_idx)
         val_subset = Subset(dataset, val_idx)
 
-        # create data loaders for this fold
+        # Create data loaders for this fold
         train_loader_fold = DataLoader(
             train_subset,
             batch_size=opt.batch_size,
@@ -947,31 +1007,37 @@ def train_nn(opt, h5_file, device, plot_distributions=True):
             drop_last=True,
         )
         val_loader_fold = DataLoader(
-            val_subset, batch_size=opt.val_batch_size, shuffle=False
+            val_subset,
+            batch_size=opt.val_batch_size,
+            shuffle=False,
+            num_workers=4,
+            pin_memory=True,
         )
 
-        # Dynamically compute number of batches per epoch
-        num_batches_per_epoch = int(
-            np.ceil(len(train_loader_fold.dataset) / opt.batch_size)
+        # Compute number of batches per epoch
+        num_batches_per_epoch = len(train_loader_fold)
+        print(
+            f"Number of batches per epoch for fold {fold_idx + 1}: {num_batches_per_epoch}"
         )
-        print(f"Number of batches per epoch for fold {fold}: {num_batches_per_epoch}")
+
+        # Update wandb config
         wandb.config.update(
-            {"num_batches_per_epoch_fold_" + str(fold): num_batches_per_epoch},
+            {f"num_batches_per_epoch_fold_{fold_idx}": num_batches_per_epoch},
             allow_val_change=True,
         )
 
-        # initialize model, optimizer, and scheduler for this fold
         model = MultimodalNetwork(
             embedding_dim_wsi=opt.embedding_dim_wsi,
             embedding_dim_omic=opt.embedding_dim_omic,
             mode=opt.input_mode,
             fusion_type=opt.fusion_type,
+            joint_embedding_type=opt.joint_embedding,
         )
 
         if torch.cuda.device_count() > 1:
             print(f"Using {torch.cuda.device_count()} GPUs")
             model = nn.DataParallel(model)
-            torch.cuda.set_device(0)  # Set primary device
+            torch.cuda.set_device(0)
 
         model.to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=opt.lr)
@@ -1001,25 +1067,24 @@ def train_nn(opt, h5_file, device, plot_distributions=True):
 
         cox_loss = CoxLoss()
 
-        # initialize and fit the scaler incrementally on training data
-        print("fitting scaler [train_test.py]")
+        # Initialize and fit the scaler for this fold
+        print(f"Fitting scaler for fold {fold_idx + 1}...")
         scaler = StandardScaler()
         for batch_idx, (tcga_id, _, _, _, x_omic) in enumerate(train_loader_fold):
-            print(
-                f"fitting batch index {batch_idx} of {len(train_loader_fold)} batches"
-            )
-            x_omic = x_omic.cpu().numpy()
-            scaler.partial_fit(x_omic)
+            if batch_idx % 10 == 0:  # Print progress every 10 batches
+                print(f"  Fitting batch {batch_idx + 1}/{len(train_loader_fold)}")
+            x_omic_np = x_omic.cpu().numpy()
+            scaler.partial_fit(x_omic_np)
 
-        # save the scaler for the current fold
-        scaler_path = os.path.join(checkpoint_dir, f"scaler_fold_{fold}.save")
+        # Save the scaler for the current fold
+        scaler_path = os.path.join(checkpoint_dir, f"scaler_fold_{fold_idx}.save")
         joblib.dump(scaler, scaler_path)
-        print(f"Scaler saved for fold {fold} at {scaler_path}")
+        print(f"Scaler saved for fold {fold_idx + 1} at {scaler_path}")
 
-        # training loop
-        for epoch in tqdm(range(0, opt.num_epochs)):
+        # EPOCH TRAINING LOOP for this fold
+        for epoch in range(opt.num_epochs):
             print(
-                f"**********  Fold {fold} out of {opt.n_folds - 1},  Epoch: {epoch} out of {opt.num_epochs - 1}"
+                f"\n--- Fold {fold_idx + 1}/{len(folds)}, Epoch {epoch + 1}/{opt.num_epochs} ---"
             )
             start_train_time = time.time()
             model.train()
@@ -1130,18 +1195,21 @@ def train_nn(opt, h5_file, device, plot_distributions=True):
             end_train_time = time.time()
             train_duration = end_train_time - start_train_time
 
+            # return here for profile
+            if opt.profile:
+                return model, optimizer
             # check validation for all epochs >= 0
             if epoch >= 0:
 
-                # save model once every 10 epochs
-                if (epoch + 1) % 10 == 0 and epoch > 0:
+                # save model once every 5 epochs
+                if (epoch + 1) % 5 == 0 and epoch > 0:
                     checkpoint_path = os.path.join(
-                        checkpoint_dir, f"checkpoint_fold_{fold}_epoch_{epoch}.pth"
+                        checkpoint_dir, f"checkpoint_fold_{fold_idx}_epoch_{epoch}.pth"
                     )
                     torch.save(
                         {
                             "epoch": epoch,
-                            "fold": fold,
+                            "fold": fold_idx,
                             "model_state_dict": model.state_dict(),
                             "optimizer_state_dict": optimizer.state_dict(),
                             "scheduler_state_dict": scheduler.state_dict(),
@@ -1149,8 +1217,10 @@ def train_nn(opt, h5_file, device, plot_distributions=True):
                         checkpoint_path,
                     )
                     print(
-                        f"Checkpoint saved at epoch {epoch}, fold {fold}, to {checkpoint_path}"
+                        f"Checkpoint saved at epoch {epoch}, fold {fold_idx}, to {checkpoint_path}"
                     )
+
+                # before validation to get the dynamic weights, but only if the mode is "wsi_omic"
 
                 start_val_time = time.time()
 
@@ -1232,7 +1302,16 @@ def train_nn(opt, h5_file, device, plot_distributions=True):
                         else model.mode
                     )
                     if mode == "wsi_omic":
-
+                        wsi_weight_val = (
+                            model.module.wsi_weight.item()
+                            if isinstance(model.module.wsi_weight, torch.Tensor)
+                            else model.module.wsi_weight
+                        )
+                        omic_weight_val = (
+                            model.module.omic_weight.item()
+                            if isinstance(model.module.omic_weight, torch.Tensor)
+                            else model.module.omic_weight
+                        )
                         epoch_metrics = {
                             # Losses
                             "Loss/train_epoch": train_loss,
@@ -1252,8 +1331,8 @@ def train_nn(opt, h5_file, device, plot_distributions=True):
                             # Metadata
                             "fold": fold_idx,
                             "epoch": epoch,
-                            "wsi_weight": model.module.wsi_weight.item(),
-                            "omic_weight": model.module.omic_weight.item(),
+                            "wsi_weight": wsi_weight_val,
+                            "omic_weight": omic_weight_val,
                         }
                     else:
                         epoch_metrics = {
@@ -1282,7 +1361,7 @@ def train_nn(opt, h5_file, device, plot_distributions=True):
         torch.cuda.empty_cache()
         gc.collect()
         print(
-            f"Memory cleared after fold {fold} - model will be recreated for next fold"
+            f"Memory cleared after fold {fold_idx} - model will be recreated for next fold"
         )
 
     wandb.finish()
@@ -1571,7 +1650,7 @@ def test_and_interpret(opt, model, test_loader, device, baseline=None):
 
         print(f"CI: {c_index[0]}")
 
-    set_trace()
+    # set_trace()
     # stratify based on the median risk scores
     median_prediction = np.median(all_predictions_np)
     high_risk_idx = all_predictions_np >= median_prediction
