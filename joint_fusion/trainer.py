@@ -205,6 +205,18 @@ def args():
         "--eta_min", type=float, default=1e-6, help="Minimum learning rate"
     )
 
+    cosw_parser.add_argument(
+        "--decay_factor",
+        type=float,
+        default=0.5,
+        help="Factor by which max learning rate is reduced after each cycle (1.0 = no decay, 0.5 = half each cycle)",
+    )
+
+    # Step scheduler
+    step_parser = subparsers.add_parser("step_lr", help="Step based learning rate")
+    step_parser.add_argument("--step", dest="step_lr_step", type=int, default=10)
+    step_parser.add_argument("--gamma", dest="step_lr_gamma", type=float, default=0.95)
+
     return parser.parse_args()
 
 

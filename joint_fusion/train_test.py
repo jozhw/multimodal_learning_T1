@@ -16,6 +16,7 @@ from torch import nn
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 from torch.utils.data import RandomSampler, DataLoader, Subset
+from torch.optim.lr_scheduler import _LRScheduler
 
 # import torch.optim.lr_scheduler as lr_scheduler
 from torchsummary import summary
@@ -594,6 +595,79 @@ def extract_survival_data(dataset) -> tp.Tuple[np.ndarray, np.ndarray]:
     return times_array, events_array
 
 
+class CosineAnnealingWarmRestartsDecay(_LRScheduler):
+    def __init__(
+        self,
+        optimizer,
+        T_0,
+        T_mult=1,
+        eta_min=0,
+        decay_factor=1.0,
+        last_epoch=-1,
+        verbose=False,
+    ):
+        """
+        Cosine annealing with warm restarts and optional learning rate decay between cycles.
+
+        Args:
+            optimizer: Wrapped optimizer
+            T_0: Number of iterations for the first restart
+            T_mult: A factor increases T_i after a restart
+            eta_min: Minimum learning rate
+            decay_factor: Factor by which max_lr is reduced after each cycle (1.0 = no decay)
+            last_epoch: The index of last epoch
+        """
+        self.T_0 = T_0
+        self.T_mult = T_mult
+        self.eta_min = eta_min
+        self.decay_factor = decay_factor
+        self.T_i = T_0
+        self.T_cur = 0
+        self.cycle = 0
+
+        # Store initial learning rates for each param group
+        self.base_lrs = [group["lr"] for group in optimizer.param_groups]
+        self.current_max_lrs = self.base_lrs.copy()
+
+        super().__init__(optimizer, last_epoch, verbose)
+
+    def get_lr(self):
+        if self.T_cur == 0:
+            # At the start of a new cycle, update max learning rates
+            if self.cycle > 0:
+                self.current_max_lrs = [
+                    lr * self.decay_factor for lr in self.current_max_lrs
+                ]
+            return self.current_max_lrs
+
+        return [
+            self.eta_min
+            + (max_lr - self.eta_min)
+            * (1 + math.cos(math.pi * self.T_cur / self.T_i))
+            / 2
+            for max_lr in self.current_max_lrs
+        ]
+
+    def step(self, epoch=None):
+        if epoch is None:
+            epoch = self.last_epoch + 1
+
+        self.last_epoch = epoch
+        self.T_cur += 1
+
+        if self.T_cur >= self.T_i:
+            # Restart
+            self.cycle += 1
+            self.T_cur = 0
+            self.T_i = self.T_i * self.T_mult
+
+        for param_group, lr in zip(self.optimizer.param_groups, self.get_lr()):
+            param_group["lr"] = lr
+
+        self._last_lr = [group["lr"] for group in self.optimizer.param_groups]
+
+
+def train_nn(opt, h5_file, device, plot_distributions=True):
 
     from pathlib import Path
     from dotenv import load_dotenv
@@ -619,6 +693,37 @@ def extract_survival_data(dataset) -> tp.Tuple[np.ndarray, np.ndarray]:
             "input_mode": opt.input_mode,
         },
     )
+    if opt.scheduler == "cosine_warmer":
+
+        wandb.config.update(
+            {
+                "scheduler": opt.scheduler,
+                "scheduler_params": {
+                    "t_0": opt.t_0,
+                    "t_mult": opt.t_mult,
+                    "eta_min": opt.eta_min,
+                },
+            },
+        )
+
+    elif opt.scheduler == "exponential":
+
+        wandb.config.update(
+            {
+                "scheduler": opt.scheduler,
+                "scheduler_params": {
+                    "exp_gamma": opt.exp_gamma,
+                },
+            },
+        )
+    elif opt.scheduler == "step_lr":
+
+        wandb.config.update(
+            {
+                "scheduler": opt.scheduler,
+                "scheduler_params": {"exp_gamma": opt.exp_gamma, "step": opt.lr_step},
+            }
+        )
 
     current_time = datetime.now()
     # if user provided timestamp then use for consistency
@@ -702,7 +807,30 @@ def extract_survival_data(dataset) -> tp.Tuple[np.ndarray, np.ndarray]:
 
         model.to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=opt.lr)
-        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=opt.gamma)
+        if opt.scheduler == "exponential":
+            scheduler = torch.optim.lr_scheduler.ExponentialLR(
+                optimizer, gamma=opt.exp_gamma
+            )
+        elif opt.scheduler == "cosine_warmer":
+            scheduler = CosineAnnealingWarmRestartsDecay(
+                optimizer,
+                T_0=opt.t_0,
+                T_mult=opt.t_mult,
+                eta_min=opt.eta_min,
+                decay_factor=opt.decay_factor,
+            )
+
+        elif opt.scheduler == "step_lr":
+            scheduler = torch.optim.lr_scheduler.StepLR(
+                optimizer, step_size=opt.step_lr_step, gamma=opt.step_lr_gamma
+            )
+        else:
+            from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+
+            scheduler = CosineAnnealingWarmRestarts(
+                optimizer, T_0=10, T_mult=2, eta_min=1e-6
+            )
+
         cox_loss = CoxLoss()
 
         # initialize and fit the scaler incrementally on training data
