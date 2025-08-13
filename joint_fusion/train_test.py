@@ -59,6 +59,163 @@ torch.autograd.set_detect_anomaly(True)
 current_time = datetime.now().strftime("%y_%m_%d_%H_%M")
 
 
+class StratifiedBatchSampler:
+    """
+    Combines time stratification with risk-set preservation
+    """
+
+    def __init__(self, times, events, batch_size, min_risk_coverage=0.8, shuffle=True):
+        self.times = np.array(times)
+        self.events = np.array(events)
+        self.batch_size = batch_size
+        self.min_risk_coverage = min_risk_coverage
+        self.shuffle = shuffle
+
+        self.indices = np.arange(len(times))
+
+        # Create time strata for balanced representation
+        self.time_quantiles = np.quantile(times[events == 1], [0, 0.33, 0.67, 1.0])
+        self.event_time_strata = (
+            np.digitize(times[events == 1], self.time_quantiles) - 1
+        )
+
+    def __iter__(self):
+
+        # Get all available indices
+        available_indices = set(self.indices.copy())
+
+        if self.shuffle:
+            available_indices = set(np.random.permutation(list(available_indicies)))
+
+        # Generate baches until out of samples
+        while len(available_indices) >= self.batch_size:
+            batch = self._create_hybrid_batch(available_indices)
+
+            # Remove used indices from available set
+            for idx in batch:
+                available_indices.discard(idx)
+
+            yield batch
+
+        # Drop incomplete batches so no need to handle leftover indices
+
+    def __len__(self):
+        """Return number of batches per epoch"""
+        return len(self.indices) // self.batch_size
+
+    def _create_hybrid_batch(self, available_indices):
+        """Create batch with both time balance and risk-set preservation"""
+        batch = []
+        available_list = list(available_indices)
+
+        # Step 1: Select events with temporal diversity
+        event_candidates = [i for i in available_list if self.events[i] == 1]
+
+        if event_candidates:
+            # Group events by time strata
+            early_events = [
+                i for i in event_candidates if self.times[i] <= self.time_quantiles[1]
+            ]
+            mid_events = [
+                i
+                for i in event_candidates
+                if self.time_quantiles[1] < self.times[i] <= self.time_quantiles[2]
+            ]
+            late_events = [
+                i for i in event_candidates if self.times[i] > self.time_quantiles[2]
+            ]
+
+            # Sample events from each stratum (temporal balance)
+            max_events_per_stratum = max(1, self.batch_size // 6)  # Conservative
+            selected_events = []
+
+            for event_group in [early_events, mid_events, late_events]:
+                if event_group:
+                    n_select = min(len(event_group), max_events_per_stratum)
+                    selected = np.random.choice(event_group, n_select, replace=False)
+                    selected_events.extend(selected)
+
+            batch.extend(selected_events)
+
+            # Step 2: For each selected event, ensure risk-set coverage
+            for event_idx in selected_events:
+                event_time = self.times[event_idx]
+
+                # Find at-risk samples
+                at_risk_candidates = [
+                    i
+                    for i in available_list
+                    if i not in batch and self.times[i] >= event_time
+                ]
+
+                if at_risk_candidates:
+                    # Calculate needed coverage
+                    total_at_risk = np.sum(self.times >= event_time)
+                    needed = int(self.min_risk_coverage * total_at_risk)
+                    needed = min(needed, len(at_risk_candidates))
+
+                    # Sample at-risk with some temporal diversity
+                    at_risk_candidates.sort(key=lambda i: self.times[i])
+
+                    # Use stratified sampling within at-risk set
+                    if needed > 1:
+                        indices = np.linspace(
+                            0, len(at_risk_candidates) - 1, needed
+                        ).astype(int)
+                        selected_at_risk = [at_risk_candidates[j] for j in indices]
+                    else:
+                        selected_at_risk = at_risk_candidates[:needed]
+
+                    # Add to batch if space allows
+                    space_remaining = self.batch_size - len(batch)
+                    batch.extend(selected_at_risk[:space_remaining])
+
+                    if len(batch) >= self.batch_size:
+                        break
+
+        # Step 3: Fill remaining slots with temporal balance
+        remaining_slots = self.batch_size - len(batch)
+        if remaining_slots > 0:
+            remaining_candidates = [i for i in available_list if i not in batch]
+
+            if remaining_candidates:
+                # Add remaining samples with time diversity preference
+                remaining_times = [self.times[i] for i in remaining_candidates]
+                time_weights = self._compute_time_diversity_weights(
+                    remaining_times, batch
+                )
+
+                # Weighted sampling for time diversity
+                probs = np.array(time_weights)
+                probs = probs / probs.sum() if probs.sum() > 0 else np.ones_like(probs)
+
+                n_additional = min(remaining_slots, len(remaining_candidates))
+                additional = np.random.choice(
+                    remaining_candidates, size=n_additional, replace=False, p=probs
+                )
+                batch.extend(additional)
+
+        return batch[: self.batch_size]
+
+    def _compute_time_diversity_weights(self, candidate_times, current_batch):
+        """Compute weights favoring temporal diversity"""
+        if not current_batch:
+            return [1.0] * len(candidate_times)
+
+        batch_times = [self.times[i] for i in current_batch]
+        batch_time_range = (min(batch_times), max(batch_times))
+
+        weights = []
+        for t in candidate_times:
+            # Higher weight for times that expand the temporal range
+            if t < batch_time_range[0] or t > batch_time_range[1]:
+                weights.append(2.0)  # Expand range
+            else:
+                weights.append(1.0)  # Within range
+
+        return weights
+
+
 class CoxLoss(nn.Module):
     def __init__(self):
         super(CoxLoss, self).__init__()
@@ -105,12 +262,23 @@ class CoxLoss(nn.Module):
 
 
 def create_data_loaders(opt, h5_file):
-    train_loader = torch.utils.data.DataLoader(
-        dataset=HDF5Dataset(
-            opt, h5_file, split="train", mode=opt.input_mode, train_val_test="train"
-        ),
+    full_dataset = HDF5Dataset(
+        opt, h5_file, split="train", mode=opt.input_mode, train_val_test="train"
+    )
+
+    times, events = extract_survival_data(full_dataset)
+
+    batch_sampler = StratifiedBatchSampler(
+        times=times,
+        events=events,
         batch_size=opt.batch_size,
+        min_risk_coverage=0.8,
         shuffle=True,
+    )
+
+    train_loader = torch.utils.data.DataLoader(
+        dataset=full_dataset,
+        batch_sampler=batch_sampler,
         num_workers=0,  # 8,
         # prefetch_factor=2,
         pin_memory=True,
