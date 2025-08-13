@@ -1995,29 +1995,41 @@ if __name__ == "__main__":
         default=True,
         help="whether to calculate IG for RNASeq data",
     )
+    parser.add_argument(
+        "--model_path",
+        type=str,
+        help="Path to the model for testing.",
+    )
+
+    parser.add_argument(
+        "--gpu_ids",
+        type=str,
+        default="0",
+        help="gpu ids: e.g. 0  0,1,2, 0,2. use -1 for CPU",
+    )
+    parser.add_argument(
+        "--use_multi_gpu", action="store_true", help="Use multiple GPUs if available"
+    )
+
     # Note: True/False have some issues when used in command line
     opt = parser.parse_args()
 
     # mapping_df = pd.read_json(opt.input_mapping_data_path + "mapping_df.json", orient='index')
 
     # get predictions on test data, and calculate interpretability metrics
-    model = MultimodalNetwork(
-        embedding_dim_wsi=opt.embedding_dim_wsi,
-        embedding_dim_omic=opt.embedding_dim_omic,
-        mode=opt.input_mode,
-        fusion_type=opt.fusion_type,
-    )
+    device, gpu_ids = setup_model_and_device(opt)
+    model = load_model_with_multi_gpu_support(opt, device, gpu_ids)
 
     # Add this multi-GPU support:
-    if opt.gpu_ids and opt.gpu_ids != "-1":
-        gpu_list = [int(x) for x in opt.gpu_ids.split(",")]
-        if len(gpu_list) > 1:
-            print(f"Using DataParallel with GPUs: {gpu_list}")
-            model = nn.DataParallel(model, device_ids=gpu_list)
-        else:
-            print(f"Using single GPU: {gpu_list[0]}")
-    else:
-        print("Using CPU")
+    # if opt.gpu_ids and opt.gpu_ids != "-1":
+    #     gpu_list = [int(x) for x in opt.gpu_ids.split(",")]
+    #     if len(gpu_list) > 1:
+    #         print(f"Using DataParallel with GPUs: {gpu_list}")
+    #         model = nn.DataParallel(model, device_ids=gpu_list)
+    #     else:
+    #         print(f"Using single GPU: {gpu_list[0]}")
+    # else:
+    #     print("Using CPU")
 
     # model should return None for the absent modality in the unimodal case
 
@@ -2029,9 +2041,10 @@ if __name__ == "__main__":
 
     # model.load_state_dict(torch.load("./saved_models_24_09_05_06_11/model_epoch_21.pt"))
     # model.load_state_dict(torch.load("./saved_models_24_09_05_18_21/model_epoch_44.pt"))  # start LR = 1e-3
-    model.load_state_dict(
-        torch.load("./saved_models_24_09_05_23_49/model_epoch_169.pt")
-    )  # 169 # start LR = 1e-4
+    # model.load_state_dict(
+    #     torch.load("./saved_models_24_09_05_23_49/model_epoch_169.pt")
+    # )  # 169 # start LR = 1e-4
+    model = load_model_state_dict(model, opt.model_path)
 
     # state_dict = torch.load("./saved_models/model_epoch_98.pt")
     # from collections import OrderedDict
