@@ -39,10 +39,11 @@ from sksurv.ensemble import GradientBoostingSurvivalAnalysis
 from sksurv.util import Surv
 from sksurv.metrics import concordance_index_censored
 
-if __name__ == "__main__":
-    os.environ["CUDA_VISIBLE_DEVICES"] = (
-        "0"  # force to use only one GPU to avoid any issues with the Cox PH loss function (that requires data for all at-risk samples)
-    )
+# if __name__ == "__main__":
+#     os.environ["CUDA_VISIBLE_DEVICES"] = (
+#         "0"  # force to use only one GPU to avoid any issues with the Cox PH loss function (that requires data for all at-risk samples)
+#     )
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 import pdb
 import pickle

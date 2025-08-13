@@ -123,7 +123,14 @@ class OmicNetwork(nn.Module):  # MLP for WSI tile-level embedding generation
 
 
 class MultimodalNetwork(nn.Module):
-    def __init__(self, embedding_dim_wsi, embedding_dim_omic, mode, fusion_type, joint_embedding_type="weighted_avg"):
+    def __init__(
+        self,
+        embedding_dim_wsi,
+        embedding_dim_omic,
+        mode,
+        fusion_type,
+        joint_embedding_type="weighted_avg",
+    ):
         super(MultimodalNetwork, self).__init__()
 
         self.mode = mode  # wsi_omic, wsi or omic
@@ -131,10 +138,10 @@ class MultimodalNetwork(nn.Module):
 
         # NOTE: Initial weights or final weights are choosen from the results from early fusion
 
-        if joint_embedding_type="weighted_avg_dynamic":
+        if joint_embedding_type == "weighted_avg_dynamic":
             self.omic_weight = nn.Parameter(torch.tensor(0.8))
             self.wsi_weight = nn.Parameter(torch.tensor(0.2))
-        else: 
+        else:
             # NOTE: Default, even if concatenation because does not take that much memory
             self.omic_weight = 0.8
             self.wsi_weight = 0.2
@@ -153,7 +160,9 @@ class MultimodalNetwork(nn.Module):
 
                 embedding_dim = self.wsi_net.embedding_dim + self.omic_net.embedding_dim
             else:
-                embedding_dim = min(self.wsi_net.embedding_dim, self.omic_net.embedding_dim)
+                embedding_dim = min(
+                    self.wsi_net.embedding_dim, self.omic_net.embedding_dim
+                )
 
                 self.wsi_projection = nn.Linear(embedding_dim_wsi, embedding_dim)
                 self.omic_projection = nn.Linear(embedding_dim_omic, embedding_dim)
