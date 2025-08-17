@@ -147,14 +147,12 @@ def args():
     )
     parser.add_argument(
         "--use_mixed_precision",
-        type=str,
-        default=False,
+        action="store_true",
         help="whether to use mixed precision calculations (currently unstable)",
     )
     parser.add_argument(
         "--use_gradient_accumulation",
-        type=str,
-        default=False,
+        action="store_true",
         help="whether to use gradient accumulation",
     )
 
@@ -393,5 +391,7 @@ def main():
 
 
 if __name__ == "__main__":
+
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
     main()

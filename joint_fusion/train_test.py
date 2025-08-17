@@ -975,6 +975,9 @@ def train_nn(opt, h5_file, device, plot_distributions=True):
     loss_average_by_epoch = np.zeros(opt.num_epochs, dtype=np.float32)
 
     # need to keep fold index at 0 for the sake of the averaging by epoch
+    if opt.use_mixed_precision:
+        amp_scaler = GradScaler()
+        print("Using mixed precision training with StandardScaler")
     # Main fold iteration loop
     for fold_idx, (train_idx, val_idx) in enumerate(folds):
         print(f"\n{'='*60}")
@@ -1059,7 +1062,7 @@ def train_nn(opt, h5_file, device, plot_distributions=True):
             torch.cuda.set_device(0)
 
         model.to(device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=opt.lr)
+        optimizer = torch.optim.Adam(model.parameters(), lr=opt.lr, weight_decay=1e-4)
         if opt.scheduler == "exponential":
             scheduler = torch.optim.lr_scheduler.ExponentialLR(
                 optimizer, gamma=opt.exp_gamma
@@ -1107,11 +1110,13 @@ def train_nn(opt, h5_file, device, plot_distributions=True):
             )
             start_train_time = time.time()
             model.train()
+
             # # added to reduce memory requirement
             # if isinstance(model, torch.nn.DataParallel):
             #     model.module.gradient_checkpointing_enable()
             # else:
             #     model.gradient_checkpointing_enable()
+
             loss_epoch = 0
 
             # Add debug info for first batch
@@ -1134,11 +1139,22 @@ def train_nn(opt, h5_file, device, plot_distributions=True):
                 )
                 print(f"Batch size: {opt.batch_size}")
                 print(f"Batch index: {batch_idx} out of {num_batches_per_epoch}")
+
+                # print(f"Before scaling - x_omic shape: {x_omic.shape}")
+                # print(f"Before scaling - days_to_event shape: {days_to_event.shape}")
+                # print(f"Before scaling - event_occurred shape: {event_occurred.shape}")
+
+                # NOTE: Do not apply standard scaler to omic data
                 x_wsi = [x.to(device) for x in x_wsi]
                 x_omic = x_omic.to(device)
+
+                print(f"After scaling - x_omic shape: {x_omic.shape}")
                 days_to_event = days_to_event.to(device)
                 # days_to_last_followup = days_to_last_followup.to(device)
                 event_occurred = event_occurred.to(device)
+
+                # print(f"Final - days_to_event shape: {days_to_event.shape}")
+                # print(f"Final - event_occurred shape: {event_occurred.shape}")
                 print("Days to event: ", days_to_event)
                 print("event occurred: ", event_occurred)
 
@@ -1147,23 +1163,30 @@ def train_nn(opt, h5_file, device, plot_distributions=True):
                 if opt.use_mixed_precision:
                     with autocast():  # should wrap only the forward pass including the loss calculation
                         predictions = model(
-                            x_wsi=x_wsi,  # list of tensors (one for each tile)
-                            x_omic=x_omic,
+                            opt,
+                            tcga_id,
+                            x_wsi=x_wsi,
+                            x_omic=x_omic,  # Now properly scaled
                         )
+
+                        # print(f"Model predictions shape: {predictions.shape}")
                         loss = cox_loss(
                             predictions.squeeze(), days_to_event, event_occurred
                         )
-                        print("\n loss: ", loss.data.item())
+                        print("\n loss (train, mixed precision): ", loss.data.item())
                         loss_epoch += loss.data.item()
-                    scaler.scale(loss).backward()
-                    scaler.step(optimizer)
-                    scaler.update()
+
+                    # Mixed precision backward pass
+                    amp_scaler.scale(loss).backward()
+                    amp_scaler.step(optimizer)
+                    amp_scaler.update()
                 else:
                     print(" Not using mixed precision")
                     # model for survival outcome (uses Cox PH partial log likelihood as the loss function)
                     # the model output should be considered as beta*X to be used in the Cox loss function
 
                     start_time = time.time()
+
                     predictions = model(
                         opt,
                         tcga_id,
@@ -1265,6 +1288,7 @@ def train_nn(opt, h5_file, device, plot_distributions=True):
                         )
                         x_wsi = [x.to(device) for x in x_wsi]
                         x_omic = x_omic.to(device)
+
                         days_to_event = days_to_event.to(device)
                         event_occurred = event_occurred.to(device)
                         print("Days to event: ", days_to_event)
