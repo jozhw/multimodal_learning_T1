@@ -232,37 +232,50 @@ class CoxLoss(nn.Module):
         :param censor: censor data, event (death) indicators (1/0)
         :return: Cox loss (scalar)
         """
-        sorted_times, sorted_indices = torch.sort(times, descending=True)
-        sorted_log_risks = log_risks[sorted_indices]
-        sorted_censor = censor[sorted_indices]
+        device = log_risks.device
 
-        # precompute for using within the inner sum of term 2 in Cox loss
+        # Ensure all tensors are on the same device and flattened
+        log_risks = log_risks.flatten().to(device)
+        times = times.flatten().to(device)
+        censor = censor.flatten().to(device)
+
+        n = len(times)
+
+        # Sort by times in descending order
+        sorted_times, sorted_indices = torch.sort(times, descending=True)
+
+        # Use advanced indexing that preserves gradients
+        sorted_log_risks = torch.gather(log_risks, 0, sorted_indices)
+        sorted_censor = torch.gather(censor, 0, sorted_indices)
+
+        # Precompute exponentials
         exp_sorted_log_risks = torch.exp(sorted_log_risks)
 
-        # initialize all samples to be at-risk (will update it below)
-        at_risk_mask = torch.ones_like(sorted_times, dtype=torch.bool)
+        # Create at-risk matrix: at_risk[i,j] = 1 if sample j is at risk when sample i has event
+        # Since sorted in descending order, sample j is at risk for sample i if j <= i
+        time_indices = torch.arange(n, device=device).unsqueeze(0)  # (1, n)
+        event_indices = torch.arange(n, device=device).unsqueeze(1)  # (n, 1)
+        at_risk_matrix = (time_indices <= event_indices).float()  # (n, n)
 
-        losses = []
-        for time_index in range(len(sorted_times)):
-            # include only the uncensored samples (i.e., for whom the event has happened)
-            if sorted_censor[time_index] == 1:
-                at_risk_mask = (
-                    torch.arange(len(sorted_times)) <= time_index
-                )  # less than, as sorted_times is in descending order
-                at_risk_mask = at_risk_mask.to(device)
-                at_risk_sum = torch.sum(
-                    exp_sorted_log_risks[at_risk_mask]  # 2nd term on the RHS
-                )  # all are at-risk for the first sample (after arranged in descending order)
-                loss = sorted_log_risks[time_index] - torch.log(at_risk_sum + 1e-15)
-                losses.append(loss)
+        # For each event time i, compute sum of exp(log_risks) for all at-risk samples
+        risk_set_sums = torch.matmul(at_risk_matrix, exp_sorted_log_risks)  # (n,)
 
-            # at_risk_mask[time_index] = False # the i'th sample is no more in the risk-set as the event has already occurred for it
+        # Compute log of risk set sums with numerical stability
+        log_risk_set_sums = torch.log(risk_set_sums + 1e-15)
 
-        # if no uncensored samples are in the mini-batch return 0
-        if not losses:
-            return torch.tensor(0.0, requires_grad=True)
+        # Compute individual losses for each sample (vectorized)
+        individual_losses = sorted_log_risks - log_risk_set_sums
 
-        cox_loss = -torch.mean(torch.stack(losses))
+        # Only include uncensored samples (events)
+        event_mask = sorted_censor.bool()
+
+        # If no events in batch, return zero loss
+        if torch.sum(event_mask) == 0:
+            return torch.tensor(0.0, device=device, requires_grad=True)
+
+        # Compute mean loss over events
+        cox_loss = -torch.mean(individual_losses[event_mask])
+
         return cox_loss
 
 
@@ -794,9 +807,9 @@ class CosineAnnealingWarmRestartsDecay(_LRScheduler):
         self.T_mult = T_mult
         self.eta_min = eta_min
         self.decay_factor = decay_factor
-        self.T_i = T_0
-        self.T_cur = 0
-        self.cycle = 0
+        self.T_i = T_0  # Current period length
+        self.T_cur = 0  # Current step within period
+        self.cycle = 0  # Current cycle number
 
         # Store initial learning rates for each param group
         self.base_lrs = [group["lr"] for group in optimizer.param_groups]
