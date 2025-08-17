@@ -818,13 +818,6 @@ class CosineAnnealingWarmRestartsDecay(_LRScheduler):
         super().__init__(optimizer, last_epoch, verbose)
 
     def get_lr(self):
-        if self.T_cur == 0:
-            # At the start of a new cycle, update max learning rates
-            if self.cycle > 0:
-                self.current_max_lrs = [
-                    lr * self.decay_factor for lr in self.current_max_lrs
-                ]
-            return self.current_max_lrs
 
         return [
             self.eta_min
@@ -835,22 +828,35 @@ class CosineAnnealingWarmRestartsDecay(_LRScheduler):
         ]
 
     def step(self, epoch=None):
+        """
+        1. First calculates and applies the current learning rate
+        2. Updates the internal state for the next step
+        3. Handles cycle transitions after the current step is complete
+        """
+
         if epoch is None:
             epoch = self.last_epoch + 1
 
         self.last_epoch = epoch
-        self.T_cur += 1
-
-        if self.T_cur >= self.T_i:
-            # Restart
-            self.cycle += 1
-            self.T_cur = 0
-            self.T_i = self.T_i * self.T_mult
 
         for param_group, lr in zip(self.optimizer.param_groups, self.get_lr()):
             param_group["lr"] = lr
 
         self._last_lr = [group["lr"] for group in self.optimizer.param_groups]
+
+        self.T_cur += 1
+
+        if self.T_cur > self.T_i:
+            # Cycle completed, prep for next one
+            self.cycle += 1
+
+            self.current_max_lrs = [
+                lr * self.decay_factor for lr in self.current_max_lrs
+            ]
+
+            # Restart
+            self.T_cur = 0
+            self.T_i = int(self.T_i * self.T_mult)
 
 
 def train_nn(opt, h5_file, device, plot_distributions=True):
