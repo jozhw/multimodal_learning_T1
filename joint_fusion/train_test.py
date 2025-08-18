@@ -1664,23 +1664,6 @@ def test_and_interpret(opt, model, test_loader, device, baseline=None):
             all_events.append(event_occurred)
             model.zero_grad()
             torch.cuda.empty_cache()
-        # set_trace()
-        # # test_loss = test_loss_epoch / len(test_loader.dataset)
-        # set_trace()
-        # all_predictions = torch.stack(all_predictions)
-        # all_times = torch.stack(all_times)
-        # all_events = torch.stack(all_events)
-        #
-        # # convert to numpy arrays for CI calculation
-        # all_predictions_np = all_predictions.cpu().numpy()
-        # all_times_np = all_times.cpu().numpy()
-        # all_events_np = all_events.cpu().numpy()
-        # # set_trace()
-        # # c_index = concordance_index_censored(all_events_np.astype(bool), all_times_np, all_predictions_np)
-        # c_index = concordance_index_censored(all_events_np.astype(bool).flatten(),
-        #                                      all_times_np.flatten(),
-        #                                      all_predictions_np)
-        # # # print(f"Test loss: {test_loss}, CI: {c_index[0]}")
 
         all_predictions_np = [pred.item() for pred in all_predictions]
         all_events_np = torch.stack(all_events).cpu().numpy()
@@ -1739,116 +1722,6 @@ def test_and_interpret(opt, model, test_loader, device, baseline=None):
     plt.ylabel("Survival probability")
     plt.legend()
     plt.savefig("km_plot_joint_fusion.png", format="png", dpi=300)
-    # plt.show()
-
-    # set_trace()
-
-    # # the flow of the gradients in backprop should be through the downstream MLP and the omic MLP
-    #
-    # # saliency = Saliency(model.wsi_net.forward)
-    # # integrated_gradients = IntegratedGradients(model.omic_net.forward)
-    # saliency = Saliency(model.forward)
-    # integrated_gradients = IntegratedGradients(model.forward)
-    #
-    # all_attributions_saliency = []
-    # all_attributions_ig = []
-    #
-    # with torch.no_grad():
-    #     for tcga_id, days_to_event, event_occurred, x_wsi, x_omic in test_loader:
-    #         x_wsi = [x.to(device) for x in x_wsi]
-    #         x_omic = x_omic.to(device)
-    #         days_to_event = days_to_event.to(device)
-    #         event_occurred = event_occurred.to(device)
-    #
-    #         predictions = model(opt,
-    #                             tcga_id,
-    #                             x_wsi=x_wsi,
-    #                             x_omic=x_omic)
-    #
-    #         risk_scores = predictions.squeeze()
-    #
-    #         dataset = CustomDatasetWSI(x_wsi, transform=None)
-    #         tile_loader = DataLoader(dataset, batch_size=1,
-    #                                  shuffle=False)  # check later why the batch size is hard-coded to 1
-    #
-    #         if model.module.mode == 'wsi_omic':
-    #             # saliency maps for WSI
-    #             # generate saliency map for each tile
-    #             for tiles in tile_loader:
-    #                 tiles = tiles.to(device)
-    #                 tiles = tiles.squeeze(0)  # Remove the batch dimension: [8, 3, 256, 256]
-    #
-    #                 for j, tile in enumerate(tiles):
-    #                     tile = tile.unsqueeze(0)  # add batch dimension back
-    #                     tile.requires_grad_()
-    #                     # set_trace()
-    #                     salience_attributions = saliency.attribute(tile, target=risk_scores[j],
-    #                                                                additional_forward_args=(
-    #                                                                opt, tcga_id, tile, x_omic[j]))
-    #
-    #                     saliency_attributions_abs = torch.abs(saliency_attributions)
-    #                     saliency_map = saliency_attributions_abs.cpu().numpy().squeeze().transpose(1, 2,
-    #                                                                                                0)  # HWC format
-    #
-    #                     # set_trace()
-    #             x_wsi_stacked = torch.stack(x_wsi).requires_grad_(True)
-    #             x_omic.requires_grad = False  # for WSI, the output gradients should be calculated only wrt the WSI inputs and not the RNASeq inputs
-    #
-    #             # wsi_embedding = model.wsi_net(x_wsi_stacked)
-    #             # omic_embedding = model.omic_net(x_omic)
-    #             # combined_embedding = torch.cat((wsi_embedding, omic_embedding), dim=1).requires_grad_(True)
-    #             # output = model.fused_mlp(combined_embedding)
-    #             # output = output.squeeze()
-    #             # output.backward()  # getting gradients of output w.r.t. graph leaves
-    #
-    #             # saliency_attributions = x_wsi_stacked.grad
-    #             saliency_attributions = saliency.attribute(x_wsi_stacked, target=risk_scores,
-    #                                                        additional_forward_args=(opt, tcga_id, x_omic))
-    #             saliency_attributions_abs = torch.abs(saliency_attributions)
-    #             all_attributions_saliency.append(saliency_attributions_abs.cpu().numpy())
-    #
-    #             # visualize and overlay saliency maps on original patches
-    #             for i, attr in enumerate(saliency_attributions_abs):
-    #                 attr_np = attr.cpu().numpy().transpose(1, 2, 0)  # convert to HWC format
-    #                 attr_np = cv2.normalize(attr_np, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    #                 heatmap = cv2.applyColorMap(attr_np, cv2.COLORMAP_JET)
-    #                 original_patch = x_wsi_stacked[i].cpu().numpy().transpose(1, 2, 0)
-    #                 original_patch = cv2.normalize(original_patch, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    #
-    #                 # overlay the saliency heatmaps with the original WSI patch
-    #                 overlay = cv2.addWeighted(heatmap, 0.5, original_patch, 0.5, 0)
-    #
-    #                 output_path = os.path.join(output_dir, f'saliency_map_patch_{i}.png')
-    #                 # cv2.imwrite(output_path, overlay)
-    #
-    #                 plt.figure(figsize=(6, 6))
-    #                 plt.imshow(overlay)
-    #                 plt.title(f'Saliency Map Overlay for Patch {i}')
-    #                 plt.axis('off')
-    #                 plt.savefig(output_path)
-    #                 plt.close()
-    #
-    #         # IG for rnaseq
-    #         x_wsi_stacked.requires_grad = False
-    #         # x_omic.requires_grad_()
-    #         x_omic.requires_grad = True  # reset to True. It was set to False for WSI saliency map computations
-    #
-    #         baseline = torch.zeros_like(x_omic)  # is zeros the appropriate baseline?
-    #         # set_trace()
-    #         attrs, delta = integrated_gradients.attribute(inputs=x_omic,
-    #                                                       baselines=baseline,
-    #                                                       target=risk_scores,
-    #                                                       additional_forward_args=(opt, tcga_id, x_omic),
-    #                                                       return_convergence_delta=True)
-    #         all_attributions_ig.append(attrs.cpu().numpy())
-    #
-    # all_attributions_saliency = np.concatenate(all_attributions_saliency, axis=0)
-    # all_attributions_ig = np.concatenate(all_attributions_ig, axis=0)
-    #
-    # np.save("wsi_attributions_saliency.npy", all_attributions_saliency)
-    # np.save("omic_attributions_ig.npy", all_attributions_ig)
-    #
-    # return all_attributions_saliency, all_attributions_ig
 
     return None
 
@@ -1981,6 +1854,12 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
+        "--output_base_dir",
+        type=str,
+        help="Path to the base directory to store results.",
+    )
+
+    parser.add_argument(
         "--input_mapping_data_path",
         type=str,
         default="/lus/eagle/clone/g2/projects/GeomicVar/tarak/multimodal_learning_T1/joint_fusion/",
@@ -2001,7 +1880,6 @@ if __name__ == "__main__":
     parser.add_argument(
         "--val_batch_size", type=int, default=1, help="Batch size for validation"
     )
-    # parser.add_argument('--test_batch_size', type=int, default=1000, help='Batch size for testing (use all samples)')
     parser.add_argument(
         "--test_batch_size", type=int, default=1, help="Batch size for testing"
     )
@@ -2028,14 +1906,12 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--calc_saliency_maps",
-        type=bool,
-        default=True,
+        action="store_true",
         help="whether to calculate saliency maps for WSI patches",
     )
     parser.add_argument(
         "--calc_IG",
-        type=bool,
-        default=True,
+        action="store_true",
         help="whether to calculate IG for RNASeq data",
     )
     parser.add_argument(
@@ -2053,50 +1929,26 @@ if __name__ == "__main__":
     parser.add_argument(
         "--use_multi_gpu", action="store_true", help="Use multiple GPUs if available"
     )
+    parser.add_argument(
+        "--joint_embedding",
+        type=str,
+        default="weighted_avg",
+        help="Joint embedding creation method for joint fusion. Current options are concatenate, weighted_avg, and weighted_avg_dynamic",
+    )
 
     # Note: True/False have some issues when used in command line
     opt = parser.parse_args()
 
-    # mapping_df = pd.read_json(opt.input_mapping_data_path + "mapping_df.json", orient='index')
+    # make sure output_base_dir exists
+    os.makedirs(opt.output_base_dir, exist_ok=True)
 
     # get predictions on test data, and calculate interpretability metrics
     device, gpu_ids = setup_model_and_device(opt)
     model = load_model_with_multi_gpu_support(opt, device, gpu_ids)
 
-    # Add this multi-GPU support:
-    # if opt.gpu_ids and opt.gpu_ids != "-1":
-    #     gpu_list = [int(x) for x in opt.gpu_ids.split(",")]
-    #     if len(gpu_list) > 1:
-    #         print(f"Using DataParallel with GPUs: {gpu_list}")
-    #         model = nn.DataParallel(model, device_ids=gpu_list)
-    #     else:
-    #         print(f"Using single GPU: {gpu_list[0]}")
-    # else:
-    #     print("Using CPU")
-
-    # model should return None for the absent modality in the unimodal case
-
     model.to(device)
     cox_loss = CoxLoss()
-    # model.load_state_dict(torch.load("./saved_models/model_epoch_98.pt"))
-    # model.load_state_dict(torch.load("./saved_models/model_epoch_8.pt"))
-    # model.load_state_dict(torch.load("./saved_models_4sep/model_epoch_20.pt"))
-
-    # model.load_state_dict(torch.load("./saved_models_24_09_05_06_11/model_epoch_21.pt"))
-    # model.load_state_dict(torch.load("./saved_models_24_09_05_18_21/model_epoch_44.pt"))  # start LR = 1e-3
-    # model.load_state_dict(
-    #     torch.load("./saved_models_24_09_05_23_49/model_epoch_169.pt")
-    # )  # 169 # start LR = 1e-4
     model = load_model_state_dict(model, opt.model_path)
-
-    # state_dict = torch.load("./saved_models/model_epoch_98.pt")
-    # from collections import OrderedDict
-    #
-    # new_state_dict = OrderedDict()
-    # for k, v in state_dict.items():
-    #     name = k[7:] if k.startswith('module.') else k  # remove `module.` if present
-    #     new_state_dict[name] = v
-    # model.load_state_dict(new_state_dict)
 
     train_loader, validation_loader, test_loader = create_data_loaders(
         opt, "mapping_data.h5"
@@ -2113,22 +1965,6 @@ if __name__ == "__main__":
         num_workers=0,
         pin_memory=True,
     )
-
-    # # get the baseline for x_omic for IG from the training data (mean expression level for all genes)
-    # total_x_omic = None
-    # total_samples = 0
-    #
-    # # loop over train_loader and accumulate the omic data
-    # for batch_idx, (tcga_id, days_to_event, event_occurred, x_wsi, x_omic) in enumerate(train_loader):
-    #     print(f"Looping over batch {batch_idx}")
-    #     if total_x_omic is None:
-    #         total_x_omic = torch.zeros_like(x_omic)
-    #
-    #     total_x_omic += x_omic.sum(dim=0)
-    #     total_samples += x_omic.size(0)
-    #
-    # # compute the mean expression for each gene across all samples
-    # mean_x_omic = total_x_omic / total_samples
 
     # get the mean expression level for all genes across all the training samples to be used as baseline for x_omic for IG
     def compute_mean_omic_from_h5(file_name):
