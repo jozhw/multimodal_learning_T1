@@ -404,17 +404,38 @@ class WSIEncoder(nn.Module):
                 slide_embedding = np.mean(embeddings_array, axis=0)
 
         else:  # for joint fusion. Need to train parts of the model alongside models for other modalities and the downstream task
-            for tiles in tile_loader:
-                tiles = tiles.to(device)
+            for batch_idx, tiles in enumerate(tile_loader):
+                tiles = tiles.to(device)  # Or self.device if available
+                # Debug: Log to spot the failing tile (remove after fix)
+                print(
+                    f"Tile batch {batch_idx}: shape {tiles.shape}, finite: {torch.isfinite(tiles).all().item()}"
+                )
+
+                # Robust squeeze: Handle loader output variations safely
+                if tiles.dim() == 5:  # e.g., [1, 1, C, H, W] → [1, C, H, W]
+                    tiles = tiles.squeeze(0)
+                elif tiles.dim() != 4:  # Expect [1, C, H, W]
+                    raise ValueError(
+                        f"Unexpected tiles shape in batch {batch_idx}: {tiles.shape}"
+                    )
+
                 features = self.model(
-                    tiles.squeeze(0)
-                )  # Get rid of the leading dim; the model expects [batch_size, n_channels, h, w]; probably tied to batch_size hardcoded to 1?
-                embeddings.append(features.cpu())  # is moving to cpu really needed??
+                    tiles
+                )  # Model forward: expect [feat_dim] or similar
+                # Debug: Check post-model
+                print(
+                    f"Features batch {batch_idx}: shape {features.shape}, finite: {torch.isfinite(features).all().item()}"
+                )
+                embeddings.append(features)
+
+            if len(embeddings) == 0:
+                raise ValueError("No tiles processed—check dataset/loader")
+
             embeddings_tensor = torch.stack(embeddings)
             # for joint fusion, the backprop will be through the combined embeddings to the inputs
             if self.pooling in {"attention", "learned_weighted"}:
                 slide_embedding = self.attention_pool(
-                    embeddings_tensor.squeeze(1).to(device)
+                    embeddings_tensor.squeeze(1).to(self.device)
                 )
             else:  # average pooling
                 slide_embedding = torch.mean(embeddings_tensor, dim=0)

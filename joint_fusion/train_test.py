@@ -21,19 +21,20 @@ from torch import nn
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 from torch.utils.data import RandomSampler, DataLoader, Subset
+import torch.utils.checkpoint as checkpoint
 from torch.optim.lr_scheduler import _LRScheduler
 
 # import torch.optim.lr_scheduler as lr_scheduler
 from torchsummary import summary
 from torch.cuda.amp import autocast, GradScaler
 from sklearn.model_selection import train_test_split
-from utils import mixed_collate
+from utils import mixed_collate, clear_memory, monitor_memory
 from tqdm import tqdm
 from torch.utils.data import ConcatDataset
 from sklearn.preprocessing import StandardScaler, KBinsDiscretizer
 
 from datasets import CustomDataset, HDF5Dataset
-from models import MultimodalNetwork, OmicNetwork, print_model_summary
+from model import MultimodalNetwork, OmicNetwork, print_model_summary
 from sklearn.model_selection import StratifiedKFold
 from generate_wsi_embeddings import CustomDatasetWSI
 
@@ -45,11 +46,6 @@ from sksurv.ensemble import GradientBoostingSurvivalAnalysis
 from sksurv.util import Surv
 from sksurv.metrics import concordance_index_censored
 
-# if __name__ == "__main__":
-#     os.environ["CUDA_VISIBLE_DEVICES"] = (
-#         "0"  # force to use only one GPU to avoid any issues with the Cox PH loss function (that requires data for all at-risk samples)
-#     )
-
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 import pdb
 import pickle
@@ -58,6 +54,8 @@ from pdb import set_trace
 from captum.attr import IntegratedGradients, Saliency
 
 import torchviz
+
+from models.loss_functions import JointLoss
 
 torch.autograd.set_detect_anomaly(True)
 
@@ -219,64 +217,6 @@ class StratifiedBatchSampler:
                 weights.append(1.0)  # Within range
 
         return weights
-
-
-class CoxLoss(nn.Module):
-    def __init__(self):
-        super(CoxLoss, self).__init__()
-
-    def forward(self, log_risks, times, censor):
-        """
-        :param log_risks: predictions from the NN
-        :param times: observed survival times (i.e. times to death) for the batch
-        :param censor: censor data, event (death) indicators (1/0)
-        :return: Cox loss (scalar)
-        """
-        device = log_risks.device
-
-        # Ensure all tensors are on the same device and flattened
-        log_risks = log_risks.flatten().to(device)
-        times = times.flatten().to(device)
-        censor = censor.flatten().to(device)
-
-        n = len(times)
-
-        # Sort by times in descending order
-        sorted_times, sorted_indices = torch.sort(times, descending=True)
-
-        # Use advanced indexing that preserves gradients
-        sorted_log_risks = torch.gather(log_risks, 0, sorted_indices)
-        sorted_censor = torch.gather(censor, 0, sorted_indices)
-
-        # Precompute exponentials
-        exp_sorted_log_risks = torch.exp(sorted_log_risks)
-
-        # Create at-risk matrix: at_risk[i,j] = 1 if sample j is at risk when sample i has event
-        # Since sorted in descending order, sample j is at risk for sample i if j <= i
-        time_indices = torch.arange(n, device=device).unsqueeze(0)  # (1, n)
-        event_indices = torch.arange(n, device=device).unsqueeze(1)  # (n, 1)
-        at_risk_matrix = (time_indices <= event_indices).float()  # (n, n)
-
-        # For each event time i, compute sum of exp(log_risks) for all at-risk samples
-        risk_set_sums = torch.matmul(at_risk_matrix, exp_sorted_log_risks)  # (n,)
-
-        # Compute log of risk set sums with numerical stability
-        log_risk_set_sums = torch.log(risk_set_sums + 1e-15)
-
-        # Compute individual losses for each sample (vectorized)
-        individual_losses = sorted_log_risks - log_risk_set_sums
-
-        # Only include uncensored samples (events)
-        event_mask = sorted_censor.bool()
-
-        # If no events in batch, return zero loss
-        if torch.sum(event_mask) == 0:
-            return torch.tensor(0.0, device=device, requires_grad=True)
-
-        # Compute mean loss over events
-        cox_loss = -torch.mean(individual_losses[event_mask])
-
-        return cox_loss
 
 
 def create_data_loaders(opt, h5_file):
@@ -880,12 +820,21 @@ def train_nn(opt, h5_file, device, plot_distributions=True):
             "batch_size": opt.batch_size,
             "val_batch_size": opt.val_batch_size,
             "lr": opt.lr,
+            "mlp_layers": opt.mlp_layers,
+            "dropout": opt.dropout,
             "fusion_type": opt.fusion_type,
             "joint_embedding": opt.joint_embedding,
+            "embedding_dim_wsi": opt.embedding_dim_wsi,
+            "embedding_dim_omic": opt.embedding_dim_omic,
             "input_mode": opt.input_mode,
             "stratified_cv": True,
+            "use_pretrained_omic": opt.use_pretrained_omic,
+            "omic_checkpoint_path": (
+                opt.omic_checkpoint_path if opt.use_pretrained_omic else None
+            ),
         },
     )
+
     if opt.scheduler == "cosine_warmer":
 
         wandb.config.update(
@@ -917,7 +866,6 @@ def train_nn(opt, h5_file, device, plot_distributions=True):
                 "scheduler_params": {"exp_gamma": opt.exp_gamma, "step": opt.lr_step},
             }
         )
-
     current_time = datetime.now()
 
     # If user provided timestamp then use for consistency
@@ -954,7 +902,10 @@ def train_nn(opt, h5_file, device, plot_distributions=True):
 
     try:
         folds = create_stratified_survival_folds(
-            times=times, events=events, n_splits=opt.n_folds
+            times=times,
+            events=events,
+            n_splits=opt.n_folds,
+            n_time_bins=10,
         )
         print(f"Successfully created {len(folds)} stratified folds")
 
@@ -978,6 +929,9 @@ def train_nn(opt, h5_file, device, plot_distributions=True):
     if opt.use_mixed_precision:
         amp_scaler = GradScaler()
         print("Using mixed precision training with StandardScaler")
+
+    # Step counter for wandb
+    step_counter = 0
     # Main fold iteration loop
     for fold_idx, (train_idx, val_idx) in enumerate(folds):
         print(f"\n{'='*60}")
@@ -1023,6 +977,7 @@ def train_nn(opt, h5_file, device, plot_distributions=True):
         train_loader_fold = DataLoader(
             train_subset,
             batch_size=opt.batch_size,
+            collate_fn=mixed_collate,
             num_workers=4,
             pin_memory=True,
             shuffle=True,
@@ -1031,6 +986,7 @@ def train_nn(opt, h5_file, device, plot_distributions=True):
         val_loader_fold = DataLoader(
             val_subset,
             batch_size=opt.val_batch_size,
+            collate_fn=mixed_collate,
             shuffle=False,
             num_workers=4,
             pin_memory=True,
@@ -1054,6 +1010,8 @@ def train_nn(opt, h5_file, device, plot_distributions=True):
             mode=opt.input_mode,
             fusion_type=opt.fusion_type,
             joint_embedding_type=opt.joint_embedding,
+            mlp_layers=opt.mlp_layers,
+            dropout=opt.dropout,
         )
 
         if torch.cuda.device_count() > 1:
@@ -1087,7 +1045,7 @@ def train_nn(opt, h5_file, device, plot_distributions=True):
                 optimizer, T_0=10, T_mult=2, eta_min=1e-6
             )
 
-        cox_loss = CoxLoss()
+        joint_loss = JointLoss()
 
         # Initialize and fit the scaler for this fold
         print(f"Fitting scaler for fold {fold_idx + 1}...")
@@ -1162,7 +1120,7 @@ def train_nn(opt, h5_file, device, plot_distributions=True):
 
                 if opt.use_mixed_precision:
                     with autocast():  # should wrap only the forward pass including the loss calculation
-                        predictions = model(
+                        predictions, wsi_embedding, omic_embedding = model(
                             opt,
                             tcga_id,
                             x_wsi=x_wsi,
@@ -1170,8 +1128,12 @@ def train_nn(opt, h5_file, device, plot_distributions=True):
                         )
 
                         # print(f"Model predictions shape: {predictions.shape}")
-                        loss = cox_loss(
-                            predictions.squeeze(), days_to_event, event_occurred
+                        loss = joint_loss(
+                            predictions.squeeze(),
+                            days_to_event,
+                            event_occurred,
+                            wsi_embedding,
+                            omic_embedding,
                         )
                         print("\n loss (train, mixed precision): ", loss.data.item())
                         loss_epoch += loss.data.item()
@@ -1187,7 +1149,7 @@ def train_nn(opt, h5_file, device, plot_distributions=True):
 
                     start_time = time.time()
 
-                    predictions = model(
+                    predictions, wsi_embedding, omic_embedding = model(
                         opt,
                         tcga_id,
                         x_wsi=x_wsi,  # list of tensors (one for each tile)
@@ -1195,11 +1157,13 @@ def train_nn(opt, h5_file, device, plot_distributions=True):
                     )
                     # print(f"predictions: {predictions} from train_test.py")
                     step1_time = time.time()
-                    loss = cox_loss(
+                    loss = joint_loss(
                         predictions.squeeze(),
                         # predictions are not survival outcomes, rather log-risk scores beta*X
                         days_to_event,
                         event_occurred,
+                        wsi_embedding,
+                        omic_embedding,
                     )  # Cox partial likelihood loss for survival outcome prediction
                     print("\n loss (train): ", loss.data.item())
                     step2_time = time.time()
@@ -1286,24 +1250,28 @@ def train_nn(opt, h5_file, device, plot_distributions=True):
                         print(
                             f"Validation Batch index: {batch_idx + 1} out of {np.ceil(len(val_loader_fold.dataset) / opt.val_batch_size)}"
                         )
+
                         x_wsi = [x.to(device) for x in x_wsi]
+
                         x_omic = x_omic.to(device)
 
                         days_to_event = days_to_event.to(device)
                         event_occurred = event_occurred.to(device)
                         print("Days to event: ", days_to_event)
                         print("event occurred: ", event_occurred)
-                        outputs = model(
+                        outputs, wsi_embedding, omic_embedding = model(
                             opt,
                             tcga_id,
                             x_wsi=x_wsi,  # list of tensors (one for each tile)
                             x_omic=x_omic,
                         )
-                        loss = cox_loss(
+                        loss = joint_loss(
                             outputs.squeeze(),
                             # predictions are not survival outcomes, rather log-risk scores beta*X
                             days_to_event,
                             event_occurred,
+                            wsi_embedding,
+                            omic_embedding,
                         )  # Cox partial likelihood loss for survival outcome prediction
                         print("\n loss (validation): ", loss.data.item())
                         val_loss_epoch += loss.data.item() * len(tcga_id)
@@ -1327,6 +1295,23 @@ def train_nn(opt, h5_file, device, plot_distributions=True):
                         all_events_np.astype(bool), all_times_np, all_predictions_np
                     )
                     print(f"Validation loss: {val_loss}, CI: {c_index[0]}")
+
+                    # Calculate cosine similarity every 5 epochs
+                    # if (epoch + 1) % 5 == 0 and epoch > 0:
+                    # if epoch > -1:
+                    #     cosine_metrics, plot_path = analyze_combined_embeddings(
+                    #         all_embeddings,
+                    #         all_predictions,
+                    #         num_bins=2,
+                    #         epoch=epoch,
+                    #         fold_idx=fold_idx,
+                    #         checkpoint_dir=checkpoint_dir,
+                    #     )
+
+                    #     wandb.log(
+                    #         {f"UMAP Plot": wandb.Image(plot_path)}, step=step_counter
+                    #     )
+                    #     wandb.log(cosine_metrics, step=step_counter)
 
                     end_val_time = time.time()
                     val_duration = end_val_time - start_val_time
@@ -1399,7 +1384,10 @@ def train_nn(opt, h5_file, device, plot_distributions=True):
                             "epoch": epoch,
                         }
                     # Log all metrics
-                    wandb.log(epoch_metrics)
+                    wandb.log(epoch_metrics, step=step_counter)
+
+                    # increment step counter
+                    step_counter += 1
 
         torch.cuda.empty_cache()
         gc.collect()
@@ -1431,7 +1419,14 @@ def denormalize_image(image, mean, std):
     return image
 
 
-def plot_saliency_maps(saliencies, x_wsi, tcga_id, patch_id, output_dir):
+def plot_saliency_maps(
+    saliencies,
+    x_wsi,
+    tcga_id,
+    patch_id,
+    output_dir,
+    threshold=0.8,
+):
     # get the first image and saliency map
     saliency = saliencies[0].squeeze().cpu().numpy()
     # image = x_wsi[0].squeeze().permute(1, 2, 0).cpu().numpy()  # convert image to HxWxC and move to cpu
@@ -1453,8 +1448,8 @@ def plot_saliency_maps(saliencies, x_wsi, tcga_id, patch_id, output_dir):
     # overlay saliency map on the image
     ax = plt.subplot(1, 3, 2)
     img = ax.imshow(image)
-    saliency_overlay = ax.imshow(saliency, cmap="hot", alpha=0.5)
-    # saliency_overlay = ax.imshow(np.clip(saliency, 0.8, 1), cmap='hot', alpha=0.5)
+    # saliency_overlay = ax.imshow(saliency, cmap="hot", alpha=0.5)
+    saliency_overlay = ax.imshow(np.clip(saliency, threshold, 1), cmap="hot", alpha=0.5)
     cbar = plt.colorbar(saliency_overlay, ax=ax)
     cbar.set_label("saliency value", rotation=270, labelpad=15)
 
@@ -1473,6 +1468,98 @@ def plot_saliency_maps(saliencies, x_wsi, tcga_id, patch_id, output_dir):
     print(f"saved saliency overlay to {save_path}")
 
     plt.close()
+
+
+def plot_enhanced_saliency_maps(
+    saliencies,
+    x_wsi,
+    tcga_id,
+    patch_id,
+    output_dir,
+    threshold_percentile=80,
+    save_clean_maps=True,
+):
+    """
+    Enhanced saliency map plotting with artifact removal and thresholding
+
+    Args:
+        threshold_percentile: Percentile threshold for keeping high-saliency regions (80-90 recommended)
+        save_clean_maps: Whether to save cleaned saliency maps
+    """
+    # Get the first image and saliency map
+    saliency = saliencies[0].squeeze().cpu().numpy()
+    image = x_wsi[0].squeeze().permute(1, 2, 0).detach().cpu().numpy()
+
+    # Denormalize the image
+    mean = [0.70322989, 0.53606487, 0.66096631]
+    std = [0.21716536, 0.26081574, 0.20723464]
+    image = denormalize_image(image, mean, std)
+
+    # Normalize the saliency map to [0, 1]
+    saliency_normalized = (saliency - saliency.min()) / (
+        saliency.max() - saliency.min()
+    )
+
+    # Calculate threshold based on percentile
+    threshold_value = np.percentile(saliency_normalized, threshold_percentile)
+
+    # Create cleaned saliency map (remove artifacts below threshold)
+    saliency_clean = saliency_normalized.copy()
+    saliency_clean[saliency_clean < threshold_value] = 0
+
+    # Create binary mask for high-importance regions
+    high_importance_mask = saliency_normalized >= threshold_value
+
+    plt.figure(figsize=(24, 8))
+
+    # Original image
+    plt.subplot(1, 4, 1)
+    plt.imshow(image)
+    plt.title("Original Patch")
+    plt.axis("off")
+
+    # Original saliency overlay
+    plt.subplot(1, 4, 2)
+    plt.imshow(image)
+    plt.imshow(saliency_normalized, cmap="hot", alpha=0.5)
+    plt.title("Original Saliency Map")
+    plt.axis("off")
+
+    # Cleaned saliency overlay (artifacts removed)
+    plt.subplot(1, 4, 3)
+    plt.imshow(image)
+    plt.imshow(saliency_clean, cmap="hot", alpha=0.6)
+    plt.title(f"Cleaned Saliency (>{threshold_percentile}th percentile)")
+    plt.axis("off")
+
+    # High-importance regions only
+    plt.subplot(1, 4, 4)
+    plt.imshow(image)
+    # Only show regions above threshold
+    masked_saliency = np.ma.masked_where(~high_importance_mask, saliency_clean)
+    plt.imshow(masked_saliency, cmap="hot", alpha=0.8)
+    plt.title("High-Importance Regions Only")
+    plt.axis("off")
+
+    # Save the enhanced plot
+    save_path = os.path.join(
+        output_dir, f"enhanced_saliency_{tcga_id[0]}_{patch_id}.png"
+    )
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+    if save_clean_maps:
+        # Save cleaned saliency map as numpy array for later use
+        clean_map_path = os.path.join(
+            output_dir, f"clean_saliency_{tcga_id[0]}_{patch_id}.npy"
+        )
+        np.save(clean_map_path, saliency_clean)
+
+    # Return whether this tile has high-importance regions
+    has_important_regions = np.any(high_importance_mask)
+    importance_ratio = np.sum(high_importance_mask) / high_importance_mask.size
+
+    return has_important_regions, importance_ratio, threshold_value
 
 
 def calc_integrated_gradients(
@@ -1531,11 +1618,15 @@ def test_and_interpret(opt, model, test_loader, device, baseline=None):
     all_times = []
     all_events = []
 
-    # create the directory to save saliency maps if it doesn't exist
-    output_dir = "./saliency_maps_6sep"
-    os.makedirs(output_dir, exist_ok=True)
+    # base directory
+    import os
 
-    output_dir_IG = "./IG_6sep"
+    base_path = Path(opt.output_base_dir)
+    # create the directory to save saliency maps if it doesn't exist
+    output_dir_saliency = str(base_path / "saliency_maps_6sep")
+    os.makedirs(output_dir_saliency, exist_ok=True)
+
+    output_dir_IG = str(base_path / "IG_6sep")
     os.makedirs(output_dir_IG, exist_ok=True)
 
     # for training, only the last transformer block (block 11) in the WSI encoder was kept trainable
@@ -1576,7 +1667,7 @@ def test_and_interpret(opt, model, test_loader, device, baseline=None):
             print("event occurred: ", event_occurred)
 
             if opt.calc_saliency_maps is False:
-                outputs = model(
+                outputs, wsi_embedding, omic_embedding = model(
                     opt,
                     tcga_id,
                     x_wsi=x_wsi,  # list of tensors (one for each tile)
@@ -1586,7 +1677,7 @@ def test_and_interpret(opt, model, test_loader, device, baseline=None):
             if opt.calc_saliency_maps is True:
                 # perform the forward pass without torch.no_grad() to allow gradient computation
                 with torch.enable_grad():
-                    outputs = model(
+                    outputs, wsi_embedding, omic_embedding = model(
                         opt,
                         tcga_id,
                         x_wsi=x_wsi,  # list of tensors (one for each tile)
@@ -1627,7 +1718,7 @@ def test_and_interpret(opt, model, test_loader, device, baseline=None):
                             saliency, _ = torch.max(image.grad.data.abs(), dim=1)
                             # saliencies.append(saliency)
                             plot_saliency_maps(
-                                saliency, image, tcga_id, patch_idx, output_dir
+                                saliency, image, tcga_id, patch_idx, output_dir_saliency
                             )
                             del saliency
                         else:
@@ -1721,136 +1812,819 @@ def test_and_interpret(opt, model, test_loader, device, baseline=None):
     plt.xlabel("Time (days)")
     plt.ylabel("Survival probability")
     plt.legend()
-    plt.savefig("km_plot_joint_fusion.png", format="png", dpi=300)
+    output_path = str(Path(opt.output_base_dir) / "km_plot_joint_fusion.png")
+    plt.savefig(output_path, format="png", dpi=300)
 
     return None
 
 
-def load_model_state_dict(model, checkpoint_path):
+def evaluate_test_set(model, test_loader, device, opt, excluded_ids=None):
     """
-    Load model state dict, handling DataParallel prefix issues
+    Shared function for test set evaluation
     """
-    from collections import OrderedDict
+    if excluded_ids is None:
+        excluded_ids = ["TCGA-05-4395", "TCGA-86-8281"]
 
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    state_dict = checkpoint["model_state_dict"]
-
-    # Get model's expected keys
-    model_keys = set(model.state_dict().keys())
-    checkpoint_keys = set(state_dict.keys())
-
-    # Check if we need to add or remove 'module.' prefix
-    if len(model_keys & checkpoint_keys) == 0:  # No matching keys
-        if any(k.startswith("module.") for k in checkpoint_keys):
-            # Remove 'module.' prefix
-            new_state_dict = OrderedDict()
-            for k, v in state_dict.items():
-                name = k[7:] if k.startswith("module.") else k
-                new_state_dict[name] = v
-            state_dict = new_state_dict
-        else:
-            # Add 'module.' prefix
-            new_state_dict = OrderedDict()
-            for k, v in state_dict.items():
-                new_state_dict[f"module.{k}"] = v
-            state_dict = new_state_dict
-
-    model.load_state_dict(state_dict)
-    return model
-
-
-def setup_model_and_device(opt):
-    """Setup model and device configuration"""
-
-    # Parse GPU IDs
-    if opt.gpu_ids == "-1":
-        device = torch.device("cpu")
-        gpu_ids = []
-        print("Using CPU")
+    # Extract the base model from DataParallel wrapper if it exists
+    if isinstance(model, nn.DataParallel):
+        test_model = model.module
+        print("Removed DataParallel wrapper for testing")
     else:
-        gpu_ids = [int(x) for x in opt.gpu_ids.split(",") if x.strip()]
-        if not gpu_ids:
-            gpu_ids = [0]
+        test_model = model
 
-        # Check if requested GPUs are available
-        available_gpus = torch.cuda.device_count()
-        gpu_ids = [gpu_id for gpu_id in gpu_ids if gpu_id < available_gpus]
+    # Move to single GPU and ensure it's in eval mode
+    test_model = test_model.to(device)
+    test_model.eval()
 
-        if not gpu_ids:
-            device = torch.device("cpu")
-            print("No valid GPUs found, falling back to CPU")
-        else:
-            device = torch.device(f"cuda:{gpu_ids[0]}")
-            print(f"Available GPUs: {available_gpus}")
-            print(f"Using GPUs: {gpu_ids}")
+    test_predictions = []
+    test_times = []
+    test_events = []
 
-    return device, gpu_ids
+    with torch.no_grad():
+        for batch_idx, (
+            tcga_id,
+            days_to_event,
+            event_occurred,
+            x_wsi,
+            x_omic,
+        ) in enumerate(test_loader):
+            if tcga_id[0] in excluded_ids:
+                print(f"Skipping TCGA ID: {tcga_id}")
+                continue
 
+            x_wsi = [x.to(device) for x in x_wsi]
+            x_omic = x_omic.to(device)
+            days_to_event = days_to_event.to(device)
+            event_occurred = event_occurred.to(device)
 
-def load_model_with_multi_gpu_support(opt, device, gpu_ids):
-    """Load model with proper multi-GPU support"""
+            print(f"Batch size: {len(test_loader.dataset)}")
+            print(
+                f"Test Batch index: {batch_idx + 1} out of {np.ceil(len(test_loader.dataset) / opt.test_batch_size)}"
+            )
+            print("TCGA ID: ", tcga_id)
+            print("Days to event: ", days_to_event)
+            print("event occurred: ", event_occurred)
 
-    # Create base model
-    model = MultimodalNetwork(
-        embedding_dim_wsi=opt.embedding_dim_wsi,
-        embedding_dim_omic=opt.embedding_dim_omic,
-        mode=opt.input_mode,
-        fusion_type=opt.fusion_type,
+            outputs, _, _ = test_model(opt, tcga_id, x_wsi=x_wsi, x_omic=x_omic)
+
+            # Collect results consistently
+            test_predictions.append(outputs.squeeze().detach().cpu().numpy())
+            test_times.append(days_to_event.cpu().numpy())
+            test_events.append(event_occurred.cpu().numpy())
+
+    # Process results consistently
+    all_predictions_np = [np.asarray(pred).flatten()[0] for pred in test_predictions]
+    all_events_np = np.concatenate(test_events)
+    all_times_np = np.concatenate(test_times)
+    test_event_rate = all_events_np.mean()
+
+    # Safe CI calculation
+    try:
+        test_ci = concordance_index_censored(
+            all_events_np.astype(bool), all_times_np, all_predictions_np
+        )[0]
+        print(f"Test CI: {test_ci}")
+    except Exception as e:
+        print(f"Could not calculate test CI: {e}")
+        test_ci = float("nan")
+
+    median_prediction = np.median(all_predictions_np)
+    high_risk_idx = all_predictions_np >= median_prediction
+    low_risk_idx = all_predictions_np < median_prediction
+
+    # separate the times and events into high and low-risk groups
+    high_risk_times = all_times_np[high_risk_idx]
+    high_risk_events = all_events_np[high_risk_idx]
+    low_risk_times = all_times_np[low_risk_idx]
+    low_risk_events = all_events_np[low_risk_idx]
+
+    # initialize the Kaplan-Meier fitter
+    kmf_high_risk = KaplanMeierFitter()
+    kmf_low_risk = KaplanMeierFitter()
+
+    # fit
+    kmf_high_risk.fit(
+        high_risk_times, event_observed=high_risk_events, label="High Risk"
+    )
+    kmf_low_risk.fit(low_risk_times, event_observed=low_risk_events, label="Low Risk")
+
+    # perform the log-rank test
+    log_rank_results = logrank_test(
+        high_risk_times,
+        low_risk_times,
+        event_observed_A=high_risk_events,
+        event_observed_B=low_risk_events,
     )
 
-    # Load checkpoint
-    print(f"Loading model from: {opt.model_path}")
-    checkpoint = torch.load(opt.model_path, map_location="cpu")
-    state_dict = checkpoint["model_state_dict"]
+    p_value = log_rank_results.p_value
+    print(f"Log-Rank Test p-value: {p_value}")
+    print(f"Log-Rank Test statistic: {log_rank_results.test_statistic}")
+    return test_ci, test_event_rate, log_rank_results.test_statistic, p_value
 
-    # Determine if the saved model was using DataParallel
-    has_module_prefix = any(k.startswith("module.") for k in state_dict.keys())
-    use_multi_gpu = len(gpu_ids) > 1 and opt.use_multi_gpu
 
-    print(f"Saved model has 'module.' prefix: {has_module_prefix}")
-    print(f"Will use multi-GPU: {use_multi_gpu}")
+def train_and_test(opt, h5_file, device):
 
-    # Handle state dict prefix conversion
-    from collections import OrderedDict
+    from pathlib import Path
+    from dotenv import load_dotenv
 
-    if has_module_prefix and not use_multi_gpu:
-        # Remove 'module.' prefix - saved with DataParallel, loading without
-        print("Removing 'module.' prefix from state dict")
-        new_state_dict = OrderedDict()
-        for k, v in state_dict.items():
-            name = k[7:] if k.startswith("module.") else k
-            new_state_dict[name] = v
-        state_dict = new_state_dict
+    env_path: Path = Path.cwd() / ".env"
 
-    elif not has_module_prefix and use_multi_gpu:
-        # Add 'module.' prefix - saved without DataParallel, loading with
-        print("Adding 'module.' prefix to state dict")
-        new_state_dict = OrderedDict()
-        for k, v in state_dict.items():
-            new_state_dict[f"module.{k}"] = v
-        state_dict = new_state_dict
+    load_dotenv(env_path)
 
-    # Move model to device first
-    model.to(device)
+    project = os.getenv("WANDB_PROJECT")
+    entity = os.getenv("WANDB_ENTITY")
 
-    # Apply DataParallel if using multiple GPUs
-    if use_multi_gpu:
-        print(f"Wrapping model with DataParallel on GPUs: {gpu_ids}")
-        model = nn.DataParallel(model, device_ids=gpu_ids)
-        # Set the primary GPU
-        torch.cuda.set_device(gpu_ids[0])
+    wandb.init(
+        project=project,
+        entity=entity,
+        config={
+            "num_folds": opt.n_folds,
+            "num_epochs": opt.num_epochs,
+            "batch_size": opt.batch_size,
+            "val_batch_size": opt.val_batch_size,
+            "test_batch_size": opt.test_batch_size,
+            "lr": opt.lr,
+            "mlp_layers": opt.mlp_layers,
+            "dropout": opt.dropout,
+            "fusion_type": opt.fusion_type,
+            "joint_embedding": opt.joint_embedding,
+            "embedding_dim_wsi": opt.embedding_dim_wsi,
+            "embedding_dim_omic": opt.embedding_dim_omic,
+            "input_mode": opt.input_mode,
+            "stratified_cv": True,
+            "use_pretrained_omic": opt.use_pretrained_omic,
+            "omic_checkpoint_path": (
+                opt.omic_checkpoint_path if opt.use_pretrained_omic else None
+            ),
+        },
+    )
 
-    # Load the state dict
-    model.load_state_dict(state_dict)
-    print("Model loaded successfully")
+    if opt.scheduler == "cosine_warmer":
 
-    return model
+        wandb.config.update(
+            {
+                "scheduler": opt.scheduler,
+                "scheduler_params": {
+                    "t_0": opt.t_0,
+                    "t_mult": opt.t_mult,
+                    "eta_min": opt.eta_min,
+                },
+            },
+        )
+
+    elif opt.scheduler == "exponential":
+
+        wandb.config.update(
+            {
+                "scheduler": opt.scheduler,
+                "scheduler_params": {
+                    "exp_gamma": opt.exp_gamma,
+                },
+            },
+        )
+    elif opt.scheduler == "step_lr":
+
+        wandb.config.update(
+            {
+                "scheduler": opt.scheduler,
+                "scheduler_params": {"exp_gamma": opt.exp_gamma, "step": opt.lr_step},
+            }
+        )
+    current_time = datetime.now()
+
+    # If user provided timestamp then use for consistency
+    if opt.timestamp:
+
+        checkpoint_dir = "checkpoints/checkpoint_" + opt.timestamp
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+    else:
+
+        checkpoint_dir = "checkpoints/checkpoint_" + current_time.strftime(
+            "%Y-%m-%d-%H-%M-%S"
+        )
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+    train_loader, validation_loader, test_loader = create_data_loaders(opt, h5_file)
+
+    validation_dataset = validation_loader.dataset
+    test_dataset = test_loader.dataset
+
+    # create a combined loader (validation + test) as the validation data hasn't been used for HPO during training
+    test_dataset = ConcatDataset([validation_dataset, test_dataset])
+    test_loader = torch.utils.data.DataLoader(
+        dataset=test_dataset,
+        batch_size=opt.test_batch_size,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=True,
+    )
+
+    dataset = (
+        train_loader.dataset
+    )  # use only the training dataset for CV during training [both the validation and test splits can be used for testing]
+
+    total_samples = len(dataset)
+    print(f"total training data size: {total_samples} samples")
+
+    # Extract survival data for stratification
+    print("Extracting survival data for startified CV...")
+    times, events = extract_survival_data(dataset)
+
+    print(f"Survival data summary:")
+    print(f"  - Total samples: {len(times)}")
+    print(f"  - Events: {events.sum()} ({events.mean():.1%})")
+    print(f"  - Censored: {len(events) - events.sum()} ({1 - events.mean():.1%})")
+    print(f"  - Median survival time: {np.median(times):.1f} days")
+    print(f"  - Time range: {times.min():.1f} - {times.max():.1f} days")
+
+    try:
+        folds = create_stratified_survival_folds(
+            times=times,
+            events=events,
+            n_splits=opt.n_folds,
+            n_time_bins=10,
+        )
+        print(f"Successfully created {len(folds)} stratified folds")
+
+    except Exception as e:
+        print(f"Error creating stratified folds: {e}")
+        # Fallback to regular k-fold if stratified fails
+        from sklearn.model_selection import KFold
+
+        kf = KFold(n_splits=opt.n_folds, shuffle=True, random_state=6)
+        folds = list(kf.split(np.arange(len(dataset))))
+        print("Falling back to regular K-Fold CV")
+
+    num_folds = opt.n_folds
+    num_epochs = opt.num_epochs
+
+    # Obtain Validation CI and Loss avg at each epoch
+    ci_average_by_epoch = np.zeros(opt.num_epochs, dtype=np.float32)
+    loss_average_by_epoch = np.zeros(opt.num_epochs, dtype=np.float32)
+
+    # need to keep fold index at 0 for the sake of the averaging by epoch
+    if opt.use_mixed_precision:
+        amp_scaler = GradScaler()
+        print("Using mixed precision training with StandardScaler")
+
+    # Step counter for wandb
+    step_counter = 0
+    # Main fold iteration loop
+    for fold_idx, (train_idx, val_idx) in enumerate(folds):
+        print(f"\n{'='*60}")
+        print(f"FOLD {fold_idx + 1}/{len(folds)}")
+        print(f"{'='*60}")
+
+        # Print fold statistics
+        print(f"Training samples: {len(train_idx)}")
+        print(f"Validation samples: {len(val_idx)}")
+
+        # Extract survival data for this fold to verify stratification
+        times_train_fold = times[train_idx]
+        events_train_fold = events[train_idx]
+        times_val_fold = times[val_idx]
+        events_val_fold = events[val_idx]
+
+        train_event_rate = events_train_fold.mean()
+        val_event_rate = events_val_fold.mean()
+
+        print(f"Train event rate: {train_event_rate:.3f}")
+        print(f"Validation event rate: {val_event_rate:.3f}")
+        print(f"Train median time: {np.median(times_train_fold):.1f} days")
+        print(f"Validation median time: {np.median(times_val_fold):.1f} days")
+
+        print_gpu_memory_usage()  # Monitor memory at start of each fold
+
+        # Create subsets for this fold
+        train_subset = Subset(dataset, train_idx)
+        val_subset = Subset(dataset, val_idx)
+
+        # Create data loaders for this fold
+        train_loader_fold = DataLoader(
+            train_subset,
+            batch_size=opt.batch_size,
+            collate_fn=mixed_collate,
+            num_workers=4,
+            pin_memory=True,
+            shuffle=True,
+            drop_last=True,
+        )
+        val_loader_fold = DataLoader(
+            val_subset,
+            collate_fn=mixed_collate,
+            batch_size=opt.val_batch_size,
+            shuffle=False,
+            num_workers=4,
+            pin_memory=True,
+        )
+
+        # Compute number of batches per epoch
+        num_batches_per_epoch = len(train_loader_fold)
+        print(
+            f"Number of batches per epoch for fold {fold_idx + 1}: {num_batches_per_epoch}"
+        )
+
+        # Update wandb config
+        wandb.config.update(
+            {f"num_batches_per_epoch_fold_{fold_idx}": num_batches_per_epoch},
+            allow_val_change=True,
+        )
+
+        model = MultimodalNetwork(
+            embedding_dim_wsi=opt.embedding_dim_wsi,
+            embedding_dim_omic=opt.embedding_dim_omic,
+            mode=opt.input_mode,
+            fusion_type=opt.fusion_type,
+            joint_embedding_type=opt.joint_embedding,
+            mlp_layers=opt.mlp_layers,
+            dropout=opt.dropout,
+        )
+
+        if torch.cuda.device_count() > 1:
+            print(f"Using {torch.cuda.device_count()} GPUs")
+            model = nn.DataParallel(model)
+            torch.cuda.set_device(0)
+
+        model.to(device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=opt.lr, weight_decay=1e-4)
+        if opt.scheduler == "exponential":
+            scheduler = torch.optim.lr_scheduler.ExponentialLR(
+                optimizer, gamma=opt.exp_gamma
+            )
+        elif opt.scheduler == "cosine_warmer":
+            scheduler = CosineAnnealingWarmRestartsDecay(
+                optimizer,
+                T_0=opt.t_0,
+                T_mult=opt.t_mult,
+                eta_min=opt.eta_min,
+                decay_factor=opt.decay_factor,
+            )
+
+        elif opt.scheduler == "step_lr":
+            scheduler = torch.optim.lr_scheduler.StepLR(
+                optimizer, step_size=opt.step_lr_step, gamma=opt.step_lr_gamma
+            )
+        else:
+            from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+
+            scheduler = CosineAnnealingWarmRestarts(
+                optimizer, T_0=10, T_mult=2, eta_min=1e-6
+            )
+
+        joint_loss = JointLoss()
+
+        # Initialize and fit the scaler for this fold
+        print(f"Fitting scaler for fold {fold_idx + 1}...")
+        scaler = StandardScaler()
+        for batch_idx, (tcga_id, _, _, _, x_omic) in enumerate(train_loader_fold):
+            if batch_idx % 10 == 0:  # Print progress every 10 batches
+                print(f"  Fitting batch {batch_idx + 1}/{len(train_loader_fold)}")
+            x_omic_np = x_omic.cpu().numpy()
+            scaler.partial_fit(x_omic_np)
+
+        # Save the scaler for the current fold
+        scaler_path = os.path.join(checkpoint_dir, f"scaler_fold_{fold_idx}.save")
+        joblib.dump(scaler, scaler_path)
+        print(f"Scaler saved for fold {fold_idx + 1} at {scaler_path}")
+
+        # EPOCH TRAINING LOOP for this fold
+        for epoch in range(opt.num_epochs):
+            print(
+                f"\n--- Fold {fold_idx + 1}/{len(folds)}, Epoch {epoch + 1}/{opt.num_epochs} ---"
+            )
+            start_train_time = time.time()
+            model.train()
+
+            loss_epoch = 0
+
+            # Add debug info for first batch
+            print(f"Starting epoch {epoch}, about to iterate over training batches...")
+            print(f"Training loader has {len(train_loader_fold)} batches")
+            # log the learning rate at the start of the epoch
+            current_lr = optimizer.param_groups[0]["lr"]
+
+            # model training in batches for the train dataloader for the current fold
+            for batch_idx, (
+                tcga_id,
+                days_to_event,
+                event_occurred,
+                x_wsi,
+                x_omic,
+            ) in enumerate(train_loader_fold):
+                # x_wsi is a list of tensors (one tensor for each tile)
+                print(
+                    f"Total training samples in fold: {len(train_loader_fold.dataset)}"
+                )
+                print(f"Batch size: {opt.batch_size}")
+                print(f"Batch index: {batch_idx} out of {num_batches_per_epoch}")
+
+                # NOTE: Do not apply standard scaler to omic data
+                # x_wsi = [
+                #     [tile.to(device) for tile in patient_tiles]
+                #     for patient_tiles in x_wsi
+                # ]
+                x_wsi = [x.to(device) for x in x_wsi]
+                x_omic = x_omic.to(device)
+
+                print(f"After scaling - x_omic shape: {x_omic.shape}")
+                days_to_event = days_to_event.to(device)
+                event_occurred = event_occurred.to(device)
+
+                print("Days to event: ", days_to_event)
+                print("event occurred: ", event_occurred)
+
+                optimizer.zero_grad()
+
+                if opt.use_mixed_precision:
+                    with autocast():  # should wrap only the forward pass including the loss calculation
+                        predictions, wsi_embedding, omic_embedding = model(
+                            opt,
+                            tcga_id,
+                            x_wsi=x_wsi,
+                            x_omic=x_omic,  # Now properly scaled
+                        )
+
+                        # print(f"Model predictions shape: {predictions.shape}")
+                        loss = joint_loss(
+                            predictions.squeeze(),
+                            days_to_event,
+                            event_occurred,
+                            wsi_embedding,
+                            omic_embedding,
+                        )
+                        print("\n loss (train, mixed precision): ", loss.data.item())
+                        loss_epoch += loss.data.item()
+
+                    # Mixed precision backward pass
+                    amp_scaler.scale(loss).backward()
+                    amp_scaler.step(optimizer)
+                    amp_scaler.update()
+                else:
+                    print(" Not using mixed precision")
+                    # model for survival outcome (uses Cox PH partial log likelihood as the loss function)
+                    # the model output should be considered as beta*X to be used in the Cox loss function
+
+                    start_time = time.time()
+
+                    predictions, wsi_embedding, omic_embedding = model(
+                        opt,
+                        tcga_id,
+                        x_wsi=x_wsi,  # list of tensors (one for each tile)
+                        x_omic=x_omic,
+                    )
+                    # print(f"predictions: {predictions} from train_test.py")
+                    step1_time = time.time()
+                    loss = joint_loss(
+                        predictions.squeeze(),
+                        # predictions are not survival outcomes, rather log-risk scores beta*X
+                        days_to_event,
+                        event_occurred,
+                        wsi_embedding,
+                        omic_embedding,
+                    )  # Cox partial likelihood loss for survival outcome prediction
+                    print("\n loss (train): ", loss.data.item())
+                    step2_time = time.time()
+                    loss_epoch += (
+                        loss.data.item()
+                    )  # * len(tcga_id)  # multiplying loss by batch size for accurate epoch averaging
+                    # backpropagate loss through the entire model arch upto the inputs
+                    loss.backward(
+                        retain_graph=True if epoch == 0 and batch_idx == 0 else False
+                    )  # tensors retained to allow backpropagation for torchhviz (for visualizing the graph)
+                    optimizer.step()
+                    torch.cuda.empty_cache()
+
+                    step3_time = time.time()
+                    print(
+                        f"(in train_nn) Step 1: {step1_time - start_time:.4f}s, Step 2: {step2_time - step1_time:.4f}s, Step 3: {step3_time - step2_time:.4f}s"
+                    )
+
+            train_loss = loss_epoch / len(
+                train_loader_fold.dataset
+            )  # average training loss per sample for the epoch
+
+            scheduler.step()  # step scheduler after each epoch
+            print("\n train loss over epoch: ", train_loss)
+            end_train_time = time.time()
+            train_duration = end_train_time - start_train_time
+
+            # return here for profile
+            if opt.profile:
+                return model, optimizer
+            # check validation for all epochs >= 0
+            if epoch >= 0:
+
+                # save model once every 5 epochs
+                if (epoch + 1) % 5 == 0 and epoch > 0:
+                    checkpoint_path = os.path.join(
+                        checkpoint_dir, f"checkpoint_fold_{fold_idx}_epoch_{epoch}.pth"
+                    )
+                    torch.save(
+                        {
+                            "epoch": epoch,
+                            "fold": fold_idx,
+                            "model_state_dict": model.state_dict(),
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "scheduler_state_dict": scheduler.state_dict(),
+                        },
+                        checkpoint_path,
+                    )
+                    print(
+                        f"Checkpoint saved at epoch {epoch}, fold {fold_idx}, to {checkpoint_path}"
+                    )
+
+                # before validation to get the dynamic weights, but only if the mode is "wsi_omic"
+
+                start_val_time = time.time()
+
+                # get predictions on the validation dataset
+                model.eval()
+                val_loss_epoch = 0.0
+                val_loss = 0.0
+                val_ci = 0.0
+                val_event_rate = 0.0
+                val_duration = 0.0
+
+                val_predictions = []
+                val_times = []
+                val_events = []
+
+                test_ci = 0.0
+                test_predictions = []
+                test_times = []
+                test_events = []
+
+                with torch.no_grad():  # inference on the validation data
+                    for batch_idx, (
+                        tcga_id,
+                        days_to_event,
+                        event_occurred,
+                        x_wsi,
+                        x_omic,
+                    ) in enumerate(val_loader_fold):
+                        # x_wsi is a list of tensors (one tensor for each tile)
+                        print(f"Batch size: {len(val_loader_fold.dataset)}")
+                        print(
+                            f"Validation Batch index: {batch_idx + 1} out of {np.ceil(len(val_loader_fold.dataset) / opt.val_batch_size)}"
+                        )
+                        # x_wsi = [
+                        #     [tile.to(device) for tile in patient_tiles]
+                        #     for patient_tiles in x_wsi
+                        # ]
+                        x_wsi = [x.to(device) for x in x_wsi]
+                        x_omic = x_omic.to(device)
+
+                        days_to_event = days_to_event.to(device)
+                        event_occurred = event_occurred.to(device)
+                        print("Days to event: ", days_to_event)
+                        print("event occurred: ", event_occurred)
+                        outputs, wsi_embedding, omic_embedding = model(
+                            opt,
+                            tcga_id,
+                            x_wsi=x_wsi,  # list of tensors (one for each tile)
+                            x_omic=x_omic,
+                        )
+                        loss = joint_loss(
+                            outputs.squeeze(),
+                            # predictions are not survival outcomes, rather log-risk scores beta*X
+                            days_to_event,
+                            event_occurred,
+                            wsi_embedding,
+                            omic_embedding,
+                        )  # Cox partial likelihood loss for survival outcome prediction
+                        print("\n loss (validation): ", loss.data.item())
+                        val_loss_epoch += loss.data.item() * len(tcga_id)
+                        val_predictions.append(outputs.squeeze())
+                        val_times.append(days_to_event)
+                        val_events.append(event_occurred)
+
+                    val_loss = val_loss_epoch / len(val_loader_fold.dataset)
+
+                    val_predictions = torch.cat(val_predictions)
+                    val_times = torch.cat(val_times)
+                    val_events = torch.cat(val_events)
+
+                    # convert to numpy arrays for CI calculation
+                    val_predictions_np = val_predictions.cpu().numpy()
+                    val_times_np = val_times.cpu().numpy()
+                    val_events_np = val_events.cpu().numpy()
+                    val_event_rate = val_events_np.mean()
+
+                    val_ci = concordance_index_censored(
+                        val_events_np.astype(bool), val_times_np, val_predictions_np
+                    )[0]
+                    print(f"Validation loss: {val_loss}, CI: {val_ci}")
+
+                    end_val_time = time.time()
+                    val_duration = end_val_time - start_val_time
+
+                test_ci, test_event_rate, test_statistic, p_value = evaluate_test_set(
+                    model, test_loader, device, opt
+                )
+
+                mode = (
+                    model.module.mode
+                    if isinstance(model, nn.DataParallel)
+                    else model.mode
+                )
+                actual_model = model.module if hasattr(model, "module") else model
+                if mode == "wsi_omic":
+                    wsi_weight_val = (
+                        actual_model.wsi_weight.item()
+                        if isinstance(actual_model.wsi_weight, torch.Tensor)
+                        else actual_model.wsi_weight
+                    )
+                    omic_weight_val = (
+                        actual_model.omic_weight.item()
+                        if isinstance(actual_model.omic_weight, torch.Tensor)
+                        else actual_model.omic_weight
+                    )
+                    epoch_metrics = {
+                        # Losses
+                        "Loss/train_epoch": train_loss,
+                        "Loss/val_epoch": val_loss,
+                        # Performance metrics
+                        "CI/validation": val_ci,
+                        "CI/test": test_ci,
+                        "pvalue/test": p_value,
+                        "test_statistic/test": test_statistic,
+                        "Event_rate/validation": val_event_rate,
+                        "Event_rate/test": test_event_rate,
+                        # Time tracking
+                        "Time/train_epoch": train_duration,
+                        "Time/val_epoch": val_duration,
+                        "Time/total_epoch": train_duration + val_duration,
+                        # Learning rate
+                        "LR": optimizer.param_groups[0]["lr"],
+                        # Metadata
+                        "fold": fold_idx,
+                        "epoch": epoch,
+                        "wsi_weight": wsi_weight_val,
+                        "omic_weight": omic_weight_val,
+                    }
+                else:
+                    epoch_metrics = {
+                        # Losses
+                        "Loss/train_epoch": train_loss,
+                        "Loss/val_epoch": val_loss,
+                        # Performance metrics
+                        "CI/validation": val_ci,
+                        "CI/test": test_ci,
+                        "Event_rate/validation": val_event_rate,
+                        "Event_rate/test": test_event_rate,
+                        # Time tracking
+                        "Time/train_epoch": train_duration,
+                        "Time/val_epoch": val_duration,
+                        "Time/total_epoch": train_duration + val_duration,
+                        # Learning rate
+                        "LR": optimizer.param_groups[0]["lr"],
+                        # Metadata
+                        "fold": fold_idx,
+                        "epoch": epoch,
+                    }
+                # Log all metrics
+                wandb.log(epoch_metrics, step=step_counter)
+
+                # increment step counter
+                step_counter += 1
+
+        torch.cuda.empty_cache()
+        gc.collect()
+        print(
+            f"Memory cleared after fold {fold_idx} - model will be recreated for next fold"
+        )
+
+    wandb.finish()
+    return model, optimizer
 
 
 if __name__ == "__main__":
     # for inference
     import argparse
     import pandas as pd
+    from pathlib import Path
+
+    def load_model_state_dict(model, checkpoint_path):
+        """
+        Load model state dict, handling DataParallel prefix issues
+        """
+        from collections import OrderedDict
+
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        state_dict = checkpoint["model_state_dict"]
+
+        # Get model's expected keys
+        model_keys = set(model.state_dict().keys())
+        checkpoint_keys = set(state_dict.keys())
+
+        # Check if we need to add or remove 'module.' prefix
+        if len(model_keys & checkpoint_keys) == 0:  # No matching keys
+            if any(k.startswith("module.") for k in checkpoint_keys):
+                # Remove 'module.' prefix
+                new_state_dict = OrderedDict()
+                for k, v in state_dict.items():
+                    name = k[7:] if k.startswith("module.") else k
+                    new_state_dict[name] = v
+                state_dict = new_state_dict
+            else:
+                # Add 'module.' prefix
+                new_state_dict = OrderedDict()
+                for k, v in state_dict.items():
+                    new_state_dict[f"module.{k}"] = v
+                state_dict = new_state_dict
+
+        model.load_state_dict(state_dict)
+        return model
+
+    def setup_model_and_device(opt):
+        """Setup model and device configuration"""
+
+        # Parse GPU IDs
+        if opt.gpu_ids == "-1":
+            device = torch.device("cpu")
+            gpu_ids = []
+            print("Using CPU")
+        else:
+            gpu_ids = [int(x) for x in opt.gpu_ids.split(",") if x.strip()]
+            if not gpu_ids:
+                gpu_ids = [0]
+
+            # Check if requested GPUs are available
+            available_gpus = torch.cuda.device_count()
+            gpu_ids = [gpu_id for gpu_id in gpu_ids if gpu_id < available_gpus]
+
+            if not gpu_ids:
+                device = torch.device("cpu")
+                print("No valid GPUs found, falling back to CPU")
+            else:
+                device = torch.device(f"cuda:{gpu_ids[0]}")
+                print(f"Available GPUs: {available_gpus}")
+                print(f"Using GPUs: {gpu_ids}")
+
+        return device, gpu_ids
+
+    def load_model_with_multi_gpu_support(opt, device, gpu_ids):
+        """Load model with proper multi-GPU support"""
+
+        # Create base model
+        model = MultimodalNetwork(
+            embedding_dim_wsi=opt.embedding_dim_wsi,
+            embedding_dim_omic=opt.embedding_dim_omic,
+            mode=opt.input_mode,
+            fusion_type=opt.fusion_type,
+            joint_embedding_type=opt.joint_embedding,
+            mlp_layers=opt.mlp_layers,
+            dropout=opt.dropout,
+        )
+
+        # Load checkpoint
+        print(f"Loading model from: {opt.model_path}")
+        checkpoint = torch.load(opt.model_path, map_location="cpu")
+        state_dict = checkpoint["model_state_dict"]
+
+        # Determine if the saved model was using DataParallel
+        has_module_prefix = any(k.startswith("module.") for k in state_dict.keys())
+        use_multi_gpu = len(gpu_ids) > 1 and opt.use_multi_gpu
+
+        print(f"Saved model has 'module.' prefix: {has_module_prefix}")
+        print(f"Will use multi-GPU: {use_multi_gpu}")
+
+        # Handle state dict prefix conversion
+        from collections import OrderedDict
+
+        if has_module_prefix and not use_multi_gpu:
+            # Remove 'module.' prefix - saved with DataParallel, loading without
+            print("Removing 'module.' prefix from state dict")
+            new_state_dict = OrderedDict()
+            for k, v in state_dict.items():
+                name = k[7:] if k.startswith("module.") else k
+                new_state_dict[name] = v
+            state_dict = new_state_dict
+
+        elif not has_module_prefix and use_multi_gpu:
+            # Add 'module.' prefix - saved without DataParallel, loading with
+            print("Adding 'module.' prefix to state dict")
+            new_state_dict = OrderedDict()
+            for k, v in state_dict.items():
+                new_state_dict[f"module.{k}"] = v
+            state_dict = new_state_dict
+
+        # Move model to device first
+        model.to(device)
+
+        # Apply DataParallel if using multiple GPUs
+        if use_multi_gpu:
+            print(f"Wrapping model with DataParallel on GPUs: {gpu_ids}")
+            # model = nn.DataParallel(model, device_ids=gpu_ids)
+            # Set the primary GPU
+            torch.cuda.set_device(gpu_ids[0])
+
+        # Load the state dict
+        model.load_state_dict(state_dict)
+        print("Model loaded successfully")
+
+        return model
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -1860,9 +2634,21 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--mlp_layers",
+        type=int,
+        default=4,
+        help="Joint mlp layer number of layers godes from embedding_dim -> 256 -> 256 * (1/2) -> 256 * (1/2)^2 -> .... -> 256 * (1/2)^n -> 1. Example 4 layers means embedding -> 256 -> 128 -> 1",
+    )
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=0.2,
+    )
+    parser.add_argument(
         "--input_mapping_data_path",
         type=str,
-        default="/lus/eagle/clone/g2/projects/GeomicVar/tarak/multimodal_learning_T1/joint_fusion/",
+        # default="/lus/eagle/clone/g2/projects/GeomicVar/tarak/multimodal_learning_T1/joint_fusion/",
+        default="/lus/eagle/clone/g2/projects/GeomicVar/jozhw/multimodal_learning_T1/joint_fusion/",
         help="Path to input mapping data file",
     )
     parser.add_argument(
@@ -1942,16 +2728,15 @@ if __name__ == "__main__":
     # make sure output_base_dir exists
     os.makedirs(opt.output_base_dir, exist_ok=True)
 
-    # get predictions on test data, and calculate interpretability metrics
     device, gpu_ids = setup_model_and_device(opt)
     model = load_model_with_multi_gpu_support(opt, device, gpu_ids)
 
     model.to(device)
-    cox_loss = CoxLoss()
+    joint_loss = JointLoss()
     model = load_model_state_dict(model, opt.model_path)
 
     train_loader, validation_loader, test_loader = create_data_loaders(
-        opt, "mapping_data.h5"
+        opt, opt.input_mapping_data_path + "mapping_data.h5"
     )
     validation_dataset = validation_loader.dataset
     test_dataset = test_loader.dataset
@@ -1984,8 +2769,8 @@ if __name__ == "__main__":
 
         return mean_rnaseq_data
 
-    mean_x_omic = compute_mean_omic_from_h5("mapping_data.h5")
+    mean_x_omic = compute_mean_omic_from_h5(
+        opt.input_mapping_data_path + "mapping_data.h5"
+    )
 
     test_and_interpret(opt, model, combined_loader, device, baseline=mean_x_omic)
-    # test_and_interpret(opt, model, combined_loader, device, baseline=None)
-    # test_and_interpret(opt, model, test_loader, device) # remove cox_loss from the arguments

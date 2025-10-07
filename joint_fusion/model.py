@@ -19,6 +19,31 @@ from torchvision.models import ViT_B_32_Weights
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def get_mlp_layers(embedding_dim, num_layers, base_dim=256):
+
+    if num_layers < 2:
+        raise ValueError("MLP Layers cannot be less than 2")
+    elif num_layers == 2:
+        return [int(embedding_dim), 1]
+
+    # append the first layer
+    mlp_layers = [int(embedding_dim)]
+
+    for i in range(num_layers - 2):
+
+        mlp_layers.append(int(base_dim * (1 / 2) ** i))
+
+    # append the last layer
+    mlp_layers.append(1)
+
+    if len(mlp_layers) != num_layers:
+        raise ValueError(
+            "get_mlp_layers method failed to obtain mlp layers with the given num_layers"
+        )
+
+    return mlp_layers
+
+
 # make the output(embedding) dimension a hyperparameter
 class WSINetwork(nn.Module):
     def __init__(self, embedding_dim):
@@ -29,17 +54,6 @@ class WSINetwork(nn.Module):
         self.use_lunit_dino = True
 
         if self.use_cnn:
-            self.net = nn.Sequential(
-                nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1),
-                nn.ReLU(),
-                nn.MaxPool2d(kernel_size=2, stride=2),
-                nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1),
-                nn.ReLU(),
-                nn.MaxPool2d(kernel_size=2, stride=2),
-                nn.Flatten(),
-                nn.Linear(32 * 256 * 256, embedding_dim),
-                nn.ReLU(),
-            )
 
             self.net = nn.Sequential(
                 nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1),
@@ -99,27 +113,108 @@ class WSINetwork(nn.Module):
         # print("+++++++++++++ Input shape within WSINetwork: ", x_wsi.shape)
         if self.use_lunit_dino:
             embeddings = self.encoder.get_wsi_embeddings(x_wsi)
-            # embeddings = torch.tensor(embeddings).to(self.encoder.device)
             embeddings = embeddings.to(self.encoder.device)
             return self.net(embeddings)
+
+            # fixed
+            # batch_embeddings = []
+
+            # for patient_idx, patient_tiles in enumerate(x_wsi):
+            #     print(
+            #         f"Processing patient {patient_idx + 1}/{len(x_wsi)} with {len(patient_tiles)} tiles"
+            #     )
+            #     # Ensure correct shape (C, H, W) -> (1, C, H, W)
+            #     processed_tiles = []
+            #     for tile in patient_tiles:
+            #         if tile.dim() == 3:  # (C, H, W)
+            #             tile = tile.unsqueeze(0)  # add batch dimension -> (1, C, H, W)
+            #         elif tile.dim() == 4 and tile.size(0) == 1:
+            #             pass
+            #         else:
+            #             raise ValueError(f"Unexpected tile shape: {tile.shape}")
+            #         processed_tiles.append(tile)
+
+            #     # get embedding for this patient
+            #     patient_embedding = self.encoder.get_wsi_embeddings(processed_tiles)
+            #     # ensure the embedding is properly shaped on right device
+            #     if not isinstance(patient_embedding, torch.Tensor):
+            #         patient_embedding = torch.tensor(
+            #             patient_embedding, dtype=torch.float32
+            #         )
+            #     if len(processed_tiles) > 0:
+            #         patient_embedding = patient_embedding.to(processed_tiles[0].device)
+
+            #     patient_embedding = self.net(
+            #         patient_embedding
+            #     )  # (1, 384) -> (1, embedding_dim_wsi)
+
+            #     if patient_embedding.dim() > 1 and patient_embedding.size(0) == 1:
+            #         patient_embedding = patient_embedding.squeeze(0)
+
+            #     batch_embeddings.append(patient_embedding)
+
+            # batch_embeddings = torch.stack(batch_embeddings)
+
+            # return batch_embeddings  # shape: (batch_size, embedding_dim)
+
         else:
             return self.net(x_wsi)
 
 
 class OmicNetwork(nn.Module):  # MLP for WSI tile-level embedding generation
-    def __init__(self, embedding_dim):
+    def __init__(
+        self,
+        embedding_dim,
+        dropout=0.2,
+        use_pretrained_vae=True,
+        vae_checkpoint_path="checkpoint/checkpoint_2024-09-04-07-56-47/checkpoint_epoch_1500.pth",
+    ):
         super(OmicNetwork, self).__init__()
+        input_dim = 19962
         self.embedding_dim = embedding_dim
-        self.net = nn.Sequential(
-            nn.Linear(19962, 256),
-            nn.ReLU(),
-            nn.Linear(256, embedding_dim),
-            # nn.ReLU()
-        )
+        self.use_pretrained_vae = use_pretrained_vae
+
+        if use_pretrained_vae and vae_checkpoint_path:
+            # Load pretrained VAE
+            from generate_rnaseq_embeddings import BetaVAE
+
+            self.vae_encoder = BetaVAE(
+                input_dim=input_dim, latent_dim=256, intermediate_dim=512, beta=0.005
+            )
+
+            # Load pretrained weights
+            checkpoint = torch.load(vae_checkpoint_path, map_location=device)
+            new_state_dict = {
+                key.replace("module.", ""): value
+                for key, value in checkpoint["model_state_dict"].items()
+            }
+
+            self.vae_encoder.load_state_dict(new_state_dict)
+            for param in self.vae_encoder.parameters():
+                param.requires_grad = True
+
+            self.projection = (
+                nn.Linear(256, embedding_dim) if embedding_dim != 256 else nn.Identity()
+            )
+
+        else:
+
+            self.net = nn.Sequential(
+                # nn.Dropout(dropout),
+                nn.Linear(input_dim, 256),
+                nn.ReLU(),
+                # nn.Dropout(dropout),
+                nn.Linear(256, embedding_dim),
+            )
 
     def forward(self, x):
         # print("+++++++++++++ Input shape within omic network: ", x.shape)
-        return self.net(x)
+
+        if self.use_pretrained_vae:
+            mean, _ = self.vae_encoder.encode(x)
+            return self.projection(mean)
+        else:
+            return self.net(x)
 
 
 class MultimodalNetwork(nn.Module):
@@ -129,7 +224,11 @@ class MultimodalNetwork(nn.Module):
         embedding_dim_omic,
         mode,
         fusion_type,
+        mlp_layers,
+        dropout=0.2,
         joint_embedding_type="weighted_avg",
+        use_pretrained_omic=True,
+        omic_checkpoint_path="checkpoints/checkpoint_2024-09-04-07-56-47/checkpoint_epoch_1500.pth",
     ):
         super(MultimodalNetwork, self).__init__()
 
@@ -153,7 +252,11 @@ class MultimodalNetwork(nn.Module):
 
         if self.mode == "wsi_omic":
             self.wsi_net = WSINetwork(embedding_dim_wsi)
-            self.omic_net = OmicNetwork(embedding_dim_omic)
+            self.omic_net = OmicNetwork(
+                embedding_dim_omic,
+                use_pretrained_vae=use_pretrained_omic,
+                vae_checkpoint_path=omic_checkpoint_path,
+            )
 
             # Don't create linear projection if non-weighted as not needed for concatenation
             if joint_embedding_type == "concatenate":
@@ -188,9 +291,10 @@ class MultimodalNetwork(nn.Module):
         # Downstream MLP for fused data (directly tied to the Cox loss)
 
         # ADD: change intermed dimension or add more layers
-        self.fused_mlp = nn.Sequential(
-            nn.Linear(embedding_dim, 256), nn.ReLU(), nn.Linear(256, 1)
-        )
+
+        layers = get_mlp_layers(embedding_dim, mlp_layers)
+        self.fused_mlp = self._create_mlp(layers, dropout=dropout)
+
         print("##############  fused MLP Summary  ##################")
         print_model_summary(self.fused_mlp)
 
@@ -200,9 +304,22 @@ class MultimodalNetwork(nn.Module):
         # print("x_wsi: ", x_wsi) # contains float values and not the image files here
         # print("x_omic: ", x_omic)
 
+        print(f"=== FORWARD DEBUG WITH NEW COLLATE ===")
+        print(f"Batch size (tcga_id length): {len(tcga_id)}")
+        print(f"x_wsi type: {type(x_wsi)}")
+        print(f"x_wsi length (should equal batch size): {len(x_wsi)}")
+
+        if x_wsi and len(x_wsi) > 0:
+            print(f"First patient's tiles: {len(x_wsi[0])} tiles")
+            print(f"First tile shape: {x_wsi[0][0].shape}")
+
+        print(f"x_omic shape: {x_omic.shape}")
+        print(f"=== END DEBUG ===")
+
         start_time = time.time()
         # print("fusion type: ", self.fusion_type)
         if self.fusion_type == "joint":
+
             wsi_embedding = self.wsi_net(x_wsi)
             omic_embedding = self.omic_net(x_omic)
             # print("wsi_embedding.shape: ", wsi_embedding.shape)
@@ -276,33 +393,36 @@ class MultimodalNetwork(nn.Module):
             if not isinstance(omic_embedding, torch.Tensor):
                 omic_embedding = torch.tensor(omic_embedding).to(device)
 
+            # with the joint loss the embeddings must be the same dim
+
+            wsi_projected = self.wsi_projection(wsi_embedding)
+            omic_projected = self.omic_projection(omic_embedding)
+            raw_wsi_embedding = wsi_projected
+            raw_omic_embedding = omic_projected
+
             if (
                 opt.joint_embedding == "weighted_avg"
                 or opt.joint_embedding == "weighted_avg_dynamic"
             ):
 
-                wsi_projected = self.wsi_projection(wsi_embedding)
-                omic_projected = self.omic_projection(omic_embedding)
                 total_weight = self.omic_weight + self.wsi_weight
                 normalized_rna = self.omic_weight / total_weight
                 normalized_wsi = self.wsi_weight / total_weight
                 combined_embedding = (
                     normalized_rna * omic_projected + normalized_wsi * wsi_projected
                 )
+                print(
+                    f"Combined embedding shape: {combined_embedding.shape}; Omic embedding shape: {omic_projected.shape}; WSI embedding shape: {wsi_projected.shape}"
+                )
 
             elif opt.joint_embedding == "concatenate":
 
-                combined_embedding = torch.cat(
-                    (wsi_embedding_tensor, omic_embedding_tensor), dim=1
-                )
                 combined_embedding = torch.cat((wsi_embedding, omic_embedding), dim=1)
 
             else:
 
                 print("Defaulting to weighted non-dynamic joint embedding...")
 
-                wsi_projected = self.wsi_projection(wsi_embedding)
-                omic_projected = self.omic_projection(omic_embedding)
                 total_weight = self.omic_weight + self.wsi_weight
                 normalized_rna = self.omic_weight / total_weight
                 normalized_wsi = self.wsi_weight / total_weight
@@ -316,17 +436,33 @@ class MultimodalNetwork(nn.Module):
         # use combined embedding with downstream MLP for getting the output that enters the loss function
         step3_time = time.time()
         output = self.fused_mlp(combined_embedding)
+        # # Ensure output is properly shaped - should be (batch_size,) or (batch_size, 1)
+        # if output.dim() > 1 and output.size(1) == 1:
+        #     output = output.squeeze(1)  # Convert (batch_size, 1) to (batch_size,)
         # step2_time = time.time()
         print(
             f"(In MultimodalNetwork) Step 1: {step1_time - start_time:.4f}s, Step 2: {step2_time - step1_time:.4f}s, Step 3: {step3_time - step2_time:.4f}s"
         )
 
-        return output
+        return output, raw_wsi_embedding, raw_omic_embedding
 
     def forward_omic_only(self, x_omic):
         omic_embedding = self.omic_net(x_omic)
         output = self.fused_mlp(omic_embedding)
         return output
+
+    def _create_mlp(self, layers, dropout=0.2):
+        """Create MLP with specified layers"""
+
+        modules = []
+        for i in range(len(layers) - 1):
+            modules.append(nn.Dropout(dropout))
+            modules.append(nn.Linear(layers[i], layers[i + 1]))
+            if i < len(layers) - 2:
+                modules.append(nn.ReLU())
+                modules.append(nn.Dropout(dropout))
+
+        return nn.Sequential(*modules)
 
 
 def print_model_summary(model):

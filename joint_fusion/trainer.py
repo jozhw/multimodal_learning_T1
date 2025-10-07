@@ -13,9 +13,6 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR
 from torch.cuda.amp import autocast, GradScaler
 import numpy as np
 
-# import datasets
-# from models import
-# from train_test import train_nn
 from sklearn.model_selection import train_test_split, KFold
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -31,7 +28,7 @@ from torch.profiler import profile, record_function, ProfilerActivity
 from PIL import Image
 from sklearn.model_selection import train_test_split
 
-from train_test import train_nn
+from train_test import train_nn, train_and_test
 
 # on Dell laptop (activate conda env 'pytorch_py3p10' and use 'python trainer.py')
 # on Polaris, activate env /lus/eagle/clone/g2/projects/GeomicVar/tarak/multimodal_learning_T1/pytorch_py3p10
@@ -42,26 +39,23 @@ def args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--only_create_new_data_mapping",
-        type=str,
-        default=False,
+        action="store_true",
         help="whether to run this script only to create data mapping files and not for training",
     )
     parser.add_argument(
         "--create_new_data_mapping",
-        type=str,
-        default=False,
+        action="store_true",
         help="whether to create new data mapping or use existing one",
     )
     parser.add_argument(
         "--create_new_data_mapping_h5",
-        type=str,
-        default=False,
+        action="store_true",
         help="whether to create new HDF5 data mapping or use existing one",
     )
     parser.add_argument(
         "--input_mapping_data_path",
         type=str,
-        default="/lus/eagle/clone/g2/projects/GeomicVar/tarak/multimodal_learning_T1/joint_fusion/",
+        default="/lus/eagle/clone/g2/projects/GeomicVar/jozhw/multimodal_learning_T1/joint_fusion/",
         help="Path to input mapping data file",
     )
     parser.add_argument(
@@ -89,14 +83,13 @@ def args():
         default="/lus/eagle/clone/g2/projects/GeomicVar/tarak/multimodal_learning_T1/joint_fusion/checkpoint_2024-04-20-08-43-52/",
         help="Path to the checkpoint files from trained VAE for omic embedding generation",
     )
-    # parser.add_argument('--output_path', type=str, default='results/output.txt', help='Path to output results file')
     parser.add_argument(
         "--batch_size", type=int, default=16, help="Batch size for training (overall)"
     )
     parser.add_argument(
         "--val_batch_size",
         type=int,
-        default=1000,
+        default=70,
         help="Batch size for validation data (using all samples for better Cox loss calculation)",
     )
     parser.add_argument(
@@ -106,9 +99,6 @@ def args():
         "--n_folds", type=int, default=5, help="Number of folds for k-fold CV"
     )
     parser.add_argument("--lr", type=float, default=1e-4, help="Initial learning rate")
-    parser.add_argument(
-        "--step_size", type=int, default=50, help="Learning rate decay steps"
-    )
     parser.add_argument(
         "--num_epochs", type=int, default=500, help="Number of training epochs"
     )
@@ -146,6 +136,17 @@ def args():
         "--profile", action="store_true", help="Enable profiling (default: False)"
     )
     parser.add_argument(
+        "--mlp_layers",
+        type=int,
+        default=4,
+        help="Joint mlp layer number of layers godes from embedding_dim -> 256 -> 256 * (1/2) -> 256 * (1/2)^2 -> .... -> 256 * (1/2)^n -> 1. Example 4 layers means embedding -> 256 -> 128 -> 1",
+    )
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=0.2,
+    )
+    parser.add_argument(
         "--use_mixed_precision",
         action="store_true",
         help="whether to use mixed precision calculations (currently unstable)",
@@ -161,6 +162,27 @@ def args():
         type=str,
         default=None,
         help="Current timestamp that will be used for model identification and labeling. Should be in the format YYYY-MM-DD-HH-MM-SS",
+    )
+
+    parser.add_argument(
+        "--use_gradient_checkpointing",
+        action="store_true",
+        help="Enable gradient checkpointing to reduce memory usage during training",
+    )
+
+    ################ Pretraining model access
+
+    parser.add_argument(
+        "--use_pretrained_omic",
+        action="store_true",
+        help="Use pretrained VAE for omic embeddings",
+    )
+
+    parser.add_argument(
+        "--omic_checkpoint_path",
+        type=str,
+        default="checkpoints/checkpoint_2024-09-04-07-56-47/checkpoint_epoch_1500.pth",
+        help="Path to pretrained omic VAE checkpoint",
     )
 
     ################ NOTE: These additions are for finding the ideal hyperparams and setup
@@ -238,8 +260,6 @@ def create_h5_file(file_name, train_df, val_df, test_df, image_dir):
                     "event_occurred", data=1 if row["event_occurred"] == "Dead" else 0
                 )
 
-                # store RNA-seq data
-                # rnaseq_data = np.log1p(np.array(list(row['rnaseq_data'].values())))
                 rnaseq_data = np.array(list(row["rnaseq_data"].values()))
                 patient_group.create_dataset("rnaseq_data", data=rnaseq_data)
 
@@ -258,15 +278,9 @@ def main():
 
     opt = args()
 
-    # device = (
-    #     torch.device("cuda:{}".format(opt.gpu_ids[0]))
-    #     if opt.gpu_ids
-    #     else torch.device("cpu")
-    # )
-
     if opt.gpu_ids and opt.gpu_ids != "-1":
         gpu_list = [int(x) for x in opt.gpu_ids.split(",")]
-        device = torch.device(f"cuda:{gpu_list[0]}")  # Primary device
+        device = torch.device(f"cuda:{gpu_list[0]}")
         print(f"Using GPUs: {gpu_list}")
     else:
         device = torch.device("cpu")
@@ -350,7 +364,7 @@ def main():
     if opt.create_new_data_mapping_h5:
         # create h5 version of mapping_df for faster IO
         create_h5_file(
-            "mapping_data.h5",
+            "joint_fusion/mapping_data.h5",
             mapping_df_train,
             mapping_df_val,
             mapping_df_test,
@@ -368,26 +382,20 @@ def main():
                 profile_memory=True,
             ) as prof:
                 with record_function("model_train"):
-                    model, optimizer = train_nn(opt, "mapping_data.h5", device)
-            # torch.autograd.profiler.profile().export_chrome_trace("./profiling_results.json")
+                    model, optimizer = train_nn(
+                        opt, "joint_fusion/mapping_data.h5", device
+                    )
             print("Finishing profiling...")
             print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
-            # print(prof.key_averages().table(sort_by="self_cpu_memory_usage", row_limit=10))
             trace_path = os.path.join(log_dir, "trace.json")
             prof.export_chrome_trace(trace_path)
             print(f"Saved profile at {trace_path}")
-        # with torch.profiler.profile(
-        #         schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
-        #         on_trace_ready=torch.profiler.tensorboard_trace_handler('./log/multimodal'),
-        #         record_shapes=True,
-        #         profile_memory=True,
-        #         with_stack=True
-        # ) as prof:
 
         else:
-            model, optimizer = train_nn(opt, "mapping_data.h5", device)
-        # break
-        # set_trace()
+            # model, optimizer = train_nn(opt, "joint_fusion/mapping_data.h5", device)
+            model, optimizer = train_and_test(
+                opt, "joint_fusion/mapping_data.h5", device
+            )
 
 
 if __name__ == "__main__":
