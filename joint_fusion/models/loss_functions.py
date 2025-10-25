@@ -4,55 +4,76 @@ import torch.nn.functional as F
 
 
 class ContrastiveLoss(nn.Module):
-    def __init__(self, temperature=0.1, time_threshold=365):
+    def __init__(self, temperature=0.1, num_risk_groups=4):
         super(ContrastiveLoss, self).__init__()
         self.temperature = temperature
-        self.time_threshold = time_threshold
+        self.num_risk_groups = num_risk_groups
 
     def forward(self, embeddings, survival_times, censor):
 
-        batch_size = embeddings.size(0)
         device = embeddings.device
 
-        z_norm = F.normalize(embeddings, dim=1)
+        uncensored_idx = (censor == 1).nonzero(as_tuple=True)[0]
 
-        sim_matrix = torch.einsum("ik,jk->ij", z_norm, z_norm) / self.temperature
+        if len(uncensored_idx) < self.num_risk_groups:
+            return torch.tensor(0.0, requires_grad=True, device=device)
 
-        # mask out self similarity
-        mask_diag = torch.eye(batch_size, dtype=torch.bool, device=device)
+        embeddings_u = embeddings[uncensored_idx]
+        times_u = survival_times[uncensored_idx]
+
+        quantiles = torch.quantile(
+            times_u.float(),
+            torch.linspace(0, 1, self.num_risk_groups + 1, device=device),
+        )
+
+        # assign patients to risk group
+        risk_groups = torch.zeros(len(times_u), dtype=torch.long, device=device)
+
+        for i in range(self.num_risk_groups):
+            mask = (times_u >= quantiles[i]) & (times_u < quantiles[i + 1])
+            risk_groups[mask] = i
+
+        risk_groups[times_u >= quantiles[-1]] = self.num_risk_groups - 1
+
+        z_norm = F.normalize(embeddings_u, dim=1)
+
+        sim_matrix = z_norm @ z_norm.T / self.temperature
+
+        # diagonal mask
+
+        mask_diag = torch.eye(len(times_u), dtype=torch.bool, device=device)
         sim_matrix = sim_matrix.masked_fill(mask_diag, -float("inf"))
-
-        time_diff = torch.abs(
-            survival_times.unsqueeze(1) - survival_times.unsqueeze(0)
-        )  # [batchsize, batchsize]
-
-        uncensored_mask = censor.unsqueeze(1) == 1  # [B, 1]
-
-        positive_mask = (time_diff < self.time_threshold) & ~mask_diag
-
-        # only use uncensored patients
-        positive_mask = positive_mask & uncensored_mask
 
         losses = []
 
-        for i in range(batch_size):
-            if not positive_mask[i].any():
-                continue  # Skip if no positives for this anchor
+        for i in range(len(times_u)):
 
-            # Get positive similarities
-            pos_sim = sim_matrix[i][positive_mask[i]]
+            anchor_group = risk_groups[i]
 
-            # Denominator: sum over all non-self samples (standard contrastive)
-            # This treats distant survival times as negatives
-            denominator = torch.logsumexp(sim_matrix[i][~mask_diag[i]], dim=0)
+            # postive for same risk group
+            positive_mask = (risk_groups == anchor_group) & ~mask_diag[i]
 
-            # Numerator: sum over positives
+            # negative for different risk group
+            group_diff = torch.abs(risk_groups - anchor_group)
+
+            # hard negative if at least one group away
+            negative_mask = (group_diff >= 1) & ~mask_diag[i]
+
+            if not positive_mask.any() or not negative_mask.any():
+                continue
+
+            pos_sim = sim_matrix[i][positive_mask]
+            neg_sim = sim_matrix[i][negative_mask]
+
+            # standard InfoNCE
             numerator = torch.logsumexp(pos_sim, dim=0)
+            denominator = torch.logsumexp(torch.cat([pos_sim, neg_sim]), dim=0)
 
             loss = -numerator + denominator
             losses.append(loss)
 
         if not losses:
+            print(f"If not losses trigged because losses is: {losses}")
             return torch.tensor(0.0, requires_grad=True, device=device)
 
         return torch.mean(torch.stack(losses))
@@ -131,14 +152,14 @@ class CoxLoss(nn.Module):
 
 class JointLoss(nn.Module):
     def __init__(
-        self, sim_weight=1.0, contrast_weight=0.1, temperature=0.1, time_threshold=365
+        self, sim_weight=1.0, contrast_weight=0.1, temperature=0.1, num_risk_groups=4
     ):
         super(JointLoss, self).__init__()
 
         self.cox_loss_fn = CoxLoss()
         self.sim_loss_fn = SimilarityLoss()
         self.contrast_loss_fn = ContrastiveLoss(
-            temperature=temperature, time_threshold=time_threshold
+            temperature=temperature, num_risk_groups=num_risk_groups
         )
 
         self.sim_weight = sim_weight
