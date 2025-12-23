@@ -262,6 +262,8 @@ class MultimodalNetwork(nn.Module):
             if joint_embedding_type == "concatenate":
 
                 embedding_dim = self.wsi_net.embedding_dim + self.omic_net.embedding_dim
+                self.wsi_projection = nn.Linear(embedding_dim_wsi, embedding_dim_wsi)
+                self.omic_projection = nn.Linear(embedding_dim_omic, embedding_dim_omic)
             else:
                 embedding_dim = min(
                     self.wsi_net.embedding_dim, self.omic_net.embedding_dim
@@ -301,20 +303,24 @@ class MultimodalNetwork(nn.Module):
         self.stored_omic_embedding = None
 
     def forward(self, opt, tcga_id, x_wsi=None, x_omic=None):
+
+        ################### DEBUG ########################
         # print("x_wsi: ", x_wsi) # contains float values and not the image files here
         # print("x_omic: ", x_omic)
 
-        print(f"=== FORWARD DEBUG WITH NEW COLLATE ===")
-        print(f"Batch size (tcga_id length): {len(tcga_id)}")
-        print(f"x_wsi type: {type(x_wsi)}")
-        print(f"x_wsi length (should equal batch size): {len(x_wsi)}")
+        # print(f"=== FORWARD DEBUG  ===")
+        # print(f"Batch size (tcga_id length): {len(tcga_id)}")
+        # print(f"x_wsi type: {type(x_wsi)}")
+        # print(f"x_wsi length (should equal batch size): {len(x_wsi)}")
 
-        if x_wsi and len(x_wsi) > 0:
-            print(f"First patient's tiles: {len(x_wsi[0])} tiles")
-            print(f"First tile shape: {x_wsi[0][0].shape}")
+        # if x_wsi and len(x_wsi) > 0:
+        #     print(f"First patient's tiles: {len(x_wsi[0])} tiles")
+        #     print(f"First tile shape: {x_wsi[0][0].shape}")
 
-        print(f"x_omic shape: {x_omic.shape}")
-        print(f"=== END DEBUG ===")
+        # print(f"x_omic shape: {x_omic.shape}")
+        # print(f"=== END DEBUG ===")
+
+        ################### END DEBUG ########################
 
         start_time = time.time()
         # print("fusion type: ", self.fusion_type)
@@ -411,9 +417,9 @@ class MultimodalNetwork(nn.Module):
                 combined_embedding = (
                     normalized_rna * omic_projected + normalized_wsi * wsi_projected
                 )
-                print(
-                    f"Combined embedding shape: {combined_embedding.shape}; Omic embedding shape: {omic_projected.shape}; WSI embedding shape: {wsi_projected.shape}"
-                )
+                # print(
+                #     f"Combined embedding shape: {combined_embedding.shape}; Omic embedding shape: {omic_projected.shape}; WSI embedding shape: {wsi_projected.shape}"
+                # )
 
             elif opt.joint_embedding == "concatenate":
 
@@ -432,7 +438,7 @@ class MultimodalNetwork(nn.Module):
 
         step2_time = time.time()
 
-        print("combined_embedding.shape: ", combined_embedding.shape)
+        # print("combined_embedding.shape: ", combined_embedding.shape)
         # use combined embedding with downstream MLP for getting the output that enters the loss function
         step3_time = time.time()
         output = self.fused_mlp(combined_embedding)

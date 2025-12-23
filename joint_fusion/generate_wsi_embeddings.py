@@ -98,13 +98,6 @@ class CustomDatasetWSI(Dataset):
     def __getitem__(self, idx):
         tile = self.tiles[idx]
         if self.transform:
-            # set_trace()
-            # # convert tensor to PIL Image only for UNI model to make it compatible with the transform function from timm
-            # if self.wsi_fm == 'uni' and isinstance(tile, torch.Tensor):
-            #     set_trace()
-            #     # tile.shape: torch.Size([200, 3, 256, 256])
-            #     tile = transforms.ToPILImage()(tile)
-            # tile = self.transform(tile)
             if not isinstance(tile, torch.Tensor):
                 tile = self.transform(tile)
 
@@ -173,14 +166,6 @@ transform_lunit = Compose(
     ]
 )
 
-# transform_uni = Compose([
-#         Resize(224),
-#         # ToTensor(),
-#         # https://github.com/mahmoodlab/UNI/blob/main/README_old.md
-#         Normalize(mean=(0.485, 0.456, 0.406),
-#                   std=(0.229, 0.224, 0.225)),
-# ])
-
 
 # Use the pretrained Lunit-DINO model [Kang et al. (2023), "Benchmarking Self-Supervised Learning on Diverse Pathology Datasets"] for WSI feature extraction (trained on histopathology images)
 # Lunit-DINO uses the ViT-S architecture with DINO for SSL
@@ -194,16 +179,6 @@ def get_pretrained_lunit(key):
     }
     pretrained_url = f"{URL_PREFIX}/{model_zoo_registry.get(key)}"
     return pretrained_url
-
-
-# def get_pretrained_uni(key):
-#     URL_PREFIX = "https://github.com/lunit-io/benchmark-ssl-pathology/releases/download/pretrained-weights"
-#     model_zoo_registry = {
-#         "DINO_p16": "dino_vit_small_patch16_ep200.torch",
-#         "DINO_p8": "dino_vit_small_patch8_ep200.torch",
-#     }
-#     pretrained_url = f"{URL_PREFIX}/{model_zoo_registry.get(key)}"
-#     return pretrained_url
 
 
 class WSIEncoder(nn.Module):
@@ -220,7 +195,6 @@ class WSIEncoder(nn.Module):
         pooling="average",
         pretrained=True,
         progress=False,
-        # key="DINO_p16",
         patch_size=16,
     ):
         super(WSIEncoder, self).__init__()
@@ -289,18 +263,6 @@ class WSIEncoder(nn.Module):
         else:
             raise ValueError(f"Unsupported WSI foundation model: {self.wsi_fm}")
 
-        # print(self.model)  # print the entire model architecture
-        # # print all children layers
-        # for name, layer in self.model.named_children():
-        #     print(name, layer)
-        # # print all modules
-        # for name, module in self.model.named_modules():
-        #     print(name, module)
-        #
-        # for name, param in self.model.named_parameters():
-        #     # if "head" not in name:
-        #     param.requires_grad = False
-
         if self.pooling == "learned_weighted":
             self.attention_pool = LearnedWeightedPool(self.embed_dim)
 
@@ -331,28 +293,6 @@ class WSIEncoder(nn.Module):
             num_heads=6,
             num_classes=0,
         )
-        # # freeze all layers (when not using joint fusion)
-        # for param in model.parameters():
-        #     param.requires_grad = False
-        #
-        # if __name__ != "__main__":  # i.e. for joint fusion the last block is trained together with the rnaseq encoder
-        #     num_blocks = len(model.blocks)
-        #     print(f"Total number of transformer blocks in DINO: {num_blocks}")
-        #
-        #     # unfreeze the last transformer block
-        #     last_block_idx = num_blocks - 1
-        #     print(f"unfreezing block {last_block_idx}")
-        #     for param in model.blocks[last_block_idx].parameters():
-        #         param.requires_grad = True
-        #
-        #     # unfreeze the final norm layer
-        #     for param in model.norm.parameters():
-        #         param.requires_grad = True
-        #
-        # # print the trainable params
-        # print("parameters for the WSI model (those in the last layer should be trainable for joint fusion)")
-        # for name, param in model.named_parameters():
-        #     print(f"{name}: {param.requires_grad}")
 
         if pretrained:
             pretrained_url = get_pretrained_lunit(key)
@@ -407,9 +347,9 @@ class WSIEncoder(nn.Module):
             for batch_idx, tiles in enumerate(tile_loader):
                 tiles = tiles.to(device)  # Or self.device if available
                 # Debug: Log to spot the failing tile (remove after fix)
-                print(
-                    f"Tile batch {batch_idx}: shape {tiles.shape}, finite: {torch.isfinite(tiles).all().item()}"
-                )
+                # print(
+                #     f"Tile batch {batch_idx}: shape {tiles.shape}, finite: {torch.isfinite(tiles).all().item()}"
+                # )
 
                 # Robust squeeze: Handle loader output variations safely
                 if tiles.dim() == 5:  # e.g., [1, 1, C, H, W] → [1, C, H, W]
@@ -423,9 +363,9 @@ class WSIEncoder(nn.Module):
                     tiles
                 )  # Model forward: expect [feat_dim] or similar
                 # Debug: Check post-model
-                print(
-                    f"Features batch {batch_idx}: shape {features.shape}, finite: {torch.isfinite(features).all().item()}"
-                )
+                # print(
+                #     f"Features batch {batch_idx}: shape {features.shape}, finite: {torch.isfinite(features).all().item()}"
+                # )
                 embeddings.append(features)
 
             if len(embeddings) == 0:

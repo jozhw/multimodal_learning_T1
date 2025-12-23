@@ -1658,13 +1658,13 @@ def test_and_interpret(opt, model, test_loader, device, baseline=None):
             # enable gradients only after data loading
             x_wsi = [x.requires_grad_() for x in x_wsi]
 
-            print(f"Batch size: {len(test_loader.dataset)}")
-            print(
-                f"Test Batch index: {batch_idx + 1} out of {np.ceil(len(test_loader.dataset) / opt.test_batch_size)}"
-            )
-            print("TCGA ID: ", tcga_id)
-            print("Days to event: ", days_to_event)
-            print("event occurred: ", event_occurred)
+            # print(f"Batch size: {len(test_loader.dataset)}")
+            # print(
+            #     f"Test Batch index: {batch_idx + 1} out of {np.ceil(len(test_loader.dataset) / opt.test_batch_size)}"
+            # )
+            # # print("TCGA ID: ", tcga_id)
+            # print("Days to event: ", days_to_event)
+            # print("event occurred: ", event_occurred)
 
             if opt.calc_saliency_maps is False:
                 outputs, wsi_embedding, omic_embedding = model(
@@ -2349,6 +2349,9 @@ def train_and_test(opt, h5_file, device):
                 val_predictions = []
                 val_times = []
                 val_events = []
+                val_wsi_emb = []
+                val_omic_emb = []
+                val_tcga_id_list = []
 
                 test_ci = 0.0
                 test_predictions = []
@@ -2385,6 +2388,7 @@ def train_and_test(opt, h5_file, device):
                             x_wsi=x_wsi,  # list of tensors (one for each tile)
                             x_omic=x_omic,
                         )
+
                         loss = joint_loss(
                             outputs.squeeze(),
                             # predictions are not survival outcomes, rather log-risk scores beta*X
@@ -2399,17 +2403,28 @@ def train_and_test(opt, h5_file, device):
                         val_times.append(days_to_event)
                         val_events.append(event_occurred)
 
+                        val_wsi_emb.append(wsi_embedding)
+                        val_omic_emb.append(omic_embedding)
+                        val_tcga_id_list.extend(tcga_id)
+
                     val_loss = val_loss_epoch / len(val_loader_fold.dataset)
 
                     val_predictions = torch.cat(val_predictions)
                     val_times = torch.cat(val_times)
                     val_events = torch.cat(val_events)
 
+                    wsi_embeddings = torch.cat(val_wsi_emb, dim=0)
+                    omic_embeddings = torch.cat(val_omic_emb, dim=0)
+
                     # convert to numpy arrays for CI calculation
                     val_predictions_np = val_predictions.cpu().numpy()
                     val_times_np = val_times.cpu().numpy()
                     val_events_np = val_events.cpu().numpy()
                     val_event_rate = val_events_np.mean()
+
+                    wsi_np = wsi_embeddings.cpu().numpy()
+                    omic_np = omic_embeddings.cpu().numpy()
+                    tcga_id_np = np.array(val_tcga_id_list)
 
                     val_ci = concordance_index_censored(
                         val_events_np.astype(bool), val_times_np, val_predictions_np
@@ -2418,6 +2433,32 @@ def train_and_test(opt, h5_file, device):
 
                     end_val_time = time.time()
                     val_duration = end_val_time - start_val_time
+
+                    # save embeddings once every 5 epochs
+                    if (epoch + 1) % 5 == 0 and epoch > 0:
+                        wsi_checkpoint_path = os.path.join(
+                            checkpoint_dir,
+                            f"wsi_embedding_fold_{fold_idx}_epoch_{epoch}.npy",
+                        )
+                        np.save(wsi_checkpoint_path, wsi_np)
+
+                        omic_checkpoint_path = os.path.join(
+                            checkpoint_dir,
+                            f"omic_embedding_fold_{fold_idx}_epoch_{epoch}.npy",
+                        )
+
+                        np.save(omic_checkpoint_path, omic_np)
+
+                        print(
+                            f"Embeddings saved at epoch {epoch}, fold {fold_idx}, to {wsi_checkpoint_path} and {omic_checkpoint_path}"
+                        )
+
+                        id_checkpoint_path = os.path.join(
+                            checkpoint_dir,
+                            f"tcga_ids_fold_{fold_idx}_epoch_{epoch}.npy",
+                        )
+
+                        np.save(id_checkpoint_path, tcga_id_np)
 
                 test_ci, test_event_rate, test_statistic, p_value = evaluate_test_set(
                     model, test_loader, device, opt

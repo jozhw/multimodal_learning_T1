@@ -4,79 +4,34 @@ import torch.nn.functional as F
 
 
 class ContrastiveLoss(nn.Module):
-    def __init__(self, temperature=0.1, num_risk_groups=4):
-        super(ContrastiveLoss, self).__init__()
+    def __init__(self, temperature=0.1, sigma=1.0):
+        super().__init__()
         self.temperature = temperature
-        self.num_risk_groups = num_risk_groups
+        self.sigma = sigma
 
+    # SimCLR inspired
     def forward(self, embeddings, survival_times, censor):
-
         device = embeddings.device
-
-        uncensored_idx = (censor == 1).nonzero(as_tuple=True)[0]
-
-        if len(uncensored_idx) < self.num_risk_groups:
+        idx = (censor == 1).nonzero(as_tuple=True)[0]
+        if len(idx) < 2:
             return torch.tensor(0.0, requires_grad=True, device=device)
 
-        embeddings_u = embeddings[uncensored_idx]
-        times_u = survival_times[uncensored_idx]
+        z = F.normalize(embeddings[idx], dim=1)
+        t = survival_times[idx].float()
 
-        quantiles = torch.quantile(
-            times_u.float(),
-            torch.linspace(0, 1, self.num_risk_groups + 1, device=device),
-        )
+        sim = z @ z.T / self.temperature
+        mask = torch.eye(len(z), device=device).bool()
+        sim = sim.masked_fill(mask, -float("inf"))
 
-        # assign patients to risk group
-        risk_groups = torch.zeros(len(times_u), dtype=torch.long, device=device)
+        diff = (t.unsqueeze(1) - t.unsqueeze(0)).abs()
+        std = t.std().clamp(min=1e-6)
+        w = torch.exp(-0.5 * (diff / (self.sigma * std)) ** 2)
+        w = w.masked_fill(mask, 0)
+        w = w / w.sum(1, keepdim=True).clamp(min=1e-8)
 
-        for i in range(self.num_risk_groups):
-            mask = (times_u >= quantiles[i]) & (times_u < quantiles[i + 1])
-            risk_groups[mask] = i
-
-        risk_groups[times_u >= quantiles[-1]] = self.num_risk_groups - 1
-
-        z_norm = F.normalize(embeddings_u, dim=1)
-
-        sim_matrix = z_norm @ z_norm.T / self.temperature
-
-        # diagonal mask
-
-        mask_diag = torch.eye(len(times_u), dtype=torch.bool, device=device)
-        sim_matrix = sim_matrix.masked_fill(mask_diag, -float("inf"))
-
-        losses = []
-
-        for i in range(len(times_u)):
-
-            anchor_group = risk_groups[i]
-
-            # postive for same risk group
-            positive_mask = (risk_groups == anchor_group) & ~mask_diag[i]
-
-            # negative for different risk group
-            group_diff = torch.abs(risk_groups - anchor_group)
-
-            # hard negative if at least one group away
-            negative_mask = (group_diff >= 1) & ~mask_diag[i]
-
-            if not positive_mask.any() or not negative_mask.any():
-                continue
-
-            pos_sim = sim_matrix[i][positive_mask]
-            neg_sim = sim_matrix[i][negative_mask]
-
-            # standard InfoNCE
-            numerator = torch.logsumexp(pos_sim, dim=0)
-            denominator = torch.logsumexp(torch.cat([pos_sim, neg_sim]), dim=0)
-
-            loss = -numerator + denominator
-            losses.append(loss)
-
-        if not losses:
-            print(f"If not losses trigged because losses is: {losses}")
-            return torch.tensor(0.0, requires_grad=True, device=device)
-
-        return torch.mean(torch.stack(losses))
+        numerator = torch.logsumexp(sim + w.log(), dim=1)
+        denominator = torch.logsumexp(sim, dim=1)
+        return (-numerator + denominator).mean()
 
 
 class SimilarityLoss(nn.Module):
@@ -151,29 +106,26 @@ class CoxLoss(nn.Module):
 
 
 class JointLoss(nn.Module):
-    def __init__(
-        self, sim_weight=1.0, contrast_weight=0.1, temperature=0.1, num_risk_groups=4
-    ):
+    def __init__(self, sim_weight=1.0, contrast_weight=0.1, temperature=0.1, sigma=1):
         super(JointLoss, self).__init__()
 
         self.cox_loss_fn = CoxLoss()
         self.sim_loss_fn = SimilarityLoss()
-        self.contrast_loss_fn = ContrastiveLoss(
-            temperature=temperature, num_risk_groups=num_risk_groups
-        )
+        self.contrast_loss_fn = ContrastiveLoss(temperature=temperature, sigma=sigma)
 
         self.sim_weight = sim_weight
-        self.contrast_weight = contrast_weight
+        self.contrast_weight = 0  # contrast_weight
 
     def forward(self, log_risks, times, censor, wsi_embeddings, omic_embeddings):
         cox_loss = self.cox_loss_fn(log_risks, times, censor)
         sim_loss = self.sim_loss_fn(wsi_embeddings, omic_embeddings)
+
         wsi_contrastive_loss = self.contrast_loss_fn(wsi_embeddings, times, censor)
         omic_contrastive_loss = self.contrast_loss_fn(omic_embeddings, times, censor)
         contrastive_loss = (wsi_contrastive_loss + omic_contrastive_loss) / 2
 
         return (
             cox_loss
-            + self.sim_weight * sim_loss
             + self.contrast_weight * contrastive_loss
+            + self.sim_weight * sim_loss
         )
