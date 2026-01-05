@@ -3,7 +3,6 @@ Code to generate WSI embeddings using i) only inference from a pretrained model 
 """
 
 import os
-import numpy as np
 import torch
 from pathlib import Path
 from dotenv import load_dotenv
@@ -19,6 +18,16 @@ from huggingface_hub import login
 # from pdb import set_trace
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# ensure you're authenticated with huggingface to access the UNI model weights
+env_path = Path.cwd() / ".env"
+load_dotenv(env_path)
+
+HF_TOKEN = os.getenv("HF_TOKEN")
+if HF_TOKEN:
+    login(token=HF_TOKEN)
+else:
+    print("Warning: No Hugging Face token provided. Authentication might fail.")
 
 
 class LearnedWeightedPool(nn.Module):
@@ -108,17 +117,6 @@ class CustomDatasetWSI(Dataset):
                 tile = self.transform(tile)
 
         return tile
-
-
-# ensure you're authenticated with huggingface to access the UNI model weights
-env_path = Path.cwd() / ".env"
-load_dotenv(env_path)
-
-HF_TOKEN = os.getenv("HF_TOKEN")
-if HF_TOKEN:
-    login(token=HF_TOKEN)
-else:
-    print("Warning: No Hugging Face token provided. Authentication might fail.")
 
 
 def load_uni_model(model_name="UNI"):

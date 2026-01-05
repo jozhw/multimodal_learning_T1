@@ -4,8 +4,8 @@ import pandas as pd
 import os
 import time
 
-from wsi_network import WSINetwork
-from omic_network import OmicNetwork
+from .wsi_network import WSINetwork
+from .omic_network import OmicNetwork
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -45,7 +45,7 @@ class MultimodalNetwork(nn.Module):
         mlp_layers,
         dropout=0.2,
         joint_embedding_type="weighted_avg",
-        use_pretrained_omic=True,
+        use_pretrained_omic=False,
         omic_checkpoint_path="checkpoints/checkpoint_2024-09-04-07-56-47/checkpoint_epoch_1500.pth",
     ):
         super(MultimodalNetwork, self).__init__()
@@ -58,10 +58,14 @@ class MultimodalNetwork(nn.Module):
         if joint_embedding_type == "weighted_avg_dynamic":
             self.omic_weight = nn.Parameter(torch.tensor(0.8))
             self.wsi_weight = nn.Parameter(torch.tensor(0.2))
-        else:
+        elif joint_embedding_type == "weighted_avg":
             # NOTE: Default, even if concatenation because does not take that much memory
             self.omic_weight = 0.8
             self.wsi_weight = 0.2
+
+        else:  # no longer weighted avg so treat as 1
+            self.omic_weight = 1
+            self.wsi_weight = 1
 
         if self.mode == "wsi_omic":
             self.wsi_net = WSINetwork(embedding_dim_wsi)
@@ -103,7 +107,7 @@ class MultimodalNetwork(nn.Module):
 
         self.stored_omic_embedding = None
 
-    def forward(self, opt, tcga_id, x_wsi=None, x_omic=None):
+    def forward(self, config, tcga_id, x_wsi=None, x_omic=None):
         # print("x_wsi: ", x_wsi) # contains float values and not the image files here
         # print("x_omic: ", x_omic)
 
@@ -115,18 +119,6 @@ class MultimodalNetwork(nn.Module):
             # print("wsi_embedding.shape: ", wsi_embedding.shape)
             # print("omic_embedding.shape: ", omic_embedding.shape)
         step1_time = time.time()
-        # set_trace()
-        if self.fusion_type == "joint_omic":
-            wsi_embedding = pd.read_json(
-                os.path.join(opt.input_wsi_embeddings_path, "WSI_embeddings.json")
-            )  # read pre-generated embeddings from the pathology foundation model
-            wsi_embedding = wsi_embedding[
-                list(tcga_id)
-            ]  # keep only the embeddings corresponding to the tcga_ids in the batch
-            print("Shape of omic input before OmicNetwork", x_omic.shape)
-            omic_embedding = self.omic_net(x_omic)
-            print("wsi_embedding.shape: ", wsi_embedding.shape)
-            print("omic_embedding.shape: ", omic_embedding.shape)
 
         print("input mode: ", self.mode)
 
@@ -145,8 +137,8 @@ class MultimodalNetwork(nn.Module):
         raw_omic_embedding = omic_projected
 
         if (
-            opt.joint_embedding == "weighted_avg"
-            or opt.joint_embedding == "weighted_avg_dynamic"
+            config.model.joint_embedding == "weighted_avg"
+            or config.model.joint_embedding == "weighted_avg_dynamic"
         ):
 
             total_weight = self.omic_weight + self.wsi_weight
@@ -156,7 +148,7 @@ class MultimodalNetwork(nn.Module):
                 normalized_rna * omic_projected + normalized_wsi * wsi_projected
             )
 
-        elif opt.joint_embedding == "concatenate":
+        elif config.model.joint_embedding == "concatenate":
 
             combined_embedding = torch.cat((wsi_embedding, omic_embedding), dim=1)
 
@@ -217,8 +209,3 @@ def print_model_summary(model):
         p.numel() for p in model.parameters() if p.requires_grad
     )
     print(f"Number of trainable params (million): {total_trainable_params / 1e6}")
-
-    # memory_bytes = total_params * 4  # 4 bytes for a torch.float32 model parameter
-    # memory_mb = memory_bytes / (1024 ** 2)
-    # memory_gb = memory_bytes / 1e9
-    # print(f"Estimated Memory (GB): {memory_gb}")

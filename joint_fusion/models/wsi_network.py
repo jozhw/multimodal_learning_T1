@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from generate_wsi_embeddings import WSIEncoder
+from .wsi_encoder import WSIEncoder
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

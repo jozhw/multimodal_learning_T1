@@ -46,12 +46,6 @@ class SimilarityLoss(nn.Module):
         cosine_sim = F.cosine_similarity(wsi_embeddings, omic_embeddings)
         cosine_sim = cosine_sim.clamp(min=-1, max=1)
 
-        # need to define for intrapatient
-
-        # need to define for interpatient
-
-        # need to to a max between 0 and M - interpatient + intrapatient
-
         loss = torch.mean(1 - cosine_sim)
 
         return loss
@@ -111,21 +105,22 @@ class JointLoss(nn.Module):
 
         self.cox_loss_fn = CoxLoss()
         self.sim_loss_fn = SimilarityLoss()
-        self.contrast_loss_fn = ContrastiveLoss(temperature=temperature, sigma=sigma)
+        # NOTE: performance of the contrastive loss is quite poor
+        # self.contrast_loss_fn = ContrastiveLoss(temperature=temperature, sigma=sigma)
 
         self.sim_weight = sim_weight
-        self.contrast_weight = 0  # contrast_weight
+        # self.contrast_weight = 0  # contrast_weight
 
     def forward(self, log_risks, times, censor, wsi_embeddings, omic_embeddings):
         cox_loss = self.cox_loss_fn(log_risks, times, censor)
         sim_loss = self.sim_loss_fn(wsi_embeddings, omic_embeddings)
 
-        wsi_contrastive_loss = self.contrast_loss_fn(wsi_embeddings, times, censor)
-        omic_contrastive_loss = self.contrast_loss_fn(omic_embeddings, times, censor)
-        contrastive_loss = (wsi_contrastive_loss + omic_contrastive_loss) / 2
+        # wsi_contrastive_loss = self.contrast_loss_fn(wsi_embeddings, times, censor)
+        # omic_contrastive_loss = self.contrast_loss_fn(omic_embeddings, times, censor)
+        # contrastive_loss = (wsi_contrastive_loss + omic_contrastive_loss) / 2
 
         return (
             cox_loss
-            + self.contrast_weight * contrastive_loss
             + self.sim_weight * sim_loss
+            # + self.contrast_weight * contrastive_loss
         )

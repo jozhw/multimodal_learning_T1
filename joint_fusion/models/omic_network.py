@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 
+from .omic_encoder import BetaVAE
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
@@ -18,8 +20,6 @@ class OmicNetwork(nn.Module):  # MLP for WSI tile-level embedding generation
         self.use_pretrained_vae = use_pretrained_vae
 
         if use_pretrained_vae and vae_checkpoint_path:
-            # Load pretrained VAE
-            from generate_rnaseq_embeddings import BetaVAE
 
             self.vae_encoder = BetaVAE(
                 input_dim=input_dim, latent_dim=256, intermediate_dim=512, beta=0.005
