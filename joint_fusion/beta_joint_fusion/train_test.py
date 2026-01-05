@@ -25,16 +25,17 @@ import torch.utils.checkpoint as checkpoint
 from torch.optim.lr_scheduler import _LRScheduler
 
 # import torch.optim.lr_scheduler as lr_scheduler
+from loss_function import JointLoss
 from torchsummary import summary
 from torch.cuda.amp import autocast, GradScaler
 from sklearn.model_selection import train_test_split
-from utils import mixed_collate, clear_memory, monitor_memory
+from utils.utils import mixed_collate, clear_memory, monitor_memory
 from tqdm import tqdm
 from torch.utils.data import ConcatDataset
 from sklearn.preprocessing import StandardScaler, KBinsDiscretizer
 
 from datasets import CustomDataset, HDF5Dataset
-from model import MultimodalNetwork, OmicNetwork, print_model_summary
+from models import MultimodalNetwork, OmicNetwork, print_model_summary
 from sklearn.model_selection import StratifiedKFold
 from generate_wsi_embeddings import CustomDatasetWSI
 
@@ -55,7 +56,6 @@ from captum.attr import IntegratedGradients, Saliency
 
 import torchviz
 
-from models.loss_functions import JointLoss
 
 torch.autograd.set_detect_anomaly(True)
 
