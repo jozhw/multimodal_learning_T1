@@ -191,8 +191,9 @@ def main():
             logging.info(f"Saved profile at {trace_path}")
 
         else:
-            # model, optimizer = train_nn(config, config.data.h5_file, device)
-            model, optimizer = train_observ_test(config, config.data.h5_file, device)
+            model, optimizer = train_nn(config, config.data.h5_file, device)
+            # used to observe test set to see if training is stable
+            # model, optimizer = train_observ_test(config, config.data.h5_file, device)
 
 
 if __name__ == "__main__":
