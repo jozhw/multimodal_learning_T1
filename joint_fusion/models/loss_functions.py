@@ -100,7 +100,7 @@ class CoxLoss(nn.Module):
 
 
 class JointLoss(nn.Module):
-    def __init__(self, sim_weight=1.0, contrast_weight=0.1, temperature=0.1, sigma=1):
+    def __init__(self, sim_weight=1.0, contrast_weight=0.0, temperature=0.1, sigma=1):
         super(JointLoss, self).__init__()
 
         self.cox_loss_fn = CoxLoss()
@@ -109,18 +109,18 @@ class JointLoss(nn.Module):
         # self.contrast_loss_fn = ContrastiveLoss(temperature=temperature, sigma=sigma)
 
         self.sim_weight = sim_weight
-        # self.contrast_weight = 0  # contrast_weight
+        self.contrast_weight = 0  # contrast_weight
 
     def forward(self, log_risks, times, censor, wsi_embeddings, omic_embeddings):
         cox_loss = self.cox_loss_fn(log_risks, times, censor)
         sim_loss = self.sim_loss_fn(wsi_embeddings, omic_embeddings)
 
-        # wsi_contrastive_loss = self.contrast_loss_fn(wsi_embeddings, times, censor)
-        # omic_contrastive_loss = self.contrast_loss_fn(omic_embeddings, times, censor)
-        # contrastive_loss = (wsi_contrastive_loss + omic_contrastive_loss) / 2
+        wsi_contrastive_loss = self.contrast_loss_fn(wsi_embeddings, times, censor)
+        omic_contrastive_loss = self.contrast_loss_fn(omic_embeddings, times, censor)
+        contrastive_loss = (wsi_contrastive_loss + omic_contrastive_loss) / 2
 
         return (
             cox_loss
             + self.sim_weight * sim_loss
-            # + self.contrast_weight * contrastive_loss
+            + self.contrast_weight * contrastive_loss
         )
