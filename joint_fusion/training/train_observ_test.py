@@ -227,7 +227,10 @@ def train_observ_test(config, h5_file, device):
                 optimizer, T_0=10, T_mult=2, eta_min=1e-6
             )
 
-        joint_loss = JointLoss()
+        joint_loss = JointLoss(
+            sim_weight=config.training.sim_loss_weight,
+            contrast_weight=config.training.contrast_loss_weight,
+        )
 
         # Initialize and fit the scaler for this fold
         print(f"Fitting scaler for fold {fold_idx + 1}...")

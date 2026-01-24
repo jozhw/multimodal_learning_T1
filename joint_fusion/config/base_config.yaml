@@ -28,9 +28,15 @@ training:
   n_folds: 5
   use_mixed_precision: true
   plot_survival_distributions: true
+  contrast_loss_weight: 0.0
+  sim_loss_weight: 1.0
 
 testing:
+  output_base_dir: ""
   test_batch_size: 1
+  model_path: ""
+  calc_saliency_maps: false
+  calc_IG: false
 
 gpu:
   gpu_ids: "0,1,2,3"

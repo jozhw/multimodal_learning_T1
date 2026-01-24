@@ -39,11 +39,17 @@ class TrainingConfig:
     n_folds: int = 5
     use_mixed_precision: bool = True
     plot_survival_distributions: bool = True
+    contrast_loss_weight: float = 0.0
+    sim_loss_weight: float = 1.0
 
 
 @dataclass
 class TestingConfig:
+    output_base_dir: Optional[str] = None
     test_batch_size: int = 1
+    model_path: Optional[str] = None
+    calc_saliency_maps: bool = False
+    calc_IG: bool = False
 
 
 @dataclass
@@ -93,6 +99,11 @@ class Config:
 
         if self.logging.checkpoint_dir is None:
             self.logging.checkpoint_dir = f"checkpoints/checkpoint_{self.timestamp}"
+
+        if self.testing.output_base_dir == "" or self.testing.output_base_dir == None:
+            self.testing.output_base_dir = (
+                f"checkpoints/checkpoint_{self.timestamp}/test_results"
+            )
 
 
 class ConfigManager:
