@@ -1,6 +1,6 @@
 from joint_fusion.models.loss_functions import JointLoss
 from joint_fusion.models.multimodal_network import MultimodalNetwork
-from joint_fusion.utils.utils import mixed_collate
+from joint_fusion.utils.utils import mixed_collate, seed_worker
 from .learning_scheduler import CosineAnnealingWarmRestartsDecay
 from .pretraining import (
     create_data_loaders,
@@ -56,7 +56,9 @@ def train_nn(config, h5_file, device):
 
     current_time = datetime.now()
 
-    train_loader, _, _ = create_data_loaders(config, h5_file)
+    train_loader, _, _ = create_data_loaders(
+        config, h5_file, config.training.random_state
+    )
 
     dataset = (
         train_loader.dataset
@@ -82,6 +84,7 @@ def train_nn(config, h5_file, device):
             events=events,
             n_splits=config.training.n_folds,
             n_time_bins=10,
+            random_state=config.training.random_state,
         )
         logging.info(f"Successfully created {len(folds)} stratified folds")
 
@@ -90,7 +93,7 @@ def train_nn(config, h5_file, device):
         # Fallback to regular k-fold if stratified fails
         from sklearn.model_selection import KFold
 
-        kf = KFold(n_splits=config.training.n_folds, shuffle=True, random_state=6)
+        kf = KFold(n_splits=config.training.n_folds, shuffle=True, random_state=40)
         folds = list(kf.split(np.arange(len(dataset))))
         print("Falling back to regular K-Fold CV")
 
@@ -152,6 +155,7 @@ def train_nn(config, h5_file, device):
             pin_memory=True,
             shuffle=True,
             drop_last=True,
+            worker_init_fn=seed_worker,
         )
         val_loader_fold = DataLoader(
             val_subset,
@@ -160,6 +164,7 @@ def train_nn(config, h5_file, device):
             shuffle=False,
             num_workers=4,
             pin_memory=True,
+            worker_init_fn=seed_worker,
         )
 
         # Compute number of batches per epoch

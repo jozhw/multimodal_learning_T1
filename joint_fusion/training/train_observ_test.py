@@ -1,6 +1,6 @@
 from joint_fusion.models.loss_functions import JointLoss
 from joint_fusion.models.multimodal_network import MultimodalNetwork
-from joint_fusion.utils.utils import mixed_collate
+from joint_fusion.utils.utils import mixed_collate, seed_worker
 from joint_fusion.testing.analysis import evaluate_test_set
 from .learning_scheduler import CosineAnnealingWarmRestartsDecay
 from .pretraining import (
@@ -104,7 +104,7 @@ def train_observ_test(config, h5_file, device):
         # Fallback to regular k-fold if stratified fails
         from sklearn.model_selection import KFold
 
-        kf = KFold(n_splits=config.training.n_folds, shuffle=True, random_state=6)
+        kf = KFold(n_splits=config.training.n_folds, shuffle=True, random_state=40)
         folds = list(kf.split(np.arange(len(dataset))))
         print("Falling back to regular K-Fold CV")
 
@@ -166,6 +166,7 @@ def train_observ_test(config, h5_file, device):
             pin_memory=True,
             shuffle=True,
             drop_last=True,
+            worker_init_fn=seed_worker,
         )
         val_loader_fold = DataLoader(
             val_subset,
@@ -174,6 +175,7 @@ def train_observ_test(config, h5_file, device):
             shuffle=False,
             num_workers=4,
             pin_memory=True,
+            worker_init_fn=seed_worker,
         )
 
         # Compute number of batches per epoch

@@ -5,6 +5,7 @@ import pandas as pd
 import torch
 import h5py
 import numpy as np
+import random
 
 import os
 import argparse
@@ -75,6 +76,16 @@ def main():
 
     config = ConfigManager.load_config(opt.config)
 
+    # make model deterministic for reproducibility
+    seed = config.training.random_state
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
     os.makedirs(config.logging.checkpoint_dir, exist_ok=True)
     ConfigManager.save_config(config, config.logging.checkpoint_dir)
 
@@ -96,7 +107,9 @@ def main():
         device = torch.device("cpu")
 
     logging.info("Using device:", device)
-    torch.backends.cudnn.benchmark = True  # A bool that, if True, causes cuDNN to benchmark multiple convolution algorithms and select the fastest.
+    # torch.backends.cudnn.benchmark = True  # A bool that, if True, causes cuDNN to benchmark multiple convolution algorithms and select the fastest.
+
+    # TODO: Need to use the "mapping_df_31Jan_1000tiles.json" as it is consistent with the early fusion and used in the paper because of the 20x magnification. Instead, I need to create a random sampler that samples randomly 400 tiles of the 1000 tiles. The following data mapping generation and also modify the configuration will be needed. I will need to provide the new path to the file for the "input_wsi_path" parameter and the "input_mapping_data_path" and the "h5_file". Probably best if I create a directory not within the joint_fusion to store the corresponding files.
 
     if config.data.create_new_data_mapping:
         # create data mappings

@@ -41,6 +41,7 @@ class TrainingConfig:
     plot_survival_distributions: bool = True
     contrast_loss_weight: float = 0.0
     sim_loss_weight: float = 1.0
+    random_state: int = 40
 
 
 @dataclass
