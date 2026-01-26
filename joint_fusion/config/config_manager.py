@@ -6,13 +6,14 @@ from datetime import datetime
 
 @dataclass
 class DataConfig:
-    input_path: str
+    input_base_path: str
+    input_base_mapping_data_json_path: str
     input_wsi_path: str
     h5_file: str
-    input_mapping_data_path: str = ""
     only_create_new_data_mapping: bool = False
     create_new_data_mapping: bool = False
     create_new_data_mapping_h5: bool = False
+    num_tiles_per_slide: int = 400
 
 
 @dataclass
