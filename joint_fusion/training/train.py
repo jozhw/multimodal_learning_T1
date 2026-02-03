@@ -1,13 +1,12 @@
 from joint_fusion.models.loss_functions import JointLoss
 from joint_fusion.models.multimodal_network import MultimodalNetwork
-from joint_fusion.utils.utils import mixed_collate, seed_worker
+from joint_fusion.utils.utils import mixed_collate, seed_worker, print_gpu_memory_usage
 from .learning_scheduler import CosineAnnealingWarmRestartsDecay
 from .pretraining import (
     create_data_loaders,
     create_stratified_survival_folds,
     extract_survival_data,
 )
-from .train import print_gpu_memory_usage
 from .visualizations import plot_survival_distributions
 
 import gc

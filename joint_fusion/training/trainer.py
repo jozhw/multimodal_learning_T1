@@ -6,6 +6,8 @@ import torch
 import h5py
 import numpy as np
 import random
+import ast
+import time
 
 import os
 import argparse
@@ -77,13 +79,29 @@ def create_mapping_df(
     seed: int,
     excluded_ids: list[str],
 ):
+
     mapping_df = pd.read_json(input_json, orient="index")
     logging.info(f"Loaded mapping: {mapping_df.shape[0]} samples")
 
-    # keep slides with WSI
-    mapping_df = mapping_df[
-        (mapping_df["tiles"].map(len) > 0) & (mapping_df["rnaseq_data"].notna())
-    ]
+    if isinstance(mapping_df["rnaseq_data"].iloc[0], str):
+        logging.info("Parsing rnaseq_data from string format...")
+        mapping_df["rnaseq_data"] = mapping_df["rnaseq_data"].apply(ast.literal_eval)
+
+    ids_with_wsi = mapping_df[mapping_df["tiles"].map(len) > 0].index.tolist()
+
+    rnaseq_df = pd.DataFrame(
+        mapping_df["rnaseq_data"].to_list(), index=mapping_df.index
+    ).transpose()
+
+    logging.warning("Are there nans in rnaseq_df: %s", rnaseq_df.isna().any().any())
+
+    mapping_df = mapping_df.loc[ids_with_wsi]
+
+    logging.info(
+        "Total number of samples where both rnaseq and wsi data are available: %s",
+        mapping_df.shape[0],
+    )
+
     # sample tiles
     mapping_df = sample_tiles_per_slide(mapping_df, n_tiles, seed)
 
@@ -106,15 +124,28 @@ def split_mapping(mapping_df, seed: int):
 
 
 def create_h5_file(file_name, train_df, val_df, test_df, image_dir):
-    with h5py.File(file_name, "w") as hdf:
+    logger = logging.getLogger("h5_creation")
+
+    start_time = time.time()
+
+    temp_file = file_name + ".tmp"
+
+    logger.info(f"Creating HDF5 file (temp): {temp_file}")
+
+    with h5py.File(temp_file, "w") as hdf:
         for df, split in zip([train_df, val_df, test_df], ["train", "val", "test"]):
+
+            logger.info(f"Creating split group: {split} ({len(df)} patients)")
             split_group = hdf.create_group(split)
+
             total_rows = len(df)
             count_row = 0
             for idx, row in df.iterrows():
                 # set_trace()
                 count_row += 1
-                print(f"Processing {split} data: {count_row}/{total_rows} rows")
+
+                logger.info(f"Processing {split} data: {count_row}/{total_rows} rows")
+
                 patient_group = split_group.create_group(idx)
                 patient_group.create_dataset("days_to_death", data=row["days_to_death"])
                 patient_group.create_dataset(
@@ -125,18 +156,35 @@ def create_h5_file(file_name, train_df, val_df, test_df, image_dir):
                     "event_occurred", data=1 if row["event_occurred"] == "Dead" else 0
                 )
 
-                rnaseq_data = np.array(list(row["rnaseq_data"].values()))
+                rnaseq = row["rnaseq_data"]
+                rnaseq_data = np.array(list(rnaseq.values()))
+
                 patient_group.create_dataset("rnaseq_data", data=rnaseq_data)
 
                 # store image tiles
                 images_group = patient_group.create_group("images")
                 for i, tile in enumerate(row["tiles"]):
                     image_path = os.path.join(image_dir, tile)
-                    image = Image.open(image_path)
-                    img_arr = np.array(image)
-                    images_group.create_dataset(
-                        f"image_{i}", data=img_arr, compression="gzip"
-                    )
+                    with Image.open(image_path) as image:
+                        img_arr = np.array(image)
+                        images_group.create_dataset(
+                            f"image_{i}", data=img_arr, compression="gzip"
+                        )
+
+            logger.info(f"Finished split: {split}")
+
+        hdf.flush()
+        logger.info("Flushed HDF5 file to disk")
+
+    logger.info("Validating temporary HDF5 file")
+
+    with h5py.File(temp_file, "r") as f:
+        for split in ["train", "val", "test"]:
+            logger.info(f" {split}: {len(f[split])} patients")
+
+    os.replace(temp_file, file_name)
+    elapsed = time.time() - start_time
+    logger.info(f"HDF5 creation complete: {file_name} ({elapsed:.1f})s")
 
 
 def main():
@@ -160,12 +208,15 @@ def main():
         log_level=config.logging.log_level,
     )
 
+    h5_logger = logging.getLogger("h5_creation")
+    h5_logger.setLevel(logging.INFO)
+
     logger.info("Starting training")
     logger.info(f"Checkpoint dir: {config.logging.checkpoint_dir}")
 
     device = get_device(config.gpu.gpu_ids)
 
-    logging.info("Using device:", device)
+    logging.info(f"Using device: {device}")
     # torch.backends.cudnn.benchmark = True  # A bool that, if True, causes cuDNN to benchmark multiple convolution algorithms and select the fastest.
 
     excluded_ids = [
@@ -180,8 +231,6 @@ def main():
             seed=config.training.random_state,
             excluded_ids=excluded_ids,
         )
-
-        mapping_df = mapping_df[~mapping_df.index.isin(excluded_ids)]
 
         mapping_df.to_json(
             os.path.join(config.data.input_base_path, "mapping_df.json"),
