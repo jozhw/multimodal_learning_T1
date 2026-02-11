@@ -43,9 +43,10 @@ class SimilarityLoss(nn.Module):
         want to force embeddings to be similar for the same patient
         """
         # normalize vectors
-        cosine_sim = F.cosine_similarity(wsi_embeddings, omic_embeddings)
-        cosine_sim = cosine_sim.clamp(min=-1, max=1)
+        wsi_embeddings = F.normalize(wsi_embeddings, dim=1)
+        omic_embeddings = F.normalize(omic_embeddings, dim=1)
 
+        cosine_sim = (wsi_embeddings * omic_embeddings).sum(dim=1)
         loss = torch.mean(1 - cosine_sim)
 
         return loss
@@ -106,7 +107,7 @@ class JointLoss(nn.Module):
         self.cox_loss_fn = CoxLoss()
         self.sim_loss_fn = SimilarityLoss()
         # NOTE: performance of the contrastive loss is quite poor
-        # self.contrast_loss_fn = ContrastiveLoss(temperature=temperature, sigma=sigma)
+        self.contrast_loss_fn = ContrastiveLoss(temperature=temperature, sigma=sigma)
 
         self.sim_weight = sim_weight
         self.contrast_weight = 0  # contrast_weight

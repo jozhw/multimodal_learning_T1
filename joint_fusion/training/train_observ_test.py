@@ -239,7 +239,19 @@ def train_observ_test(config, h5_file, device):
         for batch_idx, (tcga_id, _, _, _, x_omic) in enumerate(train_loader_fold):
             if batch_idx % 10 == 0:  # Print progress every 10 batches
                 print(f"  Fitting batch {batch_idx + 1}/{len(train_loader_fold)}")
+
             x_omic_np = x_omic.cpu().numpy()
+            nan_mask = np.isnan(x_omic_np)
+            inf_mask = np.isinf(x_omic_np)
+            logging.info(
+                "NaN count: %d | Inf count: %d", nan_mask.sum(), inf_mask.sum()
+            )
+
+            logging.info(
+                "%d zero-variance columns in this batch",
+                (x_omic_np.std(axis=0) == 0).sum(),
+            )
+
             scaler.partial_fit(x_omic_np)
 
         # Save the scaler for the current fold
@@ -390,7 +402,7 @@ def train_observ_test(config, h5_file, device):
                         },
                         checkpoint_path,
                     )
-                    print(
+                    logging.info(
                         f"Checkpoint saved at epoch {epoch}, fold {fold_idx}, to {checkpoint_path}"
                     )
 
@@ -435,12 +447,21 @@ def train_observ_test(config, h5_file, device):
                         event_occurred = event_occurred.to(device)
                         print("Days to event: ", days_to_event)
                         print("event occurred: ", event_occurred)
-                        outputs, wsi_embedding, omic_embedding = model(
-                            config,
-                            tcga_id,
-                            x_wsi=x_wsi,  # list of tensors (one for each tile)
-                            x_omic=x_omic,
-                        )
+                        batch_size = len(tcga_id)
+
+                        if batch_size < torch.cuda.device_count() and isinstance(
+                            model, nn.DataParallel
+                        ):
+                            outputs, wsi_embedding, omic_embedding = model.module(
+                                config, tcga_id, x_wsi=x_wsi, x_omic=x_omic
+                            )
+                        else:
+                            outputs, wsi_embedding, omic_embedding = model(
+                                config,
+                                tcga_id,
+                                x_wsi=x_wsi,  # list of tensors (one for each tile)
+                                x_omic=x_omic,
+                            )
 
                         loss = joint_loss(
                             outputs.squeeze(),
@@ -450,7 +471,9 @@ def train_observ_test(config, h5_file, device):
                             wsi_embedding,
                             omic_embedding,
                         )  # Cox partial likelihood loss for survival outcome prediction
-                        print("\n loss (validation): ", loss.data.item())
+                        logging.info(
+                            f"\n loss (validation): {loss.data.item()}",
+                        )
                         val_loss_epoch += loss.data.item() * len(tcga_id)
                         val_predictions.append(outputs.squeeze())
                         val_times.append(days_to_event)
