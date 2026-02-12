@@ -64,6 +64,8 @@ class CoxLoss(nn.Module):
         :return: Cox loss (scalar)
         """
         device = log_risks.device
+        if log_risks.dim() == 0:
+            log_risks = log_risks.unsqueeze(0)
         # numerical stability
         log_risks = torch.clamp(log_risks, min=-10, max=10)
         sorted_times, sorted_indices = torch.sort(times, descending=True)

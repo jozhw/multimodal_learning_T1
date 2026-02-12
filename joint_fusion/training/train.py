@@ -305,9 +305,11 @@ def train_nn(config, h5_file, device):
                             x_omic=x_omic,  # Now properly scaled
                         )
 
+                        predictions = predictions.view(-1)
+
                         # print(f"Model predictions shape: {predictions.shape}")
                         loss = joint_loss(
-                            predictions.squeeze(),
+                            predictions,
                             days_to_event,
                             event_occurred,
                             wsi_embedding,
@@ -320,6 +322,11 @@ def train_nn(config, h5_file, device):
                     amp_scaler.scale(loss).backward()
                     amp_scaler.step(optimizer)
                     amp_scaler.update()
+
+                    del predictions, wsi_embedding, omic_embedding, loss, x_wsi, x_omic
+
+                    if batch_idx % 5 == 0:
+                        torch.cuda.empty_cache()
                 else:
                     print(" Not using mixed precision")
                     # model for survival outcome (uses Cox PH partial log likelihood as the loss function)
@@ -333,10 +340,12 @@ def train_nn(config, h5_file, device):
                         x_wsi=x_wsi,  # list of tensors (one for each tile)
                         x_omic=x_omic,
                     )
+
+                    predictions = predictions.view(-1)
                     # print(f"predictions: {predictions} from train_test.py")
                     step1_time = time.time()
                     loss = joint_loss(
-                        predictions.squeeze(),
+                        predictions,
                         # predictions are not survival outcomes, rather log-risk scores beta*X
                         days_to_event,
                         event_occurred,
@@ -451,8 +460,9 @@ def train_nn(config, h5_file, device):
                                 x_omic=x_omic,
                             )
 
+                        outputs = outputs.view(-1)
                         loss = joint_loss(
-                            outputs.squeeze(),
+                            outputs,
                             # predictions are not survival outcomes, rather log-risk scores beta*X
                             days_to_event,
                             event_occurred,
@@ -463,13 +473,15 @@ def train_nn(config, h5_file, device):
                             f"\n loss (validation): {loss.data.item()}",
                         )
                         val_loss_epoch += loss.data.item() * len(tcga_id)
-                        val_predictions.append(outputs.squeeze())
+                        val_predictions.append(outputs)
                         val_times.append(days_to_event)
                         val_events.append(event_occurred)
 
                         val_wsi_emb.append(wsi_embedding)
                         val_omic_emb.append(omic_embedding)
                         val_tcga_id_list.extend(tcga_id)
+
+                    torch.cuda.empty_cache()
 
                     val_loss = val_loss_epoch / len(val_loader_fold.dataset)
 
