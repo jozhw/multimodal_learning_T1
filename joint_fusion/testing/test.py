@@ -2,11 +2,14 @@ import os
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
+import logging
 
 from pathlib import Path
 from sksurv.metrics import concordance_index_censored
 from lifelines import KaplanMeierFitter
 from lifelines.statistics import logrank_test
+
+logger = logging.getLogger(__name__)
 
 
 def denormalize_image(image, mean, std):
@@ -45,7 +48,7 @@ def calc_integrated_gradients(
         print("steps_index: ", steps_index)
         scaled_input = scaled_input.clone().detach().requires_grad_(True)
         with torch.enable_grad():
-            pred, _, _ = model(
+            pred, _, _, _ = model(
                 config,
                 tcga_id,
                 x_wsi=x_wsi,  # list of tensors (one for each tile)
@@ -203,7 +206,7 @@ def test_and_interpret(config, model, test_loader, device, baseline=None):
             # print("event occurred: ", event_occurred)
 
             if config.testing.calc_saliency_maps is False:
-                outputs, wsi_embedding, omic_embedding = model(
+                outputs, wsi_embedding, omic_embedding, _ = model(
                     config,
                     tcga_id,
                     x_wsi=x_wsi,  # list of tensors (one for each tile)
@@ -213,7 +216,7 @@ def test_and_interpret(config, model, test_loader, device, baseline=None):
             else:
                 # perform the forward pass without torch.no_grad() to allow gradient computation
                 with torch.enable_grad():
-                    outputs, wsi_embedding, omic_embedding = model(
+                    outputs, wsi_embedding, omic_embedding, _ = model(
                         config,
                         tcga_id,
                         x_wsi=x_wsi,  # list of tensors (one for each tile)

@@ -6,6 +6,10 @@ from lifelines import KaplanMeierFitter
 from lifelines.statistics import logrank_test
 from sksurv.metrics import concordance_index_censored
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 def evaluate_test_set(model, test_loader, device, config, excluded_ids=None):
     """
@@ -17,7 +21,7 @@ def evaluate_test_set(model, test_loader, device, config, excluded_ids=None):
     # Extract the base model from DataParallel wrapper if it exists
     if isinstance(model, nn.DataParallel):
         test_model = model.module
-        print("Removed DataParallel wrapper for testing")
+        logger.info("Removed DataParallel wrapper for testing")
     else:
         test_model = model
 
@@ -38,7 +42,7 @@ def evaluate_test_set(model, test_loader, device, config, excluded_ids=None):
             x_omic,
         ) in enumerate(test_loader):
             if tcga_id[0] in excluded_ids:
-                print(f"Skipping TCGA ID: {tcga_id}")
+                logger.info(f"Skipping TCGA ID: {tcga_id}")
                 continue
 
             x_wsi = [x.to(device) for x in x_wsi]
@@ -46,13 +50,13 @@ def evaluate_test_set(model, test_loader, device, config, excluded_ids=None):
             days_to_event = days_to_event.to(device)
             event_occurred = event_occurred.to(device)
 
-            print(f"Batch size: {len(test_loader.dataset)}")
-            print(
+            logger.info(f"Batch size: {len(test_loader.dataset)}")
+            logger.info(
                 f"Test Batch index: {batch_idx + 1} out of {np.ceil(len(test_loader.dataset) / config.testing.test_batch_size)}"
             )
-            print("TCGA ID: ", tcga_id)
-            print("Days to event: ", days_to_event)
-            print("event occurred: ", event_occurred)
+            logger.info("TCGA ID: ", tcga_id)
+            logger.info("Days to event: ", days_to_event)
+            logger.info("event occurred: ", event_occurred)
 
             outputs, _, _, _ = test_model(config, tcga_id, x_wsi=x_wsi, x_omic=x_omic)
 
@@ -72,9 +76,9 @@ def evaluate_test_set(model, test_loader, device, config, excluded_ids=None):
         test_ci = concordance_index_censored(
             all_events_np.astype(bool), all_times_np, all_predictions_np
         )[0]
-        print(f"Test CI: {test_ci}")
+        logger.info(f"Test CI: {test_ci}")
     except Exception as e:
-        print(f"Could not calculate test CI: {e}")
+        logger.info(f"Could not calculate test CI: {e}")
         test_ci = float("nan")
 
     median_prediction = np.median(all_predictions_np)
@@ -106,6 +110,6 @@ def evaluate_test_set(model, test_loader, device, config, excluded_ids=None):
     )
 
     p_value = log_rank_results.p_value
-    print(f"Log-Rank Test p-value: {p_value}")
-    print(f"Log-Rank Test statistic: {log_rank_results.test_statistic}")
+    logger.info(f"Log-Rank Test p-value: {p_value}")
+    logger.info(f"Log-Rank Test statistic: {log_rank_results.test_statistic}")
     return test_ci, test_event_rate, log_rank_results.test_statistic, p_value

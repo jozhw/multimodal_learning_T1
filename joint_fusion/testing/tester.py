@@ -7,7 +7,11 @@ from torch import nn
 import h5py
 import logging
 import argparse
-import pandas as pd
+
+from datetime import datetime
+
+
+from joint_fusion.utils.logging import setup_logging
 
 from .test import test_and_interpret
 
@@ -18,8 +22,6 @@ from joint_fusion.training.pretraining import (
     create_data_loaders,
 )
 from joint_fusion.config.config_manager import ConfigManager
-
-from pathlib import Path
 
 
 def compute_mean_omic_from_h5(file_name):
@@ -80,7 +82,7 @@ def setup_model_and_device(config):
     if config.gpu.gpu_ids == "-1":
         device = torch.device("cpu")
         gpu_ids = []
-        print("Using CPU")
+        logging.info("Using CPU")
     else:
         gpu_ids = [int(x) for x in config.gpu.gpu_ids.split(",") if x.strip()]
         if not gpu_ids:
@@ -92,11 +94,11 @@ def setup_model_and_device(config):
 
         if not gpu_ids:
             device = torch.device("cpu")
-            print("No valid GPUs found, falling back to CPU")
+            logging.warning("No valid GPUs found, falling back to CPU")
         else:
             device = torch.device(f"cuda:{gpu_ids[0]}")
-            print(f"Available GPUs: {available_gpus}")
-            print(f"Using GPUs: {gpu_ids}")
+            logging.info(f"Available GPUs: {available_gpus}")
+            logging.info(f"Using GPUs: {gpu_ids}")
 
     return device, gpu_ids
 
@@ -116,7 +118,7 @@ def load_model_with_multi_gpu_support(config, device, gpu_ids):
     )
 
     # Load checkpoint
-    print(f"Loading model from: {config.testing.model_path}")
+    logging.info(f"Loading model from: {config.testing.model_path}")
     checkpoint = torch.load(config.testing.model_path, map_location="cpu")
     state_dict = checkpoint["model_state_dict"]
 
@@ -124,8 +126,8 @@ def load_model_with_multi_gpu_support(config, device, gpu_ids):
     has_module_prefix = any(k.startswith("module.") for k in state_dict.keys())
     use_multi_gpu = len(gpu_ids) > 1 and config.gpu.use_multi_gpu
 
-    print(f"Saved model has 'module.' prefix: {has_module_prefix}")
-    print(f"Will use multi-GPU: {use_multi_gpu}")
+    logging.info(f"Saved model has 'module.' prefix: {has_module_prefix}")
+    logging.info(f"Will use multi-GPU: {use_multi_gpu}")
 
     # Handle state dict prefix conversion
     from collections import OrderedDict
@@ -159,7 +161,7 @@ def load_model_with_multi_gpu_support(config, device, gpu_ids):
 
     # Load the state dict
     model.load_state_dict(state_dict)
-    print("Model loaded successfully")
+    logging.info("Model loaded successfully")
 
     return model
 
@@ -168,6 +170,7 @@ def args():
 
     parser = argparse.ArgumentParser()
 
+    # ideally this should be the path to the config in the checkpoint model
     parser.add_argument(
         "--config",
         type=str,
@@ -181,6 +184,18 @@ def main():
 
     opt = args()
     config = ConfigManager.load_config(opt.config)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    log_name = f"test_{timestamp}.log"
+
+    logging.captureWarnings(True)
+    logger = setup_logging(
+        log_dir=config.testing.output_base_dir,
+        log_level=config.logging.log_level,
+        log_name=log_name,
+    )
+
     config.gpu.use_multi_gpu = False  # testing does not support multigpu currently
     if config.testing.output_base_dir == "":
         raise ValueError("No output_base_dir inputed.")
@@ -193,7 +208,7 @@ def main():
     joint_loss = JointLoss()
 
     train_loader, validation_loader, test_loader = create_data_loaders(
-        config, config.data.input_mapping_data_path + "mapping_data.h5"
+        config, config.data.h5_file
     )
     validation_dataset = validation_loader.dataset
     test_dataset = test_loader.dataset
@@ -208,9 +223,7 @@ def main():
         pin_memory=True,
     )
 
-    mean_x_omic = compute_mean_omic_from_h5(
-        config.data.input_mapping_data_path + "mapping_data.h5"
-    )
+    mean_x_omic = compute_mean_omic_from_h5(config.data.h5_file)
 
     test_and_interpret(config, model, combined_loader, device, baseline=mean_x_omic)
 
