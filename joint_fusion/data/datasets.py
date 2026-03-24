@@ -145,7 +145,6 @@ class HDF5Dataset(Dataset):
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         # Pre-computed normalization constants (moved to device for efficiency)
-        self.register_normalization_constants()
 
         # Setup transforms once
         self.setup_transforms()
@@ -380,9 +379,6 @@ class HDF5Dataset(Dataset):
         # Convert from NHWC to NCHW
         images_tensor = images_tensor.permute(0, 3, 1, 2)
 
-        # Apply normalization
-        images_tensor = (images_tensor - self.norm_mean) / self.norm_std
-
         return images_tensor
 
     def _apply_augmentations_batch(self, images_tensor):
@@ -495,15 +491,15 @@ class HDF5Dataset(Dataset):
 
         # Load images with caching (optimized)
         images = self._load_and_process_images(patient_id, patient_data)
-        print(
-            f"DEBUG - Patient {patient_id}: images.shape = {images.shape}"
-        )  # Should be [N, 3, 256, 256]
+        # logger.debug(
+        #     f"Patient {patient_id}: images.shape = {images.shape}"
+        # )  # Should be [N, 3, 256, 256]
 
         # Convert to list for compatibility with existing code
         images_list = list(torch.unbind(images, dim=0))
-        print(
-            f"DEBUG - images_list length: {len(images_list)}, first shape: {images_list[0].shape}"
-        )
+        # logger.debug(
+        #     f"Images_list length: {len(images_list)}, first shape: {images_list[0].shape}"
+        # )
 
         step3_time = time.time()
 

@@ -1,3 +1,4 @@
+import gc
 from pathlib import Path
 
 import torch
@@ -11,16 +12,11 @@ def mixed_collate(batch):
 
     days = torch.tensor(days, dtype=torch.float32)
     events = torch.tensor(events, dtype=torch.float32)
-    x_omics = torch.stack(x_omics)
+    x_omics = torch.stack(x_omics)  # [B, G]
 
-    # images_lists: list of patients -> each has 400 tensors
-    num_tiles = len(images_lists[0])  # should be 400
-
-    # Transpose: tiles across patients
-    x_wsi = []
-    for t in range(num_tiles):
-        tile_batch = torch.stack([patient_tiles[t] for patient_tiles in images_lists])
-        x_wsi.append(tile_batch)
+    # images_lists: tuple length B, each element is list length T of [3,H,W]
+    x_wsi = torch.stack([torch.stack(tiles, dim=0) for tiles in images_lists], dim=0)
+    # x_wsi: [B, T, 3, H, W]
 
     return patient_ids, days, events, x_wsi, x_omics
 

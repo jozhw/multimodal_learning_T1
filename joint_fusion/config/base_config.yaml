@@ -18,6 +18,8 @@ model:
   fusion_type: "joint"
   joint_embedding: "weighted_avg"
   input_mode: "wsi_omic"
+  wsi_uni: "uni"
+  pooling: "attention"
   use_pretrained_omic: false
   omic_checkpoint_path: "checkpoints/checkpoint_2024-09-04-07-56-47/checkpoint_epoch_1500.pth" 
   

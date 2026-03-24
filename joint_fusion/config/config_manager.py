@@ -12,6 +12,7 @@ class DataConfig:
     input_base_mapping_data_json_path: str
     input_wsi_path: str
     h5_file: str
+    json_file: str
     only_create_new_data_mapping: bool = False
     create_new_data_mapping: bool = False
     create_new_data_mapping_h5: bool = False
@@ -27,6 +28,8 @@ class ModelConfig:
     fusion_type: str = "joint"
     joint_embedding: str = "weighted_avg"
     input_mode: str = "wsi_omic"
+    wsi_fm: str = "uni"
+    pooling: str = "attention"
     use_pretrained_omic: bool = False
     omic_checkpoint_path: Optional[str] = (
         None  # only use when use_pretrained_omic is True

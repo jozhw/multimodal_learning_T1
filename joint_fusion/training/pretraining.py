@@ -42,7 +42,7 @@ class StratifiedBatchSampler:
         available_indices = set(self.indices.copy())
 
         if self.shuffle:
-            available_indices = set(np.random.permutation(list(available_indicies)))
+            available_indices = set(np.random.permutation(list(available_indices)))
 
         # Generate baches until out of samples
         while len(available_indices) >= self.batch_size:

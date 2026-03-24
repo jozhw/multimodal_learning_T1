@@ -45,7 +45,6 @@ def evaluate_test_set(model, test_loader, device, config, excluded_ids=None):
                 logger.info(f"Skipping TCGA ID: {tcga_id}")
                 continue
 
-            x_wsi = [x.to(device) for x in x_wsi]
             x_omic = x_omic.to(device)
             days_to_event = days_to_event.to(device)
             event_occurred = event_occurred.to(device)
@@ -54,11 +53,14 @@ def evaluate_test_set(model, test_loader, device, config, excluded_ids=None):
             logger.info(
                 f"Test Batch index: {batch_idx + 1} out of {np.ceil(len(test_loader.dataset) / config.testing.test_batch_size)}"
             )
-            logger.info("TCGA ID: ", tcga_id)
-            logger.info("Days to event: ", days_to_event)
-            logger.info("event occurred: ", event_occurred)
+            logger.info("TCGA ID: %s", tcga_id)
+            logger.info("Days to event: %s", days_to_event)
+            logger.info("event occurred: %s", event_occurred)
 
-            outputs, _, _, _ = test_model(config, tcga_id, x_wsi=x_wsi, x_omic=x_omic)
+            actual_model = model.module if isinstance(model, nn.DataParallel) else model
+            actual_model.config = config
+            actual_model.tcga_id = tcga_id
+            outputs, _, _, _ = test_model(x_wsi=x_wsi, x_omic=x_omic)
 
             # Collect results consistently
             test_predictions.append(outputs.squeeze().detach().cpu().numpy())

@@ -28,24 +28,24 @@ def calc_integrated_gradients(
     # torch.Size([1, 19962])
     # set_trace()
     if baseline is None:
-        print("** using trivial zero baseline for IG **")
+        logger.info("** using trivial zero baseline for IG **")
         baseline = torch.zeros_like(x_omic).to(x_omic.device)
     else:
-        print(
+        logger.info(
             "** Using mean gene expression values over training samples as the baseline for IG **"
         )
         baseline = torch.from_numpy(baseline).to(x_omic.device)
         baseline = baseline.float()
         baseline = baseline * torch.ones_like(x_omic).to(x_omic.device)
     # set_trace()
-    print(f"CALCULATING INTEGRATED GRADIENTS OVER {steps} steps")
+    logger.info(f"CALCULATING INTEGRATED GRADIENTS OVER {steps} steps")
     scaled_inputs = [
         baseline + (float(i) / steps) * (x_omic - baseline) for i in range(steps + 1)
     ]
     gradients = []
     steps_index = 0
     for scaled_input in scaled_inputs:
-        print("steps_index: ", steps_index)
+        logger.info(f"steps_index: {steps_index}")
         scaled_input = scaled_input.clone().detach().requires_grad_(True)
         with torch.enable_grad():
             pred, _, _, _ = model(
@@ -54,7 +54,7 @@ def calc_integrated_gradients(
                 x_wsi=x_wsi,  # list of tensors (one for each tile)
                 x_omic=scaled_input,
             )
-            print("prediction: ", pred)
+            logger.info(f"prediction: {pred}")
             output = pred.sum()
             output.backward()
         gradients.append(scaled_input.grad.detach().cpu().numpy())
@@ -114,7 +114,7 @@ def plot_saliency_maps(
         output_dir, f"saliency_overlay_{tcga_id[0]}_{patch_id}.png"
     )
     plt.savefig(save_path)
-    print(f"saved saliency overlay to {save_path}")
+    logger.info(f"saved saliency overlay to {save_path}")
 
     plt.close()
 
@@ -130,9 +130,9 @@ def interpret_wsi(x_wsi, tcga_id, output_dir_saliency):
 
     patch_idx = 0
     max_patches = 10
-    print("OBTAINING SALIENCY MAPS")
+    logger.info("OBTAINING SALIENCY MAPS")
     for image in x_wsi:
-        print(
+        logger.info(
             f"Generating saliency map for patch index {patch_idx} out of {max_patches}"
         )
         if patch_idx >= max_patches:  # limit to 10 patches
@@ -186,7 +186,7 @@ def test_and_interpret(config, model, test_loader, device, baseline=None):
             x_omic,
         ) in enumerate(test_loader):
             if tcga_id[0] in excluded_ids:
-                print(f"Skipping TCGA ID: {tcga_id}")
+                logger.info(f"Skipping TCGA ID: {tcga_id}")
                 continue
 
             x_wsi = [x.to(device) for x in x_wsi]
@@ -197,13 +197,13 @@ def test_and_interpret(config, model, test_loader, device, baseline=None):
             # enable gradients only after data loading
             x_wsi = [x.requires_grad_() for x in x_wsi]
 
-            # print(f"Batch size: {len(test_loader.dataset)}")
-            # print(
+            # logger.info(f"Batch size: {len(test_loader.dataset)}")
+            # logger.info(
             #     f"Test Batch index: {batch_idx + 1} out of {np.ceil(len(test_loader.dataset) / opt.test_batch_size)}"
             # )
-            # # print("TCGA ID: ", tcga_id)
-            # print("Days to event: ", days_to_event)
-            # print("event occurred: ", event_occurred)
+            # # logger.info("TCGA ID: ", tcga_id)
+            # logger.info("Days to event: ", days_to_event)
+            # logger.info("event occurred: ", event_occurred)
 
             if config.testing.calc_saliency_maps is False:
                 outputs, wsi_embedding, omic_embedding, _ = model(
@@ -223,7 +223,7 @@ def test_and_interpret(config, model, test_loader, device, baseline=None):
                         x_omic=x_omic,
                     )
 
-                    # Check and print memory usage after each batch
+                    # Check and logger.info memory usage after each batch
                     allocated_memory = torch.cuda.memory_allocated(device) / (
                         1024**3
                     )  # in GB
@@ -231,10 +231,10 @@ def test_and_interpret(config, model, test_loader, device, baseline=None):
                         1024**3
                     )  # in GB
 
-                    print(f"After batch {batch_idx + 1}:")
-                    print(f"Allocated memory: {allocated_memory:.2f} GB")
-                    print(f"Reserved memory: {reserved_memory:.2f} GB")
-                    print(
+                    logger.info(f"After batch {batch_idx + 1}:")
+                    logger.info(f"Allocated memory: {allocated_memory:.2f} GB")
+                    logger.info(f"Reserved memory: {reserved_memory:.2f} GB")
+                    logger.info(
                         f"Free memory: {torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)} bytes"
                     )
                     torch.cuda.empty_cache()
@@ -255,7 +255,9 @@ def test_and_interpret(config, model, test_loader, device, baseline=None):
                     output_dir_IG, f"integrated_grads_{tcga_id[0]}.npy"
                 )
                 np.save(save_path, integrated_grads)
-                print(f"Saved integrated gradients for {tcga_id[0]} to {save_path}")
+                logger.info(
+                    f"Saved integrated gradients for {tcga_id[0]} to {save_path}"
+                )
 
             all_predictions.append(outputs.squeeze().detach().cpu().numpy())
 
@@ -276,7 +278,7 @@ def test_and_interpret(config, model, test_loader, device, baseline=None):
             all_events_bool_np.ravel(), all_times_np.ravel(), all_predictions_np
         )
 
-        print(f"CI: {c_index[0]}")
+        logger.info(f"CI: {c_index[0]}")
 
     # set_trace()
     # stratify based on the median risk scores
@@ -309,8 +311,8 @@ def test_and_interpret(config, model, test_loader, device, baseline=None):
     )
 
     p_value = log_rank_results.p_value
-    print(f"Log-Rank Test p-value: {p_value}")
-    print(f"Log-Rank Test statistic: {log_rank_results.test_statistic}")
+    logger.info(f"Log-Rank Test p-value: {p_value}")
+    logger.info(f"Log-Rank Test statistic: {log_rank_results.test_statistic}")
 
     plt.figure(figsize=(10, 6))
     kmf_high_risk.plot(ci_show=True, color="blue")

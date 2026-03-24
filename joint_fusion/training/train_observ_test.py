@@ -31,7 +31,7 @@ from sklearn.preprocessing import StandardScaler
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-torch.autograd.set_detect_anomaly(True)
+torch.autograd.set_detect_anomaly(False)
 
 current_time = datetime.now().strftime("%y_%m_%d_%H_%M")
 
@@ -68,6 +68,7 @@ def train_observ_test(config, h5_file, device):
         batch_size=config.testing.test_batch_size,
         shuffle=True,
         num_workers=0,
+        collate_fn=mixed_collate,
         pin_memory=True,
     )
 
@@ -190,6 +191,7 @@ def train_observ_test(config, h5_file, device):
         )
 
         model = MultimodalNetwork(
+            config,
             embedding_dim_wsi=config.model.embedding_dim_wsi,
             embedding_dim_omic=config.model.embedding_dim_omic,
             mode=config.model.input_mode,
@@ -298,7 +300,7 @@ def train_observ_test(config, h5_file, device):
                 #     [tile.to(device) for tile in patient_tiles]
                 #     for patient_tiles in x_wsi
                 # ]
-                x_wsi = [x.to(device) for x in x_wsi]
+
                 x_omic = x_omic.to(device)
 
                 print(f"After scaling - x_omic shape: {x_omic.shape}")
@@ -312,14 +314,19 @@ def train_observ_test(config, h5_file, device):
 
                 if config.training.use_mixed_precision:
                     with autocast():  # should wrap only the forward pass including the loss calculation
+                        actual_model = (
+                            model.module
+                            if isinstance(model, nn.DataParallel)
+                            else model
+                        )
+                        actual_model.config = config
+                        actual_model.tcga_id = tcga_id
                         (
                             predictions,
                             wsi_embedding,
                             omic_embedding,
                             combined_embedding,
                         ) = model(
-                            config,
-                            tcga_id,
                             x_wsi=x_wsi,
                             x_omic=x_omic,  # Now properly scaled
                         )
@@ -355,10 +362,13 @@ def train_observ_test(config, h5_file, device):
 
                     start_time = time.time()
 
+                    actual_model = (
+                        model.module if isinstance(model, nn.DataParallel) else model
+                    )
+                    actual_model.config = config
+                    actual_model.tcga_id = tcga_id
                     predictions, wsi_embedding, omic_embedding, combined_embedding = (
                         model(
-                            config,
-                            tcga_id,
                             x_wsi=x_wsi,  # list of tensors (one for each tile)
                             x_omic=x_omic,
                         )
@@ -463,7 +473,6 @@ def train_observ_test(config, h5_file, device):
                         print(
                             f"Validation Batch index: {batch_idx + 1} out of {np.ceil(len(val_loader_fold.dataset) / config.training.val_batch_size)}"
                         )
-                        x_wsi = [x.to(device) for x in x_wsi]
                         x_omic = x_omic.to(device)
 
                         days_to_event = days_to_event.to(device)
@@ -472,29 +481,15 @@ def train_observ_test(config, h5_file, device):
                         print("event occurred: ", event_occurred)
                         batch_size = len(tcga_id)
 
-                        if batch_size < torch.cuda.device_count() and isinstance(
-                            model, nn.DataParallel
-                        ):
-                            (
-                                outputs,
-                                wsi_embedding,
-                                omic_embedding,
-                                combined_embedding,
-                            ) = model.module(
-                                config, tcga_id, x_wsi=x_wsi, x_omic=x_omic
-                            )
-                        else:
-                            (
-                                outputs,
-                                wsi_embedding,
-                                omic_embedding,
-                                combined_embedding,
-                            ) = model(
-                                config,
-                                tcga_id,
-                                x_wsi=x_wsi,  # list of tensors (one for each tile)
-                                x_omic=x_omic,
-                            )
+                        actual_model = (
+                            model.module
+                            if isinstance(model, nn.DataParallel)
+                            else model
+                        )
+                        actual_model.config = config
+                        outputs, wsi_embedding, omic_embedding, combined_embedding = (
+                            model(x_wsi=x_wsi, x_omic=x_omic)
+                        )
 
                         outputs = outputs.view(-1)
                         loss = joint_loss(

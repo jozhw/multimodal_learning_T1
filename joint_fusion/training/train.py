@@ -179,6 +179,7 @@ def train_nn(config, h5_file, device):
         )
 
         model = MultimodalNetwork(
+            config,
             embedding_dim_wsi=config.model.embedding_dim_wsi,
             embedding_dim_omic=config.model.embedding_dim_omic,
             mode=config.model.input_mode,

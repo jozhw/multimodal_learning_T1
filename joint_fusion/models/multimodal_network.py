@@ -38,6 +38,7 @@ def get_mlp_layers(embedding_dim, num_layers, base_dim=256):
 class MultimodalNetwork(nn.Module):
     def __init__(
         self,
+        config,
         embedding_dim_wsi,
         embedding_dim_omic,
         mode,
@@ -50,6 +51,7 @@ class MultimodalNetwork(nn.Module):
     ):
         super(MultimodalNetwork, self).__init__()
 
+        self.config = config
         self.mode = mode  # wsi_omic, wsi or omic
         self.fusion_type = fusion_type
 
@@ -68,7 +70,7 @@ class MultimodalNetwork(nn.Module):
             self.wsi_weight = 1
 
         if self.mode == "wsi_omic":
-            self.wsi_net = WSINetwork(embedding_dim_wsi)
+            self.wsi_net = WSINetwork(self.config, embedding_dim_wsi)
             self.omic_net = OmicNetwork(
                 embedding_dim_omic,
                 use_pretrained_vae=use_pretrained_omic,
@@ -107,17 +109,45 @@ class MultimodalNetwork(nn.Module):
 
         self.stored_omic_embedding = None
 
-    def forward(self, config, tcga_id, x_wsi=None, x_omic=None):
-        # print("x_wsi: ", x_wsi) # contains float values and not the image files here
-        # print("x_omic: ", x_omic)
-
+    def forward(self, x_wsi=None, x_omic=None):
+        # --- normalize x_wsi to: list[patient] where patient is (list_of_tiles or Tensor[T,C,H,W]) ---
+        if isinstance(x_wsi, torch.Tensor):
+            if x_wsi.dim() == 5:
+                # [B,T,C,H,W] -> list of B patients (each [T,C,H,W])
+                x_wsi_patients = [x_wsi[b] for b in range(x_wsi.size(0))]
+            elif x_wsi.dim() == 4:
+                # [T,C,H,W] single patient
+                x_wsi_patients = [x_wsi]
+            else:
+                raise ValueError(f"Unexpected x_wsi tensor shape: {x_wsi.shape}")
+        elif isinstance(x_wsi, list):
+            if len(x_wsi) == 0:
+                x_wsi_patients = []
+            elif isinstance(x_wsi[0], torch.Tensor) and x_wsi[0].dim() == 3:
+                # list of tiles for ONE patient
+                x_wsi_patients = [x_wsi]
+            else:
+                # already list of patients (each patient is list/tensor of tiles)
+                x_wsi_patients = x_wsi
+        else:
+            raise TypeError(f"Unexpected x_wsi type: {type(x_wsi)}")
         start_time = time.time()
         # print("fusion type: ", self.fusion_type)
-        if self.fusion_type == "joint":
-            wsi_embedding = self.wsi_net(x_wsi)
-            omic_embedding = self.omic_net(x_omic)
-            # print("wsi_embedding.shape: ", wsi_embedding.shape)
-            # print("omic_embedding.shape: ", omic_embedding.shape)
+        wsi_embeddings = []
+
+        # x_wsi is a Tensor [B,T,3,H,W]
+        for patient_tiles in x_wsi:
+            # patient_tiles is [T,3,H,W]
+            emb = self.wsi_net(patient_tiles)  # MUST return [1,D] or [D]
+            if emb.dim() == 1:
+                emb = emb.unsqueeze(0)
+
+            wsi_embeddings.append(emb)
+
+        wsi_embedding = torch.cat(wsi_embeddings, dim=0)  # [N_replica, embed_dim]
+        omic_embedding = self.omic_net(x_omic)  # [N_replica, embed_dim]
+        print("wsi_embedding.shape: ", wsi_embedding.shape)
+        print("omic_embedding.shape: ", omic_embedding.shape)
         step1_time = time.time()
 
         print("input mode: ", self.mode)
@@ -131,14 +161,17 @@ class MultimodalNetwork(nn.Module):
 
         # with the joint loss the embeddings must be the same dim
 
+        print("wsi_embedding:", wsi_embedding.shape)
+        print("omic_embedding:", omic_embedding.shape)
+
         wsi_projected = self.wsi_projection(wsi_embedding)
         omic_projected = self.omic_projection(omic_embedding)
         raw_wsi_embedding = wsi_projected
         raw_omic_embedding = omic_projected
 
         if (
-            config.model.joint_embedding == "weighted_avg"
-            or config.model.joint_embedding == "weighted_avg_dynamic"
+            self.config.model.joint_embedding == "weighted_avg"
+            or self.config.model.joint_embedding == "weighted_avg_dynamic"
         ):
 
             total_weight = self.omic_weight + self.wsi_weight
@@ -148,7 +181,7 @@ class MultimodalNetwork(nn.Module):
                 normalized_rna * omic_projected + normalized_wsi * wsi_projected
             )
 
-        elif config.model.joint_embedding == "concatenate":
+        elif self.config.model.joint_embedding == "concatenate":
 
             combined_embedding = torch.cat((wsi_embedding, omic_embedding), dim=1)
 

@@ -3,31 +3,57 @@ Code to generate WSI embeddings using i) only inference from a pretrained model 
 """
 
 import os
-import torch
 from pathlib import Path
 from dotenv import load_dotenv
+
+# WARNING: Must import here otherwise it will default to hf and will not have the right paths
+env_path = Path.cwd() / ".env"
+print("CWD:", Path.cwd())
+print(".env path:", env_path)
+print(".env exists:", env_path.exists())
+load_dotenv(env_path)
+print("ENV HF_HOME:", os.getenv("HF_HOME"))
+print("ENV HUGGINGFACE_HUB_CACHE:", os.getenv("HUGGINGFACE_HUB_CACHE"))
+print("ENV HF_TOKEN set:", bool(os.getenv("HF_TOKEN")))
+
+
+# WARNING: Load models after .env variables are obtained
+import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torchvision.transforms import Resize, Normalize, Compose
+import torchvision.transforms.functional as TF
+
 import timm
 from timm.models.vision_transformer import VisionTransformer
 from timm.data import resolve_data_config
 from timm.data.transforms_factory import create_transform
-from huggingface_hub import login
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 # from pdb import set_trace
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# ensure you're authenticated with huggingface to access the UNI model weights
-env_path = Path.cwd() / ".env"
-load_dotenv(env_path)
+from huggingface_hub import login
 
 HF_TOKEN = os.getenv("HF_TOKEN")
 if HF_TOKEN:
     login(token=HF_TOKEN)
 else:
     print("Warning: No Hugging Face token provided. Authentication might fail.")
+
+# logger.info("HF_HOME: %s", constants.HF_HOME)
+# logger.info("HF_HUB_CACHE: %s", constants.HF_HUB_CACHE)
+# logger.info("TMPDIR: %s", os.getenv("TMPDIR"))
+
+from huggingface_hub import constants
+
+print("HF_HOME:", constants.HF_HOME)
+print("HF_HUB_CACHE:", constants.HF_HUB_CACHE)
+print("TMPDIR:", os.getenv("TMPDIR"))
 
 
 class LearnedWeightedPool(nn.Module):
@@ -84,37 +110,23 @@ class AttentionPool(nn.Module):
         # (1, n_tiles) @ (n_tiles, embedding_dim) = (1, embedding_dim)
         output = attention_weights @ values
 
-        return output.squeeze(0), attention_weights.squeeze(
-            0
-        )  # Return both output and attention weights
+        return output, attention_weights  # Return both output and attention weights
 
 
 # create a custom dataset to prepare tile data for entering into the encoder
 class CustomDatasetWSI(Dataset):
-    def __init__(self, tiles, wsi_fm, transform=None):
+    def __init__(self, tiles):
         # "tiles" : list of tensors
         self.tiles = tiles
-        self.transform = transform
-        self.wsi_fm = wsi_fm
 
     def __len__(self):
         return len(self.tiles)
 
     def __getitem__(self, idx):
         tile = self.tiles[idx]
-        if self.transform:
-            # set_trace()
-            # # convert tensor to PIL Image only for UNI model to make it compatible with the transform function from timm
-            # if self.wsi_fm == 'uni' and isinstance(tile, torch.Tensor):
-            #     set_trace()
-            #     # tile.shape: torch.Size([200, 3, 256, 256])
-            #     tile = transforms.ToPILImage()(tile)
-            # tile = self.transform(tile)
-            if not isinstance(tile, torch.Tensor):
-                tile = self.transform(tile)
 
-            if self.wsi_fm == "lunit_DINO":
-                tile = self.transform(tile)
+        if isinstance(tile, torch.Tensor) and tile.dim() == 4 and tile.shape[0] == 1:
+            tile = tile.squeeze(0)
 
         return tile
 
@@ -152,20 +164,6 @@ def load_uni_model(model_name="UNI"):
     return model, transform
 
 
-transform_lunit = Compose(
-    [
-        Resize((224, 224)),  # resize image to 224x224 for the model
-        # ToTensor(),
-        # normalization parameters for lunit DINO from
-        # https://github.com/lunit-io/benchmark-ssl-pathology/releases/tag/pretrained-weights
-        Normalize(
-            mean=[0.70322989, 0.53606487, 0.66096631],
-            std=[0.21716536, 0.26081574, 0.20723464],
-        ),
-    ]
-)
-
-
 # Use the pretrained Lunit-DINO model [Kang et al. (2023), "Benchmarking Self-Supervised Learning on Diverse Pathology Datasets"] for WSI feature extraction (trained on histopathology images)
 # Lunit-DINO uses the ViT-S architecture with DINO for SSL
 # Refer to Caron et al. (2021), "Emerging Properties in Self-Supervised Vision Transformers" for DINO implementation
@@ -190,8 +188,8 @@ class WSIEncoder(nn.Module):
 
     def __init__(
         self,
-        wsi_fm="lunit_DINO",
-        pooling="average",
+        wsi_fm,
+        pooling,
         pretrained=True,
         progress=False,
         patch_size=16,
@@ -207,6 +205,18 @@ class WSIEncoder(nn.Module):
             self.model = self.vit_small(
                 pretrained, progress, "DINO_p16", patch_size=patch_size
             )
+            transform_lunit = Compose(
+                [
+                    Resize((224, 224)),  # resize image to 224x224 for the model
+                    # ToTensor(),
+                    # normalization parameters for lunit DINO from
+                    # https://github.com/lunit-io/benchmark-ssl-pathology/releases/tag/pretrained-weights
+                    Normalize(
+                        mean=[0.70322989, 0.53606487, 0.66096631],
+                        std=[0.21716536, 0.26081574, 0.20723464],
+                    ),
+                ]
+            )
 
             self.transform = transform_lunit
             self.embed_dim = 384
@@ -221,6 +231,40 @@ class WSIEncoder(nn.Module):
                 print(f"Total number of transformer blocks in lunit DINO: {num_blocks}")
                 last_block_idx = num_blocks - 1
                 # unfreeze the last transformer block
+                print(f"Unfreezing block{last_block_idx}")
+                for param in self.model.blocks[last_block_idx].parameters():
+                    param.requires_grad = True
+
+                # unfreeze the final norm layer
+                for param in self.model.norm.parameters():
+                    param.requires_grad = True
+
+        elif self.wsi_fm == "uni":
+            self.model, _ = load_uni_model()
+            self.embed_dim = self.model.num_features
+            self.uni_normalize = Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225],
+            )
+
+            # set_trace()
+
+            # freeze all layers by default
+            for param in self.model.parameters():
+                param.requires_grad = False
+
+            # for joint fusion, unfreeze the last transformer block and norm layer
+            if __name__ != "__main__":
+                # # check this: unfreeze the last transformer block (UNI has 24 blocks, indexed 0-23)
+                # for param in self.model.blocks[23].parameters():
+                #     param.requires_grad = True
+
+                # get the number of transformer blocks
+                num_blocks = len(self.model.blocks)
+                print(f"Total number of transformer blocks in UNI: {num_blocks}")
+
+                # unfreeze the last transformer block
+                last_block_idx = num_blocks - 1
                 print(f"Unfreezing block {last_block_idx}")
                 for param in self.model.blocks[last_block_idx].parameters():
                     param.requires_grad = True
@@ -269,31 +313,71 @@ class WSIEncoder(nn.Module):
         return model
 
     def get_wsi_embeddings(self, x_wsi):
-        # 'x_wsi' contain data from all tiles (list of tensors residing on the gpu)
-        # len(x_wsi) = number of tiles per WSI
-        # should get embeddings for each tile and pool them to get embeddings at the patient level
-        dataset = CustomDatasetWSI(x_wsi, self.wsi_fm, transform=self.transform)
-        tile_loader = DataLoader(
-            dataset, batch_size=1, shuffle=False
-        )  # check later why the batch size is hard-coded to 1
-        embeddings = []
+        """
+        Expected inputs
+        - Tensor: [T, 3, H, W]  (best)
+        - OR list of T tensors: each [3, H, W]  (ok)
 
-        # for joint fusion. Need to train parts of the model alongside models for other modalities and the downstream task
-        for tiles in tile_loader:
-            tiles = tiles.to(device)
-            features = self.model(
-                tiles.squeeze(0)
-            )  # Get rid of the leading dim; the model expects [batch_size, n_channels, h, w]; probably tied to batch_size hardcoded to 1?
-            embeddings.append(features.cpu())  # is moving to cpu really needed??
+        Returns:
+        - slide_embedding: [embed_dim] (or [1, embed_dim] depending on your pooling)
+        - if attention pooling: also return attention_weights
+        """
 
-        embeddings_tensor = torch.stack(embeddings)
-        # for joint fusion, the backprop will be through the combined embeddings to the inputs
+        # 1) Normalize input type -> tiles tensor [T, 3, H, W]
+        if isinstance(x_wsi, list):
+            # list of [3,H,W]
+            if len(x_wsi) == 0:
+                raise ValueError("Empty tile list for patient")
+            if not isinstance(x_wsi[0], torch.Tensor):
+                raise TypeError(f"Expected list of tensors, got {type(x_wsi[0])}")
+            tiles = torch.stack(x_wsi, dim=0)  # [T,3,H,W]
+        elif isinstance(x_wsi, torch.Tensor):
+            tiles = x_wsi
+        else:
+            raise TypeError(f"Unsupported x_wsi type: {type(x_wsi)}")
 
-        if self.pooling in {"attention", "learned_weighted"}:
-            slide_embedding = self.attention_pool(
-                embeddings_tensor.squeeze(1).to(device)
+        # 2) Fix shapes defensively (but no more DP squeezing gymnastics)
+        if tiles.dim() == 5 and tiles.size(0) == 1:
+            # occasionally someone passes [1,T,3,H,W]
+            tiles = tiles.squeeze(0)
+        if tiles.dim() != 4:
+            raise ValueError(f"Expected tiles [T,3,H,W], got {tuple(tiles.shape)}")
+
+        # 3) Ensure channels are correct
+        if tiles.size(1) != 3:
+            raise ValueError(
+                f"Expected RGB tiles with C=3, got C={tiles.size(1)} and shape {tuple(tiles.shape)}"
             )
-        else:  # average pooling
 
-            slide_embedding = torch.mean(embeddings_tensor, dim=0)
-        return slide_embedding
+        # 4) Move to device
+        tiles = tiles.to(self.device)  # keep grads for saliency if needed
+
+        # 5) Resize + normalize in batch
+        tiles = TF.resize(tiles, [224, 224])  # works on [N,C,H,W]
+
+        if self.wsi_fm == "uni":
+            tiles = self.uni_normalize(tiles)
+        elif self.wsi_fm == "lunit_DINO":
+            tiles = self.transform(tiles)
+        else:
+            raise ValueError(f"Unsupported wsi_fm: {self.wsi_fm}")
+
+        # 6) Encode in minibatches to avoid OOM
+        # (tune bs for Polaris / your GPU mem)
+        bs = 64
+        embs = []
+        for i in range(0, tiles.size(0), bs):
+            feats = self.model(tiles[i : i + bs])  # [b, embed_dim]
+            if feats.dim() == 1:
+                feats = feats.unsqueeze(0)
+            embs.append(feats)
+
+        embeddings_tensor = torch.cat(embs, dim=0)  # [T, embed_dim]
+
+        # 7) Pool across tiles
+        if self.pooling in {"attention", "learned_weighted"}:
+            slide_embedding, attention_weights = self.attention_pool(embeddings_tensor)
+            return slide_embedding, attention_weights
+        else:
+            logger.warning("Using average pooling since no valid pooling selected")
+            return embeddings_tensor.mean(dim=0)
