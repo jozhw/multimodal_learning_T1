@@ -10,167 +10,223 @@ from joint_fusion.data.datasets import HDF5Dataset
 
 class StratifiedBatchSampler:
     """
-    Combines time stratification with risk-set preservation
+    Stratified batch sampler for survival data with partial Cox loss.
+
+    Design goals:
+      1. Each batch mirrors the training marginal distribution over
+         (time_bin x event_status) strata — this keeps gradient estimates
+         low-variance and unbiased, which is the correct justification for
+         stratified sampling under SGD.
+      2. Each batch is guaranteed a minimum number of events so the partial
+         Cox likelihood has enough risk-set signal to be meaningful.
+      3. No explicit risk-set membership forcing.
+
+    Args:
+        times:             Array of survival/censoring times.
+        events:            Binary event indicator array.
+        batch_size:        Number of samples per batch.
+        n_time_bins:       Number of time strata (combined with event status
+                           gives 2 * n_time_bins strata total).
+        min_events_per_batch: Hard floor on events per batch. Defaults to
+                           max(1, round(batch_size * observed_event_rate)).
+                           Raise this if batches are too small for stable
+                           partial Cox gradients.
+        shuffle:           Re-permute within strata each epoch.
+        random_state:      Seed for reproducibility.
     """
 
     def __init__(
         self,
         times,
         events,
-        batch_size,
-        min_risk_coverage=0.8,
-        shuffle=True,
+        batch_size: int,
+        n_time_bins: int = 5,
+        min_events_per_batch: tp.Optional[int] = None,
+        shuffle: bool = True,
         random_state: int = 40,
     ):
-        self.times = np.array(times)
-        self.events = np.array(events)
+        self.times = np.array(times, dtype=float)
+        self.events = np.array(events, dtype=int)
         self.batch_size = batch_size
-        self.min_risk_coverage = min_risk_coverage
         self.shuffle = shuffle
+        self.random_state = random_state
+        self.rng = np.random.default_rng(random_state)
 
-        self.indices = np.arange(len(times))
+        n = len(self.times)
+        observed_event_rate = self.events.mean()
 
-        # Create time strata for balanced representation
-        self.time_quantiles = np.quantile(times[events == 1], [0, 0.33, 0.67, 1.0])
-        self.event_time_strata = (
-            np.digitize(times[events == 1], self.time_quantiles) - 1
+        # Default min events: match training event rate, at least 1
+        if min_events_per_batch is None:
+            self.min_events_per_batch = max(1, round(batch_size * observed_event_rate))
+        else:
+            self.min_events_per_batch = min_events_per_batch
+
+        # Build strata: time_bin x event_status -> stratum label
+        # Adjust n_time_bins if we have fewer unique times than requested
+        n_unique_times = len(np.unique(self.times))
+        if n_unique_times < n_time_bins:
+            print(
+                f"[StratifiedBatchSampler] Only {n_unique_times} unique times; "
+                f"reducing n_time_bins from {n_time_bins} to {n_unique_times}."
+            )
+            n_time_bins = n_unique_times
+
+        self.n_time_bins = n_time_bins
+
+        try:
+            disc = KBinsDiscretizer(
+                n_bins=n_time_bins,
+                encode="ordinal",
+                strategy="quantile",
+                subsample=None,
+            )
+            time_bins = (
+                disc.fit_transform(self.times.reshape(-1, 1)).flatten().astype(int)
+            )
+        except Exception as e:
+            print(
+                f"[StratifiedBatchSampler] KBinsDiscretizer failed ({e}); "
+                "falling back to manual quantile bins."
+            )
+            edges = np.unique(
+                np.quantile(self.times, np.linspace(0, 1, n_time_bins + 1))
+            )
+            time_bins = np.clip(np.digitize(self.times, edges[1:]), 0, n_time_bins - 1)
+
+        # Stratum label: encodes both time position and event status
+        # Range: [0, 2 * n_time_bins)
+        self.strat_labels = time_bins * 2 + self.events
+
+        # Build per-stratum index lists (these are used for proportional sampling)
+        unique_strata, strata_counts = np.unique(self.strat_labels, return_counts=True)
+        self.strata = {s: np.where(self.strat_labels == s)[0] for s in unique_strata}
+        # Proportion of each stratum in the full dataset
+        self.strata_proportions = {
+            s: cnt / n for s, cnt in zip(unique_strata, strata_counts)
+        }
+
+        # Separate event / censored index pools for the minimum-events guarantee
+        self.event_indices = np.where(self.events == 1)[0]
+        self.censored_indices = np.where(self.events == 0)[0]
+
+        print(
+            f"[StratifiedBatchSampler] {n} samples | "
+            f"event rate={observed_event_rate:.3f} | "
+            f"{len(unique_strata)} strata | "
+            f"min_events_per_batch={self.min_events_per_batch}"
         )
 
     def __iter__(self):
-
-        # Get all available indices
-        available_indices = set(self.indices.copy())
-
+        # Fresh per-epoch permutation within each stratum
         if self.shuffle:
-            available_indices = set(np.random.permutation(list(available_indices)))
+            strata_pools = {
+                s: self.rng.permutation(idx) for s, idx in self.strata.items()
+            }
+        else:
+            strata_pools = {s: idx.copy() for s, idx in self.strata.items()}
 
-        # Generate baches until out of samples
-        while len(available_indices) >= self.batch_size:
-            batch = self._create_hybrid_batch(available_indices)
+        # Pointers into each stratum pool
+        strata_ptrs = {s: 0 for s in strata_pools}
 
-            # Remove used indices from available set
-            for idx in batch:
-                available_indices.discard(idx)
+        total = len(self.times)
+        n_batches = total // self.batch_size  # drop last incomplete batch
 
-            yield batch
-
-        # Drop incomplete batches so no need to handle leftover indices
+        for _ in range(n_batches):
+            batch = self._create_stratified_batch(strata_pools, strata_ptrs)
+            if batch is not None:
+                yield batch
 
     def __len__(self):
-        """Return number of batches per epoch"""
-        return len(self.indices) // self.batch_size
+        return len(self.times) // self.batch_size
 
-    def _create_hybrid_batch(self, available_indices):
-        """Create batch with both time balance and risk-set preservation"""
-        batch = []
-        available_list = list(available_indices)
+    def _create_stratified_batch(self, strata_pools, strata_ptrs):
+        """
+        Build one batch by:
+          1. Proportional sampling from each stratum (mirrors training marginal).
+          2. Topping up from the event pool if the minimum-events floor isn't met.
+          3. Filling any remaining slots uniformly from all strata.
+        """
+        batch_indices = []
+        n_events_so_far = 0
 
-        # Step 1: Select events with temporal diversity
-        event_candidates = [i for i in available_list if self.events[i] == 1]
+        # Step 1: proportional draw from each stratum
+        slots_per_stratum = self._compute_stratum_slots()
 
-        if event_candidates:
-            # Group events by time strata
-            early_events = [
-                i for i in event_candidates if self.times[i] <= self.time_quantiles[1]
-            ]
-            mid_events = [
-                i
-                for i in event_candidates
-                if self.time_quantiles[1] < self.times[i] <= self.time_quantiles[2]
-            ]
-            late_events = [
-                i for i in event_candidates if self.times[i] > self.time_quantiles[2]
-            ]
+        for stratum, n_slots in slots_per_stratum.items():
+            pool = strata_pools[stratum]
+            ptr = strata_ptrs[stratum]
 
-            # Sample events from each stratum (temporal balance)
-            max_events_per_stratum = max(1, self.batch_size // 6)  # Conservative
-            selected_events = []
+            # Wrap pointer if stratum is exhausted mid-epoch
+            available = len(pool) - ptr
+            if available <= 0:
+                strata_ptrs[stratum] = 0
+                ptr = 0
+                available = len(pool)
 
-            for event_group in [early_events, mid_events, late_events]:
-                if event_group:
-                    n_select = min(len(event_group), max_events_per_stratum)
-                    selected = np.random.choice(event_group, n_select, replace=False)
-                    selected_events.extend(selected)
+            take = min(n_slots, available)
+            selected = pool[ptr : ptr + take]
+            strata_ptrs[stratum] += take
 
-            batch.extend(selected_events)
+            batch_indices.extend(selected.tolist())
+            n_events_so_far += self.events[selected].sum()
 
-            # Step 2: For each selected event, ensure risk-set coverage
-            for event_idx in selected_events:
-                event_time = self.times[event_idx]
+        # Step 2: enforce minimum events per batch
+        if n_events_so_far < self.min_events_per_batch:
+            shortfall = self.min_events_per_batch - n_events_so_far
+            current_set = set(batch_indices)
 
-                # Find at-risk samples
-                at_risk_candidates = [
-                    i
-                    for i in available_list
-                    if i not in batch and self.times[i] >= event_time
-                ]
+            # Draw from event pool, excluding already-selected indices
+            candidate_events = [i for i in self.event_indices if i not in current_set]
+            if self.shuffle:
+                candidate_events = self.rng.permutation(candidate_events).tolist()
 
-                if at_risk_candidates:
-                    # Calculate needed coverage
-                    total_at_risk = np.sum(self.times >= event_time)
-                    needed = int(self.min_risk_coverage * total_at_risk)
-                    needed = min(needed, len(at_risk_candidates))
+            top_up = candidate_events[:shortfall]
+            batch_indices.extend(top_up)
+            n_events_so_far += len(top_up)
 
-                    # Sample at-risk with some temporal diversity
-                    at_risk_candidates.sort(key=lambda i: self.times[i])
+        # Step 3: fill remaining slots up to batch_size
+        remaining = self.batch_size - len(batch_indices)
+        if remaining > 0:
+            current_set = set(batch_indices)
+            all_indices = np.arange(len(self.times))
+            leftover = [i for i in all_indices if i not in current_set]
+            if self.shuffle:
+                leftover = self.rng.permutation(leftover).tolist()
+            batch_indices.extend(leftover[:remaining])
 
-                    # Use stratified sampling within at-risk set
-                    if needed > 1:
-                        indices = np.linspace(
-                            0, len(at_risk_candidates) - 1, needed
-                        ).astype(int)
-                        selected_at_risk = [at_risk_candidates[j] for j in indices]
-                    else:
-                        selected_at_risk = at_risk_candidates[:needed]
+        if len(batch_indices) < self.batch_size:
+            # Dataset nearly exhausted — skip this batch
+            return None
 
-                    # Add to batch if space allows
-                    space_remaining = self.batch_size - len(batch)
-                    batch.extend(selected_at_risk[:space_remaining])
+        # Final shuffle within batch so model doesn't see time-sorted input
+        batch_indices = batch_indices[: self.batch_size]
+        if self.shuffle:
+            batch_indices = self.rng.permutation(batch_indices).tolist()
 
-                    if len(batch) >= self.batch_size:
-                        break
+        return batch_indices
 
-        # Step 3: Fill remaining slots with temporal balance
-        remaining_slots = self.batch_size - len(batch)
-        if remaining_slots > 0:
-            remaining_candidates = [i for i in available_list if i not in batch]
+    def _compute_stratum_slots(self) -> tp.Dict[int, int]:
+        """
+        Allocate batch slots proportionally to each stratum's share of the data.
+        Uses floor allocation then distributes remainders to largest-remainder strata
+        so the total always equals batch_size exactly.
+        """
+        raw = {
+            s: self.strata_proportions[s] * self.batch_size
+            for s in self.strata_proportions
+        }
+        floors = {s: int(v) for s, v in raw.items()}
+        remainders = {s: raw[s] - floors[s] for s in raw}
 
-            if remaining_candidates:
-                # Add remaining samples with time diversity preference
-                remaining_times = [self.times[i] for i in remaining_candidates]
-                time_weights = self._compute_time_diversity_weights(
-                    remaining_times, batch
-                )
+        allocated = sum(floors.values())
+        shortfall = self.batch_size - allocated
 
-                # Weighted sampling for time diversity
-                probs = np.array(time_weights)
-                probs = probs / probs.sum() if probs.sum() > 0 else np.ones_like(probs)
+        # Distribute remaining slots to strata with largest fractional remainders
+        sorted_by_remainder = sorted(remainders, key=remainders.get, reverse=True)
+        for s in sorted_by_remainder[:shortfall]:
+            floors[s] += 1
 
-                n_additional = min(remaining_slots, len(remaining_candidates))
-                additional = np.random.choice(
-                    remaining_candidates, size=n_additional, replace=False, p=probs
-                )
-                batch.extend(additional)
-
-        return batch[: self.batch_size]
-
-    def _compute_time_diversity_weights(self, candidate_times, current_batch):
-        """Compute weights favoring temporal diversity"""
-        if not current_batch:
-            return [1.0] * len(candidate_times)
-
-        batch_times = [self.times[i] for i in current_batch]
-        batch_time_range = (min(batch_times), max(batch_times))
-
-        weights = []
-        for t in candidate_times:
-            # Higher weight for times that expand the temporal range
-            if t < batch_time_range[0] or t > batch_time_range[1]:
-                weights.append(2.0)  # Expand range
-            else:
-                weights.append(1.0)  # Within range
-
-        return weights
+        return floors
 
 
 def _create_stratification_labels(
@@ -443,7 +499,7 @@ def create_data_loaders(config, h5_file, random_state=40):
         times=times,
         events=events,
         batch_size=config.training.batch_size,
-        min_risk_coverage=0.8,
+        min_events_per_batch=1,
         shuffle=True,
         random_state=random_state,
     )
