@@ -56,17 +56,15 @@ def train_observ_test(config, h5_file, device):
 
     current_time = datetime.now()
 
-    train_loader, validation_loader, test_loader = create_data_loaders(config, h5_file)
+    train_loader, test_loader = create_data_loaders(config, h5_file)
 
-    validation_dataset = validation_loader.dataset
     test_dataset = test_loader.dataset
 
     # create a combined loader (validation + test) as the validation data hasn't been used for HPO during training
-    test_dataset = ConcatDataset([validation_dataset, test_dataset])
     test_loader = torch.utils.data.DataLoader(
         dataset=test_dataset,
         batch_size=config.testing.test_batch_size,
-        shuffle=True,
+        shuffle=False,  # need to preserve order.
         num_workers=0,
         collate_fn=mixed_collate,
         pin_memory=True,
@@ -124,6 +122,17 @@ def train_observ_test(config, h5_file, device):
         # Print fold statistics
         print(f"Training samples: {len(train_idx)}")
         print(f"Validation samples: {len(val_idx)}")
+
+        best_val_ci_smooth = -float("inf")
+        best_val_ci_raw = -float("inf")
+        best_val_loss = float("inf")
+        best_epoch = -1
+
+        val_ci_history = []
+        selection_window = 5
+        min_delta = 0.002
+        patience = 10
+        patience_counter = 0
 
         # Extract survival data for this fold to verify stratification
         times_train_fold = times[train_idx]
@@ -429,7 +438,10 @@ def train_observ_test(config, h5_file, device):
                         {
                             "epoch": epoch,
                             "fold": fold_idx,
-                            "model_state_dict": model.state_dict(),
+                            "best_val_ci_smooth": best_val_ci_smooth,
+                            "best_val_ci_raw": best_val_ci_raw,
+                            "best_val_loss": best_val_loss,
+                            "model_state_dict": model_to_save.state_dict(),
                             "optimizer_state_dict": optimizer.state_dict(),
                             "scheduler_state_dict": scheduler.state_dict(),
                         },
@@ -539,11 +551,109 @@ def train_observ_test(config, h5_file, device):
                     )[0]
                     print(f"Validation loss: {val_loss}, CI: {val_ci}")
 
+                    val_ci_history.append(val_ci)
+                    window_start = max(0, len(val_ci_history) - selection_window)
+                    val_ci_smooth = float(np.mean(val_ci_history[window_start:]))
+                    improved = False
+                    if val_ci_smooth > best_val_ci_smooth + min_delta:
+                        improved = True
+                    elif (
+                        abs(val_ci_smooth - best_val_ci_smooth) <= min_delta
+                        and val_loss < best_val_loss
+                    ):
+                        improved = True
+
+                    if improved:
+                        best_val_ci_smooth = val_ci_smooth
+                        best_val_ci_raw = val_ci
+                        best_val_loss = val_loss
+                        best_epoch = epoch
+                        patience_counter = 0
+
+                        model_to_save = (
+                            model.module
+                            if isinstance(model, nn.DataParallel)
+                            else model
+                        )
+                        best_checkpoint_path = os.path.join(
+                            config.logging.checkpoint_dir,
+                            f"best_model_fold_{fold_idx}.pth",
+                        )
+
+                        torch.save(
+                            {
+                                "epoch": epoch,
+                                "fold": fold_idx,
+                                "best_val_ci_smooth": best_val_ci_smooth,
+                                "best_val_ci_raw": best_val_ci_raw,
+                                "best_val_loss": best_val_loss,
+                                "model_state_dict": model_to_save.state_dict(),
+                                "optimizer_state_dict": optimizer.state_dict(),
+                                "scheduler_state_dict": scheduler.state_dict(),
+                            },
+                            best_checkpoint_path,
+                        )
+
+                        wsi_checkpoint_path = os.path.join(
+                            config.logging.checkpoint_dir,
+                            f"best_wsi_embedding_fold_{fold_idx}_epoch_{epoch}.npy",
+                        )
+                        np.save(wsi_checkpoint_path, wsi_np)
+
+                        omic_checkpoint_path = os.path.join(
+                            config.logging.checkpoint_dir,
+                            f"best_omic_embedding_fold_{fold_idx}_epoch_{epoch}.npy",
+                        )
+                        np.save(omic_checkpoint_path, omic_np)
+
+                        print(
+                            f"Embeddings saved at epoch {epoch}, fold {fold_idx}, to {wsi_checkpoint_path} and {omic_checkpoint_path}"
+                        )
+
+                        id_checkpoint_path = os.path.join(
+                            config.logging.checkpoint_dir,
+                            f"best_tcga_ids_fold_{fold_idx}_epoch_{epoch}.npy",
+                        )
+                        np.save(id_checkpoint_path, tcga_id_np)
+
+                        logging.info(
+                            f"Saved new best model for fold {fold_idx} at epoch {epoch} | "
+                            f"raw val CI={val_ci:.4f}, smooth val CI={val_ci_smooth:.4f}, val loss={val_loss:.4f}"
+                        )
+                    else:
+                        patience_counter += 1
+
                     end_val_time = time.time()
                     val_duration = end_val_time - start_val_time
 
-                    # save embeddings once every 5 epochs
+                    # Optional archival checkpoint every 5 epochs
                     if (epoch + 1) % 5 == 0 and epoch > 0:
+                        model_to_save = (
+                            model.module
+                            if isinstance(model, nn.DataParallel)
+                            else model
+                        )
+                        checkpoint_path = os.path.join(
+                            config.logging.checkpoint_dir,
+                            f"checkpoint_fold_{fold_idx}_epoch_{epoch}.pth",
+                        )
+                        torch.save(
+                            {
+                                "epoch": epoch,
+                                "fold": fold_idx,
+                                "best_val_ci_smooth": best_val_ci_smooth,
+                                "best_val_ci_raw": best_val_ci_raw,
+                                "best_val_loss": best_val_loss,
+                                "model_state_dict": model_to_save.state_dict(),
+                                "optimizer_state_dict": optimizer.state_dict(),
+                                "scheduler_state_dict": scheduler.state_dict(),
+                            },
+                            checkpoint_path,
+                        )
+                        logging.info(
+                            f"Checkpoint saved at epoch {epoch}, fold {fold_idx}, to {checkpoint_path}"
+                        )
+
                         wsi_checkpoint_path = os.path.join(
                             config.logging.checkpoint_dir,
                             f"wsi_embedding_fold_{fold_idx}_epoch_{epoch}.npy",
@@ -554,7 +664,6 @@ def train_observ_test(config, h5_file, device):
                             config.logging.checkpoint_dir,
                             f"omic_embedding_fold_{fold_idx}_epoch_{epoch}.npy",
                         )
-
                         np.save(omic_checkpoint_path, omic_np)
 
                         print(
@@ -565,7 +674,6 @@ def train_observ_test(config, h5_file, device):
                             config.logging.checkpoint_dir,
                             f"tcga_ids_fold_{fold_idx}_epoch_{epoch}.npy",
                         )
-
                         np.save(id_checkpoint_path, tcga_id_np)
 
                 test_ci, test_event_rate, test_statistic, p_value = evaluate_test_set(
@@ -642,6 +750,18 @@ def train_observ_test(config, h5_file, device):
                 # increment step counter
                 step_counter += 1
 
+                if patience_counter >= patience:
+                    logging.info(
+                        f"Early stopping fold {fold_idx} at epoch {epoch}. "
+                        f"Best epoch was {best_epoch} with smooth val CI={best_val_ci_smooth:.4f}"
+                    )
+                    break
+
+        logging.info(
+            f"Fold {fold_idx} best checkpoint: epoch={best_epoch}, "
+            f"raw val CI={best_val_ci_raw:.4f}, smooth val CI={best_val_ci_smooth:.4f}, "
+            f"val loss={best_val_loss:.4f}"
+        )
         torch.cuda.empty_cache()
         gc.collect()
         logging.info(

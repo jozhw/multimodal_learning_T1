@@ -1,4 +1,5 @@
 import os
+import re
 import gc
 import psutil
 import pickle
@@ -24,6 +25,23 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+# Obtaining tile coordinates from tile name
+def parse_tile_coordinates(tile_name):
+    base = os.path.splitext(os.path.basename(tile_name))[0]
+    parts = base.split("-")
+
+    if len(parts) < 2:
+        raise ValueError(f"Unexpected tile format: {tile_name}")
+
+    try:
+        x = int(parts[-2])
+        y = int(parts[-1])
+    except ValueError:
+        raise ValueError(f"Could not parse coordinates from title name: {tile_name}")
+
+    return x, y
 
 
 # using opencv with cached images
@@ -119,11 +137,13 @@ class HDF5Dataset(Dataset):
         mode="wsi",
         train_val_test="train",
         num_tiles_per_slide=400,
+        return_tile_names=False,
     ):
         self.train_val_test = train_val_test
         self.split = split
         self.mode = mode
         self.num_tiles_per_slide = num_tiles_per_slide
+        self.return_tile_names = return_tile_names
 
         self.h5_file_path = h5_file
         self.h5_file = h5py.File(h5_file, "r")
@@ -360,7 +380,7 @@ class HDF5Dataset(Dataset):
     def _vectorized_image_loading(self, patient_data):
         """Optimized vectorized image loading"""
         images_group = patient_data["images"]
-        image_keys = list(images_group.keys())
+        image_keys = sorted(images_group.keys(), key=lambda x: int(x.split("_")[-1]))
 
         # Pre-allocate arrays for better memory efficiency
         n_images = len(image_keys)
@@ -501,6 +521,11 @@ class HDF5Dataset(Dataset):
         #     f"Images_list length: {len(images_list)}, first shape: {images_list[0].shape}"
         # )
 
+        tile_names = [
+            t.decode("utf-8") if isinstance(t, bytes) else str(t)
+            for t in patient_data["tile_names"][()]
+        ]
+
         step3_time = time.time()
 
         # Periodic cache statistics logging
@@ -515,6 +540,20 @@ class HDF5Dataset(Dataset):
         if self.train_val_test == "test":
             for img in images_list:
                 img.requires_grad_(True)
+
+        if self.return_tile_names:
+            tile_names = [
+                t.decode("utf-8") if isinstance(t, bytes) else str(t)
+                for t in patient_data["tile_names"][()]
+            ]
+            return (
+                patient_id,
+                days_to_event,
+                event_occurred,
+                images_list,
+                x_omic,
+                tile_names,
+            )
 
         return patient_id, days_to_event, event_occurred, images_list, x_omic
 

@@ -512,20 +512,6 @@ def create_data_loaders(config, h5_file, random_state=40):
         pin_memory=True,
     )
 
-    validation_loader = torch.utils.data.DataLoader(
-        dataset=HDF5Dataset(
-            h5_file,
-            split="val",
-            mode=config.model.input_mode,
-            train_val_test="val",
-        ),
-        batch_size=config.training.val_batch_size,
-        shuffle=True,
-        num_workers=0,  # 8,
-        # prefetch_factor=2,
-        pin_memory=True,
-    )
-
     test_loader = torch.utils.data.DataLoader(
         dataset=HDF5Dataset(
             h5_file,
@@ -540,4 +526,4 @@ def create_data_loaders(config, h5_file, random_state=40):
         pin_memory=True,
     )
 
-    return train_loader, validation_loader, test_loader
+    return train_loader, test_loader

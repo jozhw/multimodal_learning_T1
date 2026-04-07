@@ -1,3 +1,5 @@
+import os
+import re
 import gc
 from pathlib import Path
 
@@ -8,17 +10,39 @@ from torch.utils.data.dataloader import default_collate
 
 
 def mixed_collate(batch):
-    patient_ids, days, events, images_lists, x_omics = zip(*batch)
+    first_sample = batch[0]
 
-    days = torch.tensor(days, dtype=torch.float32)
-    events = torch.tensor(events, dtype=torch.float32)
-    x_omics = torch.stack(x_omics)  # [B, G]
+    if len(first_sample) == 5:
+        patient_ids, days, events, images_lists, x_omics = zip(*batch)
 
-    # images_lists: tuple length B, each element is list length T of [3,H,W]
-    x_wsi = torch.stack([torch.stack(tiles, dim=0) for tiles in images_lists], dim=0)
-    # x_wsi: [B, T, 3, H, W]
+        days = torch.tensor(days, dtype=torch.float32)
+        events = torch.tensor(events, dtype=torch.float32)
+        x_omics = torch.stack(x_omics)
 
-    return patient_ids, days, events, x_wsi, x_omics
+        x_wsi = torch.stack(
+            [torch.stack(tiles, dim=0) for tiles in images_lists], dim=0
+        )
+
+        return patient_ids, days, events, x_wsi, x_omics
+
+    elif len(first_sample) == 6:
+        patient_ids, days, events, images_lists, x_omics, tile_names = zip(*batch)
+
+        days = torch.tensor(days, dtype=torch.float32)
+        events = torch.tensor(events, dtype=torch.float32)
+        x_omics = torch.stack(x_omics)
+
+        x_wsi = torch.stack(
+            [torch.stack(tiles, dim=0) for tiles in images_lists], dim=0
+        )
+
+        return patient_ids, days, events, x_wsi, x_omics, tile_names
+
+    else:
+        raise ValueError(
+            f"Unexpected sample size {len(first_sample)} in batch. "
+            "Expected 5 or 7 elements per sample."
+        )
 
 
 def clear_memory():
@@ -51,3 +75,20 @@ def print_gpu_memory_usage():
         allocated = torch.cuda.memory_allocated() / 1024**3  # GB
         cached = torch.cuda.memory_reserved() / 1024**3  # GB
         print(f"GPU Memory - Allocated: {allocated:.2f}GB, Cached: {cached:.2f}GB")
+
+
+# Obtaining tile coordinates from tile name
+def parse_tile_coordinates(tile_name):
+    base = os.path.splitext(os.path.basename(tile_name))[0]
+    parts = base.split("-")
+
+    if len(parts) < 2:
+        raise ValueError(f"Unexpected tile format: {tile_name}")
+
+    try:
+        x = int(parts[-2])
+        y = int(parts[-1])
+    except ValueError:
+        raise ValueError(f"Could not parse coordinates from title name: {tile_name}")
+
+    return x, y

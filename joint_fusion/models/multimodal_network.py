@@ -109,7 +109,7 @@ class MultimodalNetwork(nn.Module):
 
         self.stored_omic_embedding = None
 
-    def forward(self, x_wsi=None, x_omic=None):
+    def forward(self, x_wsi=None, x_omic=None, return_attention=False):
         # --- normalize x_wsi to: list[patient] where patient is (list_of_tiles or Tensor[T,C,H,W]) ---
         if isinstance(x_wsi, torch.Tensor):
             if x_wsi.dim() == 5:
@@ -134,11 +134,18 @@ class MultimodalNetwork(nn.Module):
         start_time = time.time()
         # print("fusion type: ", self.fusion_type)
         wsi_embeddings = []
+        # attention weights for all patients
+        attention_weights = []
 
         # x_wsi is a Tensor [B,T,3,H,W]
-        for patient_tiles in x_wsi:
+        for patient_tiles in x_wsi_patients:
             # patient_tiles is [T,3,H,W]
             emb = self.wsi_net(patient_tiles)  # MUST return [1,D] or [D]
+
+            if return_attention:
+                attn = self.wsi_net.last_attention_weights
+                attention_weights.append(attn)
+
             if emb.dim() == 1:
                 emb = emb.unsqueeze(0)
 
@@ -209,6 +216,15 @@ class MultimodalNetwork(nn.Module):
         print(
             f"(In MultimodalNetwork) Step 1: {step1_time - start_time:.4f}s, Step 2: {step2_time - step1_time:.4f}s, Step 3: {step3_time - step2_time:.4f}s"
         )
+
+        if return_attention:
+            return (
+                output,
+                raw_wsi_embedding,
+                raw_omic_embedding,
+                combined_embedding,
+                attention_weights,
+            )
 
         return output, raw_wsi_embedding, raw_omic_embedding, combined_embedding
 

@@ -25,8 +25,8 @@ model:
   omic_checkpoint_path: "checkpoints/checkpoint_2024-09-04-07-56-47/checkpoint_epoch_1500.pth" 
   
 training:
-  batch_size: 25
-  val_batch_size: 25
+  batch_size: 30
+  val_batch_size: 30
   lr: 0.0001
   num_epochs: 100
   n_folds: 3

@@ -118,12 +118,11 @@ def create_mapping_df(
 
 
 def split_mapping(mapping_df, seed: int):
-    train_df, temp_df = train_test_split(mapping_df, test_size=0.3, random_state=seed)
-    val_df, test_df = train_test_split(temp_df, test_size=0.5, random_state=seed)
-    return train_df, val_df, test_df
+    train_df, test_df = train_test_split(mapping_df, test_size=0.3, random_state=seed)
+    return train_df, test_df
 
 
-def create_h5_file(file_name, train_df, val_df, test_df, image_dir):
+def create_h5_file(file_name, train_df, test_df, image_dir):
     logger = logging.getLogger("h5_creation")
 
     start_time = time.time()
@@ -133,7 +132,7 @@ def create_h5_file(file_name, train_df, val_df, test_df, image_dir):
     logger.info(f"Creating HDF5 file (temp): {temp_file}")
 
     with h5py.File(temp_file, "w") as hdf:
-        for df, split in zip([train_df, val_df, test_df], ["train", "val", "test"]):
+        for df, split in zip([train_df, test_df], ["train", "test"]):
 
             logger.info(f"Creating split group: {split} ({len(df)} patients)")
             split_group = hdf.create_group(split)
@@ -163,6 +162,10 @@ def create_h5_file(file_name, train_df, val_df, test_df, image_dir):
 
                 # store image tiles
                 images_group = patient_group.create_group("images")
+
+                # store the names of the tiles because it follows <tile_id>-<x_coordinate>-<y_coordinate>
+                tile_names = []
+
                 for i, tile in enumerate(row["tiles"]):
                     image_path = os.path.join(image_dir, tile)
                     with Image.open(image_path) as image:
@@ -170,6 +173,13 @@ def create_h5_file(file_name, train_df, val_df, test_df, image_dir):
                         images_group.create_dataset(
                             f"image_{i}", data=img_arr, compression="gzip"
                         )
+
+                    tile_names.append(tile)
+
+                dt = h5py.string_dtype(encoding="utf-8")
+                patient_group.create_dataset(
+                    "tile_names", data=np.array(tile_names, dtype=object), dtype=dt
+                )
 
             logger.info(f"Finished split: {split}")
 
@@ -179,7 +189,7 @@ def create_h5_file(file_name, train_df, val_df, test_df, image_dir):
     logger.info("Validating temporary HDF5 file")
 
     with h5py.File(temp_file, "r") as f:
-        for split in ["train", "val", "test"]:
+        for split in ["train", "test"]:
             logger.info(f" {split}: {len(f[split])} patients")
 
     os.replace(temp_file, file_name)
@@ -245,14 +255,13 @@ def main():
 
     # set_trace()
 
-    train_df, val_df, test_df = split_mapping(mapping_df, config.training.random_state)
+    train_df, test_df = split_mapping(mapping_df, config.training.random_state)
 
     if config.data.create_new_data_mapping_h5:
         # create h5 version of mapping_df for faster IO
         create_h5_file(
             os.path.join(config.data.input_base_path, "mapping_data.h5"),
             train_df,
-            val_df,
             test_df,
             config.data.input_wsi_path,
         )

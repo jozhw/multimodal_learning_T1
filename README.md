@@ -56,7 +56,8 @@ Embeddings from the RNASeq and WSI modalities are learnt and combined using thes
     - Embeddings from the individual modalities are generated in a crossmodal manner (using a contrastive loss function) where they are informed about the other modality, leading to a stronger inter-modal coupling 
     - The crossmodality aware embeddings are combined using weighted summation and passed as inputs to a downstream task-specific (survival) model
     - More computationally expensive to train, and more prone to overfitting for small datasets.
-
+    
+3. Joint Fusion
 
 <!--
 In the joint fusion approach, all the models are trained 
