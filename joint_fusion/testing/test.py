@@ -169,8 +169,12 @@ def plot_saliency_maps(
     plt.colorbar(label="saliency value")
     plt.title("saliency map only")
 
-    tile_stem = Path(tile_name).stem if tile_name is not None else f"tile_{patch_id:04d}"
-    save_path = os.path.join(output_dir, f"saliency_overlay_{tcga_id[0]}_{tile_stem}.png")
+    tile_stem = (
+        Path(tile_name).stem if tile_name is not None else f"tile_{patch_id:04d}"
+    )
+    save_path = os.path.join(
+        output_dir, f"saliency_overlay_{tcga_id[0]}_{tile_stem}.png"
+    )
     plt.savefig(save_path)
     logger.info(f"saved saliency overlay to {save_path}")
 
@@ -184,7 +188,9 @@ def interpret_omic():
     pass
 
 
-def interpret_wsi(patient_tiles, tcga_id, output_dir_saliency, tile_names=None, max_patches=10):
+def interpret_wsi(
+    patient_tiles, tcga_id, output_dir_saliency, tile_names=None, max_patches=10
+):
     if patient_tiles.grad is None:
         raise RuntimeError("Gradients have not been computed for the WSI tiles.")
 
@@ -225,6 +231,7 @@ def build_tile_metadata(tile_names):
         "x_coords": np.asarray(xs, dtype=np.int32),
         "y_coords": np.asarray(ys, dtype=np.int32),
     }
+
 
 def save_tile_scores(tcga_id, tile_names, output_dir, score_name, scores):
     payload = build_tile_metadata(tile_names)
@@ -276,7 +283,9 @@ def export_saliency_maps(model, device, tcga_id, x_wsi, x_omic, output_dir, tile
     return saliency_scores
 
 
-def export_integrated_gradients(model, config, tcga_id, x_omic, x_wsi, baseline, output_dir):
+def export_integrated_gradients(
+    model, config, tcga_id, x_omic, x_wsi, baseline, output_dir
+):
     integrated_grads = calc_integrated_gradients(
         model, config, tcga_id, x_omic, x_wsi, baseline=baseline, steps=10
     )
@@ -325,7 +334,9 @@ def test_and_interpret(config, model, test_loader, device, baseline=None):
     validate_attribution_config(config)
 
     for batch_idx, batch in enumerate(test_loader):
-        tcga_id, days_to_event, event_occurred, x_wsi, x_omic, tile_names = unpack_test_batch(batch)
+        tcga_id, days_to_event, event_occurred, x_wsi, x_omic, tile_names = (
+            unpack_test_batch(batch)
+        )
         if tcga_id[0] in excluded_ids:
             logger.info(f"Skipping TCGA ID: {tcga_id}")
             continue
@@ -347,6 +358,12 @@ def test_and_interpret(config, model, test_loader, device, baseline=None):
 
         if need_attention:
             export_attention_maps(tcga_id, attention_scores, output_dirs["attention"])
+            export_attention_tile_scores(
+                tcga_id,
+                tile_names,
+                output_dirs["attention_tile_scores"],
+                attention_scores,
+            )
 
         if need_saliency:
             saliency_scores = export_saliency_maps(
@@ -359,6 +376,13 @@ def test_and_interpret(config, model, test_loader, device, baseline=None):
                 tile_names,
             )
 
+            export_saliency_tile_scores(
+                tcga_id,
+                tile_names,
+                output_dirs["saliency_tile_scores"],
+                saliency_scores,
+            )
+
         if need_ig:
             export_integrated_gradients(
                 model,
@@ -368,22 +392,6 @@ def test_and_interpret(config, model, test_loader, device, baseline=None):
                 x_wsi,
                 baseline,
                 output_dirs["ig"],
-            )
-
-        if need_attention:
-            export_attention_tile_scores(
-                tcga_id,
-                tile_names,
-                output_dirs["attention_tile_scores"],
-                attention_scores,
-            )
-
-        if need_saliency:
-            export_saliency_tile_scores(
-                tcga_id,
-                tile_names,
-                output_dirs["saliency_tile_scores"],
-                saliency_scores,
             )
 
         all_predictions.append(outputs.squeeze().detach().cpu().numpy())

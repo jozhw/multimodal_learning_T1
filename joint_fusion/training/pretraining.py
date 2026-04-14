@@ -5,6 +5,7 @@ import typing as tp
 from sklearn.preprocessing import KBinsDiscretizer
 from sklearn.model_selection import StratifiedKFold
 
+from joint_fusion.utils.utils import mixed_collate
 from joint_fusion.data.datasets import HDF5Dataset
 
 
@@ -508,6 +509,7 @@ def create_data_loaders(config, h5_file, random_state=40):
         dataset=full_dataset,
         batch_sampler=batch_sampler,
         num_workers=0,  # 8,
+        collate_fn=mixed_collate,
         # prefetch_factor=2,
         pin_memory=True,
     )
@@ -522,6 +524,7 @@ def create_data_loaders(config, h5_file, random_state=40):
         ),
         batch_size=config.testing.test_batch_size,
         shuffle=False,  # must be false otherwise attention map recontruction issues.
+        collate_fn=mixed_collate,
         num_workers=0,  # 1, #4,
         # prefetch_factor=2,
         pin_memory=True,
