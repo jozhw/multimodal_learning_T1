@@ -60,6 +60,7 @@ class TestingConfig:
     model_path: Optional[str] = None
     calc_saliency_maps: bool = False
     calc_IG: bool = False
+    calc_attention_maps: bool = False
 
 
 @dataclass

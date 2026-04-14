@@ -44,6 +44,7 @@ testing:
   model_path: ""
   calc_saliency_maps: false
   calc_IG: false
+  calc_attention_maps: false
 
 gpu:
   gpu_ids: "0,1,2,3"

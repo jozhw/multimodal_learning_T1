@@ -45,6 +45,7 @@ testing: # add this after training.
   model_path: "checkpoints/checkpoint_2026-02-14-05-44-19/checkpoint_fold_1_epoch_39.pth"
   calc_saliency_maps: true
   calc_IG: true
+  calc_attention_maps: true
 
 gpu:
   gpu_ids: "0,1,2,3"
