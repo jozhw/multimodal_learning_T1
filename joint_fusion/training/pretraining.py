@@ -520,7 +520,7 @@ def create_data_loaders(config, h5_file, random_state=40):
             train_val_test="test",
         ),
         batch_size=config.testing.test_batch_size,
-        shuffle=True,
+        shuffle=False,  # must be false otherwise attention map recontruction issues.
         num_workers=0,  # 1, #4,
         # prefetch_factor=2,
         pin_memory=True,

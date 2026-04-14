@@ -205,27 +205,12 @@ def main():
     device, gpu_ids = setup_model_and_device(config)
     model = load_model_with_multi_gpu_support(config, device, gpu_ids)
     model.to(device)
-    joint_loss = JointLoss()
 
-    train_loader, validation_loader, test_loader = create_data_loaders(
-        config, config.data.h5_file
-    )
-    validation_dataset = validation_loader.dataset
-    test_dataset = test_loader.dataset
-
-    # create a combined loader (validation + test) as the validation data hasn't been used for HPO during training
-    combined_dataset = ConcatDataset([validation_dataset, test_dataset])
-    combined_loader = torch.utils.data.DataLoader(
-        dataset=combined_dataset,
-        batch_size=config.testing.test_batch_size,
-        shuffle=True,
-        num_workers=0,
-        pin_memory=True,
-    )
+    _, test_loader = create_data_loaders(config, config.data.h5_file)
 
     mean_x_omic = compute_mean_omic_from_h5(config.data.h5_file)
 
-    test_and_interpret(config, model, combined_loader, device, baseline=mean_x_omic)
+    test_and_interpret(config, model, test_loader, device, baseline=mean_x_omic)
 
 
 if __name__ == "__main__":
