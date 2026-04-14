@@ -31,6 +31,7 @@ class ModelConfig:
     wsi_fm: str = "uni"
     pooling: str = "attention"
     use_pretrained_omic: bool = False
+    wsi_encoder_tile_batch_size: int = 64
     omic_checkpoint_path: Optional[str] = (
         None  # only use when use_pretrained_omic is True
     )

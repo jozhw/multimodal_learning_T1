@@ -11,7 +11,10 @@ class WSINetwork(nn.Module):
         self.embedding_dim = embedding_dim
 
         self.encoder = WSIEncoder(
-            config.model.wsi_fm, config.model.pooling, pretrained=True
+            config.model.wsi_fm,
+            config.model.pooling,
+            pretrained=True,
+            tile_batch_size=config.model.wsi_encoder_tile_batch_size,
         )
         encoder_dim = getattr(self.encoder, "embed_dim", 384)
         self.net = nn.Sequential(

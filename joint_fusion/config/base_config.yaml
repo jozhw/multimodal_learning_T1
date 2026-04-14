@@ -21,6 +21,7 @@ model:
   wsi_uni: "uni"
   pooling: "attention"
   use_pretrained_omic: false
+  wsi_encoder_tile_batch_size: 64
   omic_checkpoint_path: "checkpoints/checkpoint_2024-09-04-07-56-47/checkpoint_epoch_1500.pth" 
   
 training:

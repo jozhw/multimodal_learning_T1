@@ -10,7 +10,7 @@ data:
   create_new_data_mapping: false
   create_new_data_mapping_h5: false
   num_tiles_per_slide: 400
-  
+
 model:
   embedding_dim_wsi: 384
   embedding_dim_omic: 256
@@ -22,8 +22,9 @@ model:
   wsi_fm: "uni"
   pooling: "attention"
   use_pretrained_omic: false
-  omic_checkpoint_path: "checkpoints/checkpoint_2024-09-04-07-56-47/checkpoint_epoch_1500.pth" 
-  
+  wsi_encoder_tile_batch_size: 64
+  omic_checkpoint_path: "checkpoints/checkpoint_2024-09-04-07-56-47/checkpoint_epoch_1500.pth"
+
 training:
   batch_size: 30
   val_batch_size: 30

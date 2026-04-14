@@ -193,10 +193,12 @@ class WSIEncoder(nn.Module):
         pretrained=True,
         progress=False,
         patch_size=16,
+        tile_batch_size=64,
     ):
         super(WSIEncoder, self).__init__()
         self.wsi_fm = wsi_fm
         self.pooling = pooling
+        self.tile_batch_size = tile_batch_size
 
         # need to resize transform for training otherwise 256 != 224
         # self.resize_transform = transforms.Resize((224, 224))
@@ -364,7 +366,7 @@ class WSIEncoder(nn.Module):
 
         # 6) Encode in minibatches to avoid OOM
         # (tune bs for Polaris / your GPU mem)
-        bs = 64
+        bs = self.tile_batch_size
         embs = []
         for i in range(0, tiles.size(0), bs):
             feats = self.model(tiles[i : i + bs])  # [b, embed_dim]
