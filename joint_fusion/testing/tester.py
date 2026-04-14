@@ -108,6 +108,7 @@ def load_model_with_multi_gpu_support(config, device, gpu_ids):
 
     # Create base model
     model = MultimodalNetwork(
+        config,
         embedding_dim_wsi=config.model.embedding_dim_wsi,
         embedding_dim_omic=config.model.embedding_dim_omic,
         mode=config.model.input_mode,

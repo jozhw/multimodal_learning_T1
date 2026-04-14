@@ -518,6 +518,7 @@ def create_data_loaders(config, h5_file, random_state=40):
             split="test",
             mode=config.model.input_mode,
             train_val_test="test",
+            return_tile_names=True,
         ),
         batch_size=config.testing.test_batch_size,
         shuffle=False,  # must be false otherwise attention map recontruction issues.
