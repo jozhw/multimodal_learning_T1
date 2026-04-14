@@ -8,8 +8,56 @@ from pathlib import Path
 from sksurv.metrics import concordance_index_censored
 from lifelines import KaplanMeierFitter
 from lifelines.statistics import logrank_test
+from joint_fusion.utils.utils import parse_tile_coordinates
 
 logger = logging.getLogger(__name__)
+
+
+def setup_output_dirs(base_path):
+    output_dirs = {
+        "saliency": str(base_path / "saliency_maps_6sep"),
+        "ig": str(base_path / "IG_6sep"),
+        "attention": str(base_path / "attention_scores"),
+        "attention_tile_scores": str(base_path / "attention_tile_scores"),
+        "saliency_tile_scores": str(base_path / "saliency_tile_scores"),
+    }
+    for output_dir in output_dirs.values():
+        os.makedirs(output_dir, exist_ok=True)
+    return output_dirs
+
+
+def unpack_test_batch(batch):
+    if len(batch) == 6:
+        tcga_id, days_to_event, event_occurred, x_wsi, x_omic, tile_names = batch
+        tile_names = list(tile_names[0])
+    else:
+        tcga_id, days_to_event, event_occurred, x_wsi, x_omic = batch
+        tile_names = None
+
+    return tcga_id, days_to_event, event_occurred, x_wsi, x_omic, tile_names
+
+
+def move_batch_to_device(x_wsi, x_omic, days_to_event, event_occurred, device):
+    return (
+        x_wsi.to(device),
+        x_omic.to(device),
+        days_to_event.to(device),
+        event_occurred.to(device),
+    )
+
+
+def validate_attribution_config(config):
+    needs_single_item_batches = any(
+        (
+            config.testing.calc_saliency_maps,
+            config.testing.calc_IG,
+            getattr(config.testing, "calc_attention_maps", False),
+        )
+    )
+    if needs_single_item_batches and config.testing.test_batch_size != 1:
+        raise ValueError(
+            "Attribution export currently requires testing.test_batch_size == 1"
+        )
 
 
 def denormalize_image(image, mean, std):
@@ -47,13 +95,9 @@ def calc_integrated_gradients(
     for scaled_input in scaled_inputs:
         logger.info(f"steps_index: {steps_index}")
         scaled_input = scaled_input.clone().detach().requires_grad_(True)
+        model.zero_grad(set_to_none=True)
         with torch.enable_grad():
-            pred, _, _, _ = model(
-                config,
-                tcga_id,
-                x_wsi=x_wsi,  # list of tensors (one for each tile)
-                x_omic=scaled_input,
-            )
+            pred, _, _, _ = model(x_wsi=x_wsi, x_omic=scaled_input)
             logger.info(f"prediction: {pred}")
             output = pred.sum()
             output.backward()
@@ -68,18 +112,33 @@ def calc_integrated_gradients(
     return integrated_grads
 
 
+def run_inference(model, x_wsi, x_omic, return_attention=False):
+    outputs_tuple = model(
+        x_wsi=x_wsi,
+        x_omic=x_omic,
+        return_attention=return_attention,
+    )
+    if return_attention:
+        outputs, wsi_embedding, omic_embedding, _, attention_weights = outputs_tuple
+        attention_scores = attention_weights[0].squeeze().detach().cpu().numpy()
+    else:
+        outputs, wsi_embedding, omic_embedding, _ = outputs_tuple
+        attention_scores = None
+
+    return outputs, wsi_embedding, omic_embedding, attention_scores
+
+
 def plot_saliency_maps(
-    saliencies,
-    x_wsi,
+    saliency,
+    image,
     tcga_id,
+    tile_name,
     patch_id,
     output_dir,
     threshold=0.8,
 ):
-    # get the first image and saliency map
-    saliency = saliencies[0].squeeze().cpu().numpy()
-    # image = x_wsi[0].squeeze().permute(1, 2, 0).cpu().numpy()  # convert image to HxWxC and move to cpu
-    image = x_wsi[0].squeeze().permute(1, 2, 0).detach().cpu().numpy()
+    saliency = saliency.detach().cpu().numpy()
+    image = image.permute(1, 2, 0).detach().cpu().numpy()
     # denormalize the image based on normalization factors used during transformations of the test images
     mean = [0.70322989, 0.53606487, 0.66096631]
     std = [0.21716536, 0.26081574, 0.20723464]
@@ -110,9 +169,8 @@ def plot_saliency_maps(
     plt.colorbar(label="saliency value")
     plt.title("saliency map only")
 
-    save_path = os.path.join(
-        output_dir, f"saliency_overlay_{tcga_id[0]}_{patch_id}.png"
-    )
+    tile_stem = Path(tile_name).stem if tile_name is not None else f"tile_{patch_id:04d}"
+    save_path = os.path.join(output_dir, f"saliency_overlay_{tcga_id[0]}_{tile_stem}.png")
     plt.savefig(save_path)
     logger.info(f"saved saliency overlay to {save_path}")
 
@@ -126,159 +184,228 @@ def interpret_omic():
     pass
 
 
-def interpret_wsi(x_wsi, tcga_id, output_dir_saliency):
+def interpret_wsi(patient_tiles, tcga_id, output_dir_saliency, tile_names=None, max_patches=10):
+    if patient_tiles.grad is None:
+        raise RuntimeError("Gradients have not been computed for the WSI tiles.")
 
-    patch_idx = 0
-    max_patches = 10
+    saliency_maps = patient_tiles.grad.detach().abs().amax(dim=1)
+    saliency_scores = saliency_maps.mean(dim=(1, 2)).cpu().numpy()
+
     logger.info("OBTAINING SALIENCY MAPS")
-    for image in x_wsi:
+    for patch_idx in range(min(patient_tiles.shape[0], max_patches)):
         logger.info(
             f"Generating saliency map for patch index {patch_idx} out of {max_patches}"
         )
-        if patch_idx >= max_patches:  # limit to 10 patches
-            break
-        if image.grad is not None:
-            saliency, _ = torch.max(image.grad.data.abs(), dim=1)
-            # saliencies.append(saliency)
-            plot_saliency_maps(saliency, image, tcga_id, patch_idx, output_dir_saliency)
-            del saliency
-        else:
-            raise RuntimeError(
-                "Gradients have not been computed for one of the images in x_wsi."
+        tile_name = tile_names[patch_idx] if tile_names is not None else None
+        plot_saliency_maps(
+            saliency_maps[patch_idx],
+            patient_tiles[patch_idx],
+            tcga_id,
+            tile_name,
+            patch_idx,
+            output_dir_saliency,
+        )
+
+    return saliency_scores
+
+
+def build_tile_metadata(tile_names):
+    if tile_names is None:
+        return None
+
+    xs = []
+    ys = []
+    for tile_name in tile_names:
+        x_coord, y_coord = parse_tile_coordinates(tile_name)
+        xs.append(x_coord)
+        ys.append(y_coord)
+
+    return {
+        "tile_names": np.asarray(tile_names, dtype=object),
+        "x_coords": np.asarray(xs, dtype=np.int32),
+        "y_coords": np.asarray(ys, dtype=np.int32),
+    }
+
+def save_tile_scores(tcga_id, tile_names, output_dir, score_name, scores):
+    payload = build_tile_metadata(tile_names)
+    if payload is None or scores is None:
+        return
+
+    payload[score_name] = np.asarray(scores, dtype=np.float32)
+
+    save_path = os.path.join(output_dir, f"{score_name}_{tcga_id[0]}.npz")
+    np.savez_compressed(save_path, **payload)
+    logger.info(f"Saved tile-level attribution metadata to {save_path}")
+
+
+def export_attention_maps(tcga_id, attention_scores, output_dir):
+    if attention_scores is None:
+        return
+
+    save_path = os.path.join(output_dir, f"attention_scores_{tcga_id[0]}.npy")
+    np.save(save_path, attention_scores)
+    logger.info(f"Saved attention scores for {tcga_id[0]} to {save_path}")
+
+
+def export_saliency_maps(model, device, tcga_id, x_wsi, x_omic, output_dir, tile_names):
+    x_wsi = x_wsi.requires_grad_(True)
+    model.zero_grad(set_to_none=True)
+
+    with torch.enable_grad():
+        outputs, _, _, _ = run_inference(model, x_wsi, x_omic, return_attention=False)
+
+        if device.type == "cuda":
+            allocated_memory = torch.cuda.memory_allocated(device) / (1024**3)
+            reserved_memory = torch.cuda.memory_reserved(device) / (1024**3)
+
+            logger.info(f"Allocated memory: {allocated_memory:.2f} GB")
+            logger.info(f"Reserved memory: {reserved_memory:.2f} GB")
+            logger.info(
+                f"Free memory: {torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)} bytes"
             )
-        patch_idx += 1
+            torch.cuda.empty_cache()
+
+        outputs.sum().backward()
+        saliency_scores = interpret_wsi(
+            x_wsi[0],
+            tcga_id,
+            output_dir,
+            tile_names=tile_names,
+        )
+
+    return saliency_scores
+
+
+def export_integrated_gradients(model, config, tcga_id, x_omic, x_wsi, baseline, output_dir):
+    integrated_grads = calc_integrated_gradients(
+        model, config, tcga_id, x_omic, x_wsi, baseline=baseline, steps=10
+    )
+    save_path = os.path.join(output_dir, f"integrated_grads_{tcga_id[0]}.npy")
+    np.save(save_path, integrated_grads)
+    logger.info(f"Saved integrated gradients for {tcga_id[0]} to {save_path}")
+
+
+def export_attention_tile_scores(tcga_id, tile_names, output_dir, attention_scores):
+    save_tile_scores(
+        tcga_id,
+        tile_names,
+        output_dir,
+        "attention_scores",
+        attention_scores,
+    )
+
+
+def export_saliency_tile_scores(tcga_id, tile_names, output_dir, saliency_scores):
+    save_tile_scores(
+        tcga_id,
+        tile_names,
+        output_dir,
+        "saliency_scores",
+        saliency_scores,
+    )
 
 
 def test_and_interpret(config, model, test_loader, device, baseline=None):
     model.eval()
-    test_loss_epoch = 0.0
     all_tcga_ids = []
     all_predictions = []
     all_times = []
     all_events = []
 
-    # base directory
-    import os
-
     base_path = Path(config.testing.output_base_dir)
-    # create the directory to save saliency maps if it doesn't exist
-    output_dir_saliency = str(base_path / "saliency_maps_6sep")
-    os.makedirs(output_dir_saliency, exist_ok=True)
+    output_dirs = setup_output_dirs(base_path)
 
-    output_dir_IG = str(base_path / "IG_6sep")
-    os.makedirs(output_dir_IG, exist_ok=True)
-
-    # for training, only the last transformer block (block 11) in the WSI encoder was kept trainable
-    # see WSIEncoder class in generate_Wsi_embeddings.py
-
-    # Get the CI and the KM plots for the test set
     excluded_ids = [
         "TCGA-05-4395",
         "TCGA-86-8281",
-    ]  # contains anomalous time to event and censoring data
-    # remove these ids during the input json/h5 file creation
-    with torch.no_grad():
-        for batch_idx, (
-            tcga_id,
-            days_to_event,
-            event_occurred,
-            x_wsi,
-            x_omic,
-        ) in enumerate(test_loader):
-            if tcga_id[0] in excluded_ids:
-                logger.info(f"Skipping TCGA ID: {tcga_id}")
-                continue
+    ]
+    need_saliency = config.testing.calc_saliency_maps
+    need_ig = config.testing.calc_IG
+    need_attention = config.testing.calc_attention_maps
+    validate_attribution_config(config)
 
-            x_wsi = [x.to(device) for x in x_wsi]
-            x_omic = x_omic.to(device)
-            days_to_event = days_to_event.to(device)
-            event_occurred = event_occurred.to(device)
+    for batch_idx, batch in enumerate(test_loader):
+        tcga_id, days_to_event, event_occurred, x_wsi, x_omic, tile_names = unpack_test_batch(batch)
+        if tcga_id[0] in excluded_ids:
+            logger.info(f"Skipping TCGA ID: {tcga_id}")
+            continue
 
-            # enable gradients only after data loading
-            x_wsi = [x.requires_grad_() for x in x_wsi]
-
-            # logger.info(f"Batch size: {len(test_loader.dataset)}")
-            # logger.info(
-            #     f"Test Batch index: {batch_idx + 1} out of {np.ceil(len(test_loader.dataset) / opt.test_batch_size)}"
-            # )
-            # # logger.info("TCGA ID: ", tcga_id)
-            # logger.info("Days to event: ", days_to_event)
-            # logger.info("event occurred: ", event_occurred)
-
-            if config.testing.calc_saliency_maps is False:
-                outputs, wsi_embedding, omic_embedding, _ = model(
-                    config,
-                    tcga_id,
-                    x_wsi=x_wsi,  # list of tensors (one for each tile)
-                    x_omic=x_omic,
-                )
-
-            else:
-                # perform the forward pass without torch.no_grad() to allow gradient computation
-                with torch.enable_grad():
-                    outputs, wsi_embedding, omic_embedding, _ = model(
-                        config,
-                        tcga_id,
-                        x_wsi=x_wsi,  # list of tensors (one for each tile)
-                        x_omic=x_omic,
-                    )
-
-                    # Check and logger.info memory usage after each batch
-                    allocated_memory = torch.cuda.memory_allocated(device) / (
-                        1024**3
-                    )  # in GB
-                    reserved_memory = torch.cuda.memory_reserved(device) / (
-                        1024**3
-                    )  # in GB
-
-                    logger.info(f"After batch {batch_idx + 1}:")
-                    logger.info(f"Allocated memory: {allocated_memory:.2f} GB")
-                    logger.info(f"Reserved memory: {reserved_memory:.2f} GB")
-                    logger.info(
-                        f"Free memory: {torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)} bytes"
-                    )
-                    torch.cuda.empty_cache()
-
-                    # set_trace()
-                    # backward pass to compute gradients for saliency maps
-                    outputs.backward()  # if outputs is not scalar, reduce it to scalar
-
-                    # saliencies = []  # list of saliency maps corresponding to each image in `x_wsi`
-
-                    interpret_wsi(x_wsi, tcga_id, output_dir_saliency)
-
-            if config.testing.calc_IG is True:
-                integrated_grads = calc_integrated_gradients(
-                    model, config, tcga_id, x_omic, x_wsi, baseline=baseline, steps=10
-                )
-                save_path = os.path.join(
-                    output_dir_IG, f"integrated_grads_{tcga_id[0]}.npy"
-                )
-                np.save(save_path, integrated_grads)
-                logger.info(
-                    f"Saved integrated gradients for {tcga_id[0]} to {save_path}"
-                )
-
-            all_predictions.append(outputs.squeeze().detach().cpu().numpy())
-
-            del outputs
-            torch.cuda.empty_cache()
-            all_tcga_ids.append(tcga_id)
-            all_times.append(days_to_event)
-            all_events.append(event_occurred)
-            model.zero_grad()
-            torch.cuda.empty_cache()
-
-        all_predictions_np = [pred.item() for pred in all_predictions]
-        all_events_np = torch.stack(all_events).cpu().numpy()
-        all_events_bool_np = all_events_np.astype(bool)
-        all_times_np = torch.stack(all_times).cpu().numpy()
-
-        c_index = concordance_index_censored(
-            all_events_bool_np.ravel(), all_times_np.ravel(), all_predictions_np
+        x_wsi, x_omic, days_to_event, event_occurred = move_batch_to_device(
+            x_wsi, x_omic, days_to_event, event_occurred, device
         )
 
-        logger.info(f"CI: {c_index[0]}")
+        attention_scores = None
+        saliency_scores = None
+
+        with torch.no_grad():
+            outputs, _, _, attention_scores = run_inference(
+                model,
+                x_wsi,
+                x_omic,
+                return_attention=need_attention,
+            )
+
+        if need_attention:
+            export_attention_maps(tcga_id, attention_scores, output_dirs["attention"])
+
+        if need_saliency:
+            saliency_scores = export_saliency_maps(
+                model,
+                device,
+                tcga_id,
+                x_wsi.detach().clone(),
+                x_omic,
+                output_dirs["saliency"],
+                tile_names,
+            )
+
+        if need_ig:
+            export_integrated_gradients(
+                model,
+                config,
+                tcga_id,
+                x_omic,
+                x_wsi,
+                baseline,
+                output_dirs["ig"],
+            )
+
+        if need_attention:
+            export_attention_tile_scores(
+                tcga_id,
+                tile_names,
+                output_dirs["attention_tile_scores"],
+                attention_scores,
+            )
+
+        if need_saliency:
+            export_saliency_tile_scores(
+                tcga_id,
+                tile_names,
+                output_dirs["saliency_tile_scores"],
+                saliency_scores,
+            )
+
+        all_predictions.append(outputs.squeeze().detach().cpu().numpy())
+
+        del outputs
+        torch.cuda.empty_cache()
+        all_tcga_ids.append(tcga_id)
+        all_times.append(days_to_event)
+        all_events.append(event_occurred)
+        model.zero_grad()
+        torch.cuda.empty_cache()
+
+    all_predictions_np = [pred.item() for pred in all_predictions]
+    all_events_np = torch.stack(all_events).cpu().numpy()
+    all_events_bool_np = all_events_np.astype(bool)
+    all_times_np = torch.stack(all_times).cpu().numpy()
+
+    c_index = concordance_index_censored(
+        all_events_bool_np.ravel(), all_times_np.ravel(), all_predictions_np
+    )
+
+    logger.info(f"CI: {c_index[0]}")
 
     # set_trace()
     # stratify based on the median risk scores
