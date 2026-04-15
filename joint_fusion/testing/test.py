@@ -239,13 +239,13 @@ def interpret_omic():
     pass
 
 
-def interpret_wsi(
-    patient_tiles, tcga_id, output_dir_saliency, tile_names=None, max_patches=10
-):
-    if patient_tiles.grad is None:
+def interpret_wsi(x_wsi, tcga_id, output_dir_saliency, tile_names=None, max_patches=10):
+    if x_wsi.grad is None:
         raise RuntimeError("Gradients have not been computed for the WSI tiles.")
 
-    saliency_maps = patient_tiles.grad.detach().abs().amax(dim=1)
+    patient_tiles = x_wsi[0]
+    patient_grads = x_wsi.grad[0]
+    saliency_maps = patient_grads.detach().abs().amax(dim=1)
     saliency_scores = saliency_maps.mean(dim=(1, 2)).cpu().numpy()
 
     logger.info("OBTAINING SALIENCY MAPS")
@@ -340,7 +340,7 @@ def export_saliency_maps(
 
         outputs.sum().backward()
         saliency_scores = interpret_wsi(
-            x_wsi[0],
+            x_wsi,
             tcga_id,
             output_dir,
             tile_names=tile_names,
