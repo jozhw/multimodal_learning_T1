@@ -62,6 +62,9 @@ class TestingConfig:
     calc_saliency_maps: bool = False
     calc_IG: bool = False
     calc_attention_maps: bool = False
+    saliency_tile_selection: str = "all"
+    saliency_max_tiles: int = 10
+    saliency_attention_scores_dir: Optional[str] = None
 
 
 @dataclass

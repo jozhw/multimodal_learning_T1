@@ -58,6 +58,11 @@ def validate_attribution_config(config):
         raise ValueError(
             "Attribution export currently requires testing.test_batch_size == 1"
         )
+    valid_selection = {"all", "first_k", "topk_attention"}
+    if config.testing.saliency_tile_selection not in valid_selection:
+        raise ValueError(
+            f"Unsupported saliency_tile_selection: {config.testing.saliency_tile_selection}"
+        )
 
 
 def denormalize_image(image, mean, std):
@@ -126,6 +131,52 @@ def run_inference(model, x_wsi, x_omic, return_attention=False):
         attention_scores = None
 
     return outputs, wsi_embedding, omic_embedding, attention_scores
+
+
+def load_saved_attention_scores(tcga_id, attention_scores_dir):
+    save_path = Path(attention_scores_dir) / f"attention_scores_{tcga_id[0]}.npy"
+    if not save_path.exists():
+        raise FileNotFoundError(f"Saved attention scores not found: {save_path}")
+    return np.load(save_path)
+
+
+def get_saliency_subset_indices(config, tcga_id, x_wsi, x_omic, model):
+    selection = config.testing.saliency_tile_selection
+    num_tiles = x_wsi.shape[1]
+
+    if selection == "all":
+        return np.arange(num_tiles)
+
+    max_tiles = min(config.testing.saliency_max_tiles, num_tiles)
+    if selection == "first_k":
+        return np.arange(max_tiles)
+
+    if selection == "topk_attention":
+        attention_scores_dir = config.testing.saliency_attention_scores_dir
+        if attention_scores_dir not in (None, ""):
+            attention_scores = load_saved_attention_scores(tcga_id, attention_scores_dir)
+        else:
+            with torch.no_grad():
+                _, _, _, attention_scores = run_inference(
+                    model,
+                    x_wsi,
+                    x_omic,
+                    return_attention=True,
+                )
+        topk_idx = np.argsort(attention_scores)[::-1][:max_tiles]
+        return np.sort(topk_idx)
+
+    raise ValueError(f"Unsupported saliency tile selection: {selection}")
+
+
+def subset_tiles(x_wsi, tile_names, tile_indices):
+    tile_indices = np.asarray(tile_indices, dtype=np.int64)
+    x_wsi_subset = x_wsi[:, tile_indices]
+    if tile_names is None:
+        tile_names_subset = None
+    else:
+        tile_names_subset = [tile_names[i] for i in tile_indices.tolist()]
+    return x_wsi_subset, tile_names_subset
 
 
 def plot_saliency_maps(
@@ -253,13 +304,28 @@ def export_attention_maps(tcga_id, attention_scores, output_dir):
     np.save(save_path, attention_scores)
     logger.info(f"Saved attention scores for {tcga_id[0]} to {save_path}")
 
-
-def export_saliency_maps(model, device, tcga_id, x_wsi, x_omic, output_dir, tile_names):
+def export_saliency_maps(
+    config,
+    model,
+    device,
+    tcga_id,
+    x_wsi,
+    x_omic,
+    output_dir,
+    tile_names,
+    return_attention=False,
+):
+    max_saved = min(config.testing.saliency_max_tiles, x_wsi.shape[1])
     x_wsi = x_wsi.requires_grad_(True)
     model.zero_grad(set_to_none=True)
 
     with torch.enable_grad():
-        outputs, _, _, _ = run_inference(model, x_wsi, x_omic, return_attention=False)
+        outputs, _, _, attention_scores = run_inference(
+            model,
+            x_wsi,
+            x_omic,
+            return_attention=return_attention,
+        )
 
         if device.type == "cuda":
             allocated_memory = torch.cuda.memory_allocated(device) / (1024**3)
@@ -278,9 +344,10 @@ def export_saliency_maps(model, device, tcga_id, x_wsi, x_omic, output_dir, tile
             tcga_id,
             output_dir,
             tile_names=tile_names,
+            max_patches=max_saved,
         )
 
-    return saliency_scores
+    return outputs.detach(), saliency_scores, attention_scores
 
 
 def export_integrated_gradients(
@@ -347,13 +414,57 @@ def test_and_interpret(config, model, test_loader, device, baseline=None):
 
         attention_scores = None
         saliency_scores = None
+        saliency_tile_names = tile_names
+        outputs = None
 
-        with torch.no_grad():
-            outputs, _, _, attention_scores = run_inference(
-                model,
+        need_full_slide_inference = (
+            not need_saliency
+            or need_attention
+            or config.testing.saliency_tile_selection != "all"
+        )
+
+        if need_full_slide_inference:
+            with torch.no_grad():
+                outputs, _, _, attention_scores = run_inference(
+                    model,
+                    x_wsi,
+                    x_omic,
+                    return_attention=need_attention,
+                )
+
+        if need_saliency:
+            saliency_tile_indices = get_saliency_subset_indices(
+                config,
+                tcga_id,
                 x_wsi,
                 x_omic,
+                model,
+            )
+            x_wsi_saliency, saliency_tile_names = subset_tiles(
+                x_wsi,
+                tile_names,
+                saliency_tile_indices,
+            )
+            saliency_outputs, saliency_scores, saliency_attention_scores = export_saliency_maps(
+                config,
+                model,
+                device,
+                tcga_id,
+                x_wsi_saliency,
+                x_omic,
+                output_dirs["saliency"],
+                saliency_tile_names,
                 return_attention=need_attention,
+            )
+            if outputs is None:
+                outputs = saliency_outputs
+            if attention_scores is None:
+                attention_scores = saliency_attention_scores
+            export_saliency_tile_scores(
+                tcga_id,
+                saliency_tile_names,
+                output_dirs["saliency_tile_scores"],
+                saliency_scores,
             )
 
         if need_attention:
@@ -363,24 +474,6 @@ def test_and_interpret(config, model, test_loader, device, baseline=None):
                 tile_names,
                 output_dirs["attention_tile_scores"],
                 attention_scores,
-            )
-
-        if need_saliency:
-            saliency_scores = export_saliency_maps(
-                model,
-                device,
-                tcga_id,
-                x_wsi.detach().clone(),
-                x_omic,
-                output_dirs["saliency"],
-                tile_names,
-            )
-
-            export_saliency_tile_scores(
-                tcga_id,
-                tile_names,
-                output_dirs["saliency_tile_scores"],
-                saliency_scores,
             )
 
         if need_ig:
