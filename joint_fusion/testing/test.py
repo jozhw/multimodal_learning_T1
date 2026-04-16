@@ -154,7 +154,9 @@ def get_saliency_subset_indices(config, tcga_id, x_wsi, x_omic, model):
     if selection == "topk_attention":
         attention_scores_dir = config.testing.saliency_attention_scores_dir
         if attention_scores_dir not in (None, ""):
-            attention_scores = load_saved_attention_scores(tcga_id, attention_scores_dir)
+            attention_scores = load_saved_attention_scores(
+                tcga_id, attention_scores_dir
+            )
         else:
             with torch.no_grad():
                 _, _, _, attention_scores = run_inference(
@@ -304,6 +306,7 @@ def export_attention_maps(tcga_id, attention_scores, output_dir):
     np.save(save_path, attention_scores)
     logger.info(f"Saved attention scores for {tcga_id[0]} to {save_path}")
 
+
 def export_saliency_maps(
     config,
     model,
@@ -316,7 +319,7 @@ def export_saliency_maps(
     return_attention=False,
 ):
     max_saved = min(config.testing.saliency_max_tiles, x_wsi.shape[1])
-    x_wsi = x_wsi.requires_grad_(True)
+    x_wsi = x_wsi.detach().clone().requires_grad_(True)
     model.zero_grad(set_to_none=True)
 
     with torch.enable_grad():
@@ -445,16 +448,18 @@ def test_and_interpret(config, model, test_loader, device, baseline=None):
                 tile_names,
                 saliency_tile_indices,
             )
-            saliency_outputs, saliency_scores, saliency_attention_scores = export_saliency_maps(
-                config,
-                model,
-                device,
-                tcga_id,
-                x_wsi_saliency,
-                x_omic,
-                output_dirs["saliency"],
-                saliency_tile_names,
-                return_attention=need_attention,
+            saliency_outputs, saliency_scores, saliency_attention_scores = (
+                export_saliency_maps(
+                    config,
+                    model,
+                    device,
+                    tcga_id,
+                    x_wsi_saliency,
+                    x_omic,
+                    output_dirs["saliency"],
+                    saliency_tile_names,
+                    return_attention=need_attention,
+                )
             )
             if outputs is None:
                 outputs = saliency_outputs
