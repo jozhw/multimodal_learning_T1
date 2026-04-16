@@ -109,38 +109,28 @@ class MultimodalNetwork(nn.Module):
 
         self.stored_omic_embedding = None
 
-    def forward(self, x_wsi=None, x_omic=None, return_attention=False):
-        # --- normalize x_wsi to: list[patient] where patient is (list_of_tiles or Tensor[T,C,H,W]) ---
+    def _normalize_x_wsi_patients(self, x_wsi):
         if isinstance(x_wsi, torch.Tensor):
             if x_wsi.dim() == 5:
-                # [B,T,C,H,W] -> list of B patients (each [T,C,H,W])
-                x_wsi_patients = [x_wsi[b] for b in range(x_wsi.size(0))]
-            elif x_wsi.dim() == 4:
-                # [T,C,H,W] single patient
-                x_wsi_patients = [x_wsi]
-            else:
-                raise ValueError(f"Unexpected x_wsi tensor shape: {x_wsi.shape}")
-        elif isinstance(x_wsi, list):
+                return [x_wsi[b] for b in range(x_wsi.size(0))]
+            if x_wsi.dim() == 4:
+                return [x_wsi]
+            raise ValueError(f"Unexpected x_wsi tensor shape: {x_wsi.shape}")
+        if isinstance(x_wsi, list):
             if len(x_wsi) == 0:
-                x_wsi_patients = []
-            elif isinstance(x_wsi[0], torch.Tensor) and x_wsi[0].dim() == 3:
-                # list of tiles for ONE patient
-                x_wsi_patients = [x_wsi]
-            else:
-                # already list of patients (each patient is list/tensor of tiles)
-                x_wsi_patients = x_wsi
-        else:
-            raise TypeError(f"Unexpected x_wsi type: {type(x_wsi)}")
-        start_time = time.time()
-        # print("fusion type: ", self.fusion_type)
+                return []
+            if isinstance(x_wsi[0], torch.Tensor) and x_wsi[0].dim() == 3:
+                return [x_wsi]
+            return x_wsi
+        raise TypeError(f"Unexpected x_wsi type: {type(x_wsi)}")
+
+    def encode_wsi(self, x_wsi, return_attention=False):
+        x_wsi_patients = self._normalize_x_wsi_patients(x_wsi)
         wsi_embeddings = []
-        # attention weights for all patients
         attention_weights = []
 
-        # x_wsi is a Tensor [B,T,3,H,W]
         for patient_tiles in x_wsi_patients:
-            # patient_tiles is [T,3,H,W]
-            emb = self.wsi_net(patient_tiles)  # MUST return [1,D] or [D]
+            emb = self.wsi_net(patient_tiles)
 
             if return_attention:
                 attn = self.wsi_net.last_attention_weights
@@ -151,7 +141,58 @@ class MultimodalNetwork(nn.Module):
 
             wsi_embeddings.append(emb)
 
-        wsi_embedding = torch.cat(wsi_embeddings, dim=0)  # [N_replica, embed_dim]
+        wsi_embedding = torch.cat(wsi_embeddings, dim=0)
+
+        if return_attention:
+            return wsi_embedding, attention_weights
+        return wsi_embedding
+
+    def forward_with_fixed_wsi(self, fixed_wsi_embedding, x_omic):
+        omic_embedding = self.omic_net(x_omic)
+
+        if not isinstance(fixed_wsi_embedding, torch.Tensor):
+            fixed_wsi_embedding = torch.as_tensor(
+                fixed_wsi_embedding, device=device, dtype=torch.float32
+            )
+        else:
+            fixed_wsi_embedding = fixed_wsi_embedding.to(device)
+
+        if not isinstance(omic_embedding, torch.Tensor):
+            omic_embedding = torch.as_tensor(
+                omic_embedding, device=device, dtype=torch.float32
+            )
+
+        if self.config.model.joint_embedding == "concatenate":
+            combined_embedding = torch.cat((fixed_wsi_embedding, omic_embedding), dim=1)
+            raw_wsi_embedding = fixed_wsi_embedding
+            raw_omic_embedding = omic_embedding
+        else:
+            wsi_projected = self.wsi_projection(fixed_wsi_embedding)
+            omic_projected = self.omic_projection(omic_embedding)
+            raw_wsi_embedding = wsi_projected
+            raw_omic_embedding = omic_projected
+
+            total_weight = self.omic_weight + self.wsi_weight
+            normalized_rna = self.omic_weight / total_weight
+            normalized_wsi = self.wsi_weight / total_weight
+            combined_embedding = (
+                normalized_rna * omic_projected + normalized_wsi * wsi_projected
+            )
+
+        output = self.fused_mlp(combined_embedding)
+        if output.dim() > 1 and output.size(1) == 1:
+            output = output.squeeze(1)
+
+        return output, raw_wsi_embedding, raw_omic_embedding, combined_embedding
+
+    def forward(self, x_wsi=None, x_omic=None, return_attention=False):
+        start_time = time.time()
+        if return_attention:
+            wsi_embedding, attention_weights = self.encode_wsi(
+                x_wsi, return_attention=True
+            )
+        else:
+            wsi_embedding = self.encode_wsi(x_wsi, return_attention=False)
         omic_embedding = self.omic_net(x_omic)  # [N_replica, embed_dim]
         print("wsi_embedding.shape: ", wsi_embedding.shape)
         print("omic_embedding.shape: ", omic_embedding.shape)

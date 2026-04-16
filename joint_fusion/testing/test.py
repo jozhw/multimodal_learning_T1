@@ -92,6 +92,10 @@ def calc_integrated_gradients(
         baseline = baseline * torch.ones_like(x_omic).to(x_omic.device)
     # set_trace()
     logger.info(f"CALCULATING INTEGRATED GRADIENTS OVER {steps} steps")
+    model.zero_grad(set_to_none=True)
+    with torch.no_grad():
+        fixed_wsi_embedding = model.encode_wsi(x_wsi).detach()
+
     scaled_inputs = [
         baseline + (float(i) / steps) * (x_omic - baseline) for i in range(steps + 1)
     ]
@@ -102,7 +106,10 @@ def calc_integrated_gradients(
         scaled_input = scaled_input.clone().detach().requires_grad_(True)
         model.zero_grad(set_to_none=True)
         with torch.enable_grad():
-            pred, _, _, _ = model(x_wsi=x_wsi, x_omic=scaled_input)
+            pred, _, _, _ = model.forward_with_fixed_wsi(
+                fixed_wsi_embedding=fixed_wsi_embedding,
+                x_omic=scaled_input,
+            )
             logger.info(f"prediction: {pred}")
             output = pred.sum()
             output.backward()
