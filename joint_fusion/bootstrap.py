@@ -253,8 +253,8 @@ def save_outputs(output_dir, tcga_ids, predictions, times, events, bootstrap_res
 
     plt.figure(figsize=(10, 6))
     plt.boxplot(c_indices, vert=True)
-    plt.title("Bootstrap Distribution of C-index")
-    plt.xlabel("C-index")
+    plt.title("Bootstrap Distribution")
+    plt.xticks([1], ["Multimodal (joint fusion)"])
     plt.savefig(output_dir / "bootstrapped_cindex.png", dpi=300, bbox_inches="tight")
     plt.close()
 
