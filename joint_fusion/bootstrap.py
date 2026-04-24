@@ -253,7 +253,7 @@ def save_outputs(output_dir, tcga_ids, predictions, times, events, bootstrap_res
 
     plt.figure(figsize=(10, 6))
     plt.boxplot(c_indices, vert=True)
-    plt.title("Bootstrap Distribution")
+    plt.title("Bootstrapped Concordance Indices")
     plt.xticks([1], ["Multimodal (joint fusion)"])
     plt.savefig(output_dir / "bootstrapped_cindex.png", dpi=300, bbox_inches="tight")
     plt.close()
@@ -268,7 +268,9 @@ def main():
     config = ConfigManager.load_config(opt.config)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    bootstrap_output_dir = Path(config.testing.output_base_dir) / f"bootstrap_{timestamp}"
+    bootstrap_output_dir = (
+        Path(config.testing.output_base_dir) / f"bootstrap_{timestamp}"
+    )
     bootstrap_output_dir.mkdir(parents=True, exist_ok=True)
 
     logging.captureWarnings(True)
