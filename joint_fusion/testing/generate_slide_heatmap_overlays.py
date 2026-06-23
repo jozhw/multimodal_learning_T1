@@ -128,7 +128,9 @@ def iter_tile_score_files(tile_scores, tile_scores_dir):
         yield path
 
 
-def process_tile_score_file(path, output_dir, slide_assets_dir, tile_size, score_key, save_array):
+def process_tile_score_file(
+    path, output_dir, slide_assets_dir, tile_size, score_key, save_array
+):
     payload = np.load(path, allow_pickle=True)
     resolved_score_key = infer_score_key(payload, score_key)
     heatmap = build_heatmap(payload, resolved_score_key, tile_size)

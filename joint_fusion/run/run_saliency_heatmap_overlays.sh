@@ -6,16 +6,16 @@ set -euo pipefail
 
 # Choose exactly one input mode:
 # 1) Directory mode: point to a folder of .npz tile-score files
-TILE_SCORES_DIR="checkpoints/checkpoint_2026-04-07-04-58-17/test_results/saliency_tile_scores"
+TILE_SCORES_DIR="checkpoints/checkpoint_2026-04-07-04-58-17/test_results/best_model_fold_1/saliency_tile_scores"
 
 # 2) Single-file mode: set a specific .npz file and leave TILE_SCORES_DIR empty
 TILE_SCORES_FILE=""
 
 # Output folder for generated heatmaps and overlays
-OUTPUT_DIR="checkpoints/checkpoint_2026-04-07-04-58-17/test_results/saliency_visualizations"
+OUTPUT_DIR="checkpoints/checkpoint_2026-04-07-04-58-17/test_results/best_model_fold_1/saliency_visualizations"
 
 # Directory containing full-slide images such as assets/TCGA-50-5044-01Z-00-DX1....png
-SLIDE_ASSETS_DIR="assets"
+SLIDE_ASSETS_DIR="assets/png_files_all_samples_per_patient"
 
 # Tile edge length used when placing each tile on the heatmap canvas
 TILE_SIZE=256
