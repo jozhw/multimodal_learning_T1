@@ -27,5 +27,6 @@ mapping_data.h5
 # run scripts
 /run_scripts
 
-
+archive/
+assets/
 
