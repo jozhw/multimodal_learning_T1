@@ -17,6 +17,10 @@ OUTPUT_DIR="checkpoints/checkpoint_2026-04-07-04-58-17/test_results/best_model_f
 # Directory containing full-slide images such as assets/TCGA-50-5044-01Z-00-DX1....png
 SLIDE_ASSETS_DIR="assets/png_files_all_samples_per_patient"
 
+# CSV with per-slide full-resolution Width/Height (openslide_getstats.py output).
+# Enables faithful (no-skew) placement of the heatmap on the thumbnail.
+SLIDE_STATS_CSV="assets/slide_statistics_all.csv"
+
 # Tile edge length used when placing each tile on the heatmap canvas
 TILE_SIZE=256
 
@@ -31,6 +35,7 @@ CMD=(
   python -m joint_fusion.testing.generate_slide_heatmap_overlays
   --output-dir "$OUTPUT_DIR"
   --slide-assets-dir "$SLIDE_ASSETS_DIR"
+  --slide-stats-csv "$SLIDE_STATS_CSV"
   --tile-size "$TILE_SIZE"
 )
 

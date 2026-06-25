@@ -71,29 +71,91 @@ def normalize_scores(scores):
     return (scores - score_min) / (score_max - score_min)
 
 
-def build_heatmap(payload, score_key, tile_size):
-    x_coords = np.asarray(payload["x_coords"], dtype=np.int32)
-    y_coords = np.asarray(payload["y_coords"], dtype=np.int32)
+def infer_tile_footprint(x_coords, y_coords, fallback):
+    """Recover the tile footprint (grid stride) in slide-level-0 pixels.
+
+    The tile x/y values are slideflow tile *centers* in full-resolution
+    (level-0) pixels, laid out on a regular grid whose spacing equals the
+    tile's level-0 footprint (``tile_um / mpp``). The greatest common divisor
+    of the gaps between distinct coordinates recovers that stride even when
+    only a random subset of tiles was kept. ``fallback`` (the legacy
+    ``tile_size``) is used when the grid is too degenerate to infer.
+    """
+    gaps = []
+    for coords in (x_coords, y_coords):
+        unique = np.unique(np.asarray(coords, dtype=np.int64))
+        if unique.size >= 2:
+            diffs = np.diff(unique)
+            gaps.append(diffs[diffs > 0])
+
+    if not gaps:
+        return int(fallback)
+
+    all_gaps = np.concatenate(gaps)
+    if all_gaps.size == 0:
+        return int(fallback)
+
+    stride = int(np.gcd.reduce(all_gaps))
+    # Guard against a degenerate gcd (e.g. 1) from off-grid coords produced by
+    # slide alignment: fall back to the smallest observed gap, then to legacy.
+    if stride < max(8, int(fallback) // 4):
+        stride = int(all_gaps.min())
+    if stride <= 0:
+        return int(fallback)
+    return stride
+
+
+def build_heatmap(payload, score_key, tile_size, footprint=None, max_canvas_side=4096):
+    x_coords = np.asarray(payload["x_coords"], dtype=np.int64)
+    y_coords = np.asarray(payload["y_coords"], dtype=np.int64)
     scores = normalize_scores(payload[score_key])
+
+    # x/y are tile centers in level-0 px; paint each tile at its true level-0
+    # footprint so tiles tessellate instead of leaving gaps (or overlapping)
+    # when the slide's native magnification differs from the saved tile_px.
+    if footprint is None:
+        footprint = infer_tile_footprint(x_coords, y_coords, tile_size)
 
     min_x = int(x_coords.min())
     min_y = int(y_coords.min())
-    shifted_x = x_coords - min_x
-    shifted_y = y_coords - min_y
 
-    width = int(shifted_x.max()) + tile_size
-    height = int(shifted_y.max()) + tile_size
+    # The canvas spans the tile bbox in level-0 px, which can be tens of
+    # thousands wide. Downsample so the raster stays bounded (the overlay
+    # rescales it to the thumbnail anyway, so extra resolution is wasted).
+    raw_side = max(
+        int(x_coords.max()) - min_x + footprint,
+        int(y_coords.max()) - min_y + footprint,
+    )
+    scale = max(1, -(-raw_side // int(max_canvas_side)))  # ceil division
+    footprint_ds = max(1, footprint // scale)
+
+    shifted_x = (x_coords - min_x) // scale
+    shifted_y = (y_coords - min_y) // scale
+
+    width = int(shifted_x.max()) + footprint_ds
+    height = int(shifted_y.max()) + footprint_ds
 
     heatmap = np.zeros((height, width), dtype=np.float32)
     counts = np.zeros((height, width), dtype=np.float32)
 
     for x, y, score in zip(shifted_x, shifted_y, scores):
-        heatmap[y : y + tile_size, x : x + tile_size] += score
-        counts[y : y + tile_size, x : x + tile_size] += 1.0
+        heatmap[y : y + footprint_ds, x : x + footprint_ds] += score
+        counts[y : y + footprint_ds, x : x + footprint_ds] += 1.0
 
     nonzero = counts > 0
     heatmap[nonzero] /= counts[nonzero]
-    return heatmap
+
+    # The level-0 (full-resolution) slide region this canvas covers, in
+    # matplotlib extent order (left, right, bottom, top) with y increasing
+    # downward. This lets the overlay place the heatmap at its true absolute
+    # position on the slide, with no rescaling guess.
+    extent = (
+        min_x,
+        min_x + width * scale,
+        min_y + height * scale,
+        min_y,
+    )
+    return heatmap, extent
 
 
 def render_heatmap(heatmap, output_path, title):
@@ -124,7 +186,7 @@ def render_payload_heatmap(
     title=None,
     save_array=False,
 ):
-    heatmap = build_heatmap(payload, score_key, tile_size)
+    heatmap, _ = build_heatmap(payload, score_key, tile_size)
     resolved_title = title or score_key.replace("_", " ")
     render_heatmap(heatmap, output_path, resolved_title)
 
