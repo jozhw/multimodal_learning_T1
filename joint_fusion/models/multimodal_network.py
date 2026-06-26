@@ -269,6 +269,59 @@ class MultimodalNetwork(nn.Module):
 
         return output, raw_wsi_embedding, raw_omic_embedding, combined_embedding
 
+    # ------------------------------------------------------------------
+    # Chunked-saliency support. forward() above is untouched; these methods
+    # express the same risk score
+    #     \( y = f(E_1, \dots, E_T) \),   \( E_i = \mathrm{enc}(x_i) \),
+    # as (a) a per-tile encode and (b) a "head from per-tile features" that
+    # reproduces forward()'s pooling + fusion + MLP. The fusion block below is a
+    # verbatim copy of forward()'s and must track it. Guarantee:
+    #     forward(x_wsi, x_omic)
+    #       == forward_from_wsi_tile_features(encode_wsi_tile_features(x_wsi), x_omic)
+    # ------------------------------------------------------------------
+    def encode_wsi_tile_features(self, x_wsi):
+        r"""Single-patient per-tile FM features \(E\in\mathbb{R}^{T\times d_{enc}}\)."""
+        patients = self._normalize_x_wsi_patients(x_wsi)
+        if len(patients) != 1:
+            raise ValueError(
+                "encode_wsi_tile_features expects a single patient (batch size 1)"
+            )
+        return self.wsi_net.encode_tile_features(patients[0])
+
+    def forward_from_wsi_tile_features(self, tile_features, x_omic):
+        r"""Pooling + fusion + MLP from per-tile WSI features.
+
+        This is the map \(f\): it takes the per-tile embeddings \(E\), pools them
+        (the only cross-tile step), fuses with the omic branch, and applies the
+        MLP head to produce \(y\). Equivalent to forward(x_wsi, x_omic) when
+        ``tile_features = encode_wsi_tile_features(x_wsi)``.
+        """
+        wsi_embedding = self.wsi_net.forward_from_tile_features(tile_features)
+        if wsi_embedding.dim() == 1:
+            wsi_embedding = wsi_embedding.unsqueeze(0)
+        omic_embedding = self.omic_net(x_omic)
+
+        wsi_projected = self.wsi_projection(wsi_embedding)
+        omic_projected = self.omic_projection(omic_embedding)
+        raw_wsi_embedding = wsi_projected
+        raw_omic_embedding = omic_projected
+
+        if self.config.model.joint_embedding == "concatenate":
+            combined_embedding = torch.cat((wsi_embedding, omic_embedding), dim=1)
+        else:
+            total_weight = self.omic_weight + self.wsi_weight
+            normalized_rna = self.omic_weight / total_weight
+            normalized_wsi = self.wsi_weight / total_weight
+            combined_embedding = (
+                normalized_rna * omic_projected + normalized_wsi * wsi_projected
+            )
+
+        output = self.fused_mlp(combined_embedding)
+        if output.dim() > 1 and output.size(1) == 1:
+            output = output.squeeze(1)
+
+        return output, raw_wsi_embedding, raw_omic_embedding, combined_embedding
+
     def forward_omic_only(self, x_omic):
         omic_embedding = self.omic_net(x_omic)
         output = self.fused_mlp(omic_embedding)

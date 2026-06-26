@@ -47,9 +47,11 @@ testing: # add this after training.
   calc_saliency_maps: true
   calc_IG: true
   calc_attention_maps: true
-  saliency_tile_selection: "topk_attention"
-  saliency_max_tiles: 8
+  saliency_tile_selection: "all"
   saliency_attention_scores_dir: "checkpoints/checkpoint_2026-02-14-05-44-19/test_results/attention_scores"
+  saliency_chunked: true
+  saliency_chunk_size: 16
+  saliency_self_check: false
 
 gpu:
   gpu_ids: "0,1,2,3"

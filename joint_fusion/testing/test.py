@@ -58,7 +58,7 @@ def validate_attribution_config(config):
         raise ValueError(
             "Attribution export currently requires testing.test_batch_size == 1"
         )
-    valid_selection = {"all", "first_k", "topk_attention"}
+    valid_selection = {"all"}
     if config.testing.saliency_tile_selection not in valid_selection:
         raise ValueError(
             f"Unsupported saliency_tile_selection: {config.testing.saliency_tile_selection}"
@@ -153,27 +153,6 @@ def get_saliency_subset_indices(config, tcga_id, x_wsi, x_omic, model):
 
     if selection == "all":
         return np.arange(num_tiles)
-
-    max_tiles = min(config.testing.saliency_max_tiles, num_tiles)
-    if selection == "first_k":
-        return np.arange(max_tiles)
-
-    if selection == "topk_attention":
-        attention_scores_dir = config.testing.saliency_attention_scores_dir
-        if attention_scores_dir not in (None, ""):
-            attention_scores = load_saved_attention_scores(
-                tcga_id, attention_scores_dir
-            )
-        else:
-            with torch.no_grad():
-                _, _, _, attention_scores = run_inference(
-                    model,
-                    x_wsi,
-                    x_omic,
-                    return_attention=True,
-                )
-        topk_idx = np.argsort(attention_scores)[::-1][:max_tiles]
-        return np.sort(topk_idx)
 
     raise ValueError(f"Unsupported saliency tile selection: {selection}")
 
@@ -360,6 +339,168 @@ def export_saliency_maps(
     return outputs.detach(), saliency_scores, attention_scores
 
 
+def compute_saliency_chunked(model, x_wsi, x_omic, chunk_size):
+    r"""Full-context per-tile saliency over ALL tiles, identical to the
+    all-at-once backward (up to floating-point reduction order), but with memory
+    bounded by ``chunk_size`` tiles instead of all :math:`T` at once.
+
+    ----------------------------------------------------------------------------
+    Model. Let the slide risk score be
+    .. math::
+        y \;=\; f\big(E_1, \dots, E_T\big), \qquad E_i \;=\; \mathrm{enc}(x_i),
+    where :math:`x_i\in\mathbb{R}^{3\times H\times W}` is tile :math:`i`,
+    :math:`\mathrm{enc}` is the per-tile foundation-model encoder, and
+    :math:`E_i\in\mathbb{R}^{d}` is its embedding. Crucially :math:`E_i` depends
+    on :math:`x_i` ALONE (tiles are encoded independently); the ONLY cross-tile
+    interaction -- the mean query and the softmax over all tiles in the attention
+    pool -- lives inside :math:`f` (= pool + fusion + MLP head).
+
+    Quantity of interest. The per-tile saliency is the input gradient
+    .. math::
+        \frac{\partial y}{\partial x_i}
+            \;=\; \underbrace{\frac{\partial y}{\partial E_i}}_{\textstyle g_i\in\mathbb{R}^{d}}
+                  \;\underbrace{\frac{\partial E_i}{\partial x_i}}_{\textstyle J_i\;(\text{Jacobian of enc})}
+            \;=\; g_i\,J_i ,
+    by the chain rule. We then reduce :math:`\partial y/\partial x_i` to one
+    scalar per tile (max over channels, mean over space), as in interpret_wsi.
+
+    Why one backward OOMs. Computing :math:`\partial y/\partial x` in a single
+    ``y.backward()`` forces autograd to keep the encoder graph (all activations)
+    for every tile alive at once -- :math:`O(T)` activations of a 24-layer ViT.
+
+    ----------------------------------------------------------------------------
+    Stage 1 -- upstream gradient, full attention context, cheap.
+    Treat the embeddings :math:`E` as leaves and backprop ONLY through :math:`f`:
+    .. math::
+        g \;=\; \nabla_E\, f(E_1,\dots,E_T)\Big|_{E=\mathrm{enc}(x)}
+        \quad\Longrightarrow\quad
+        g_i \;=\; \frac{\partial y}{\partial E_i}.
+    No encoder activations are stored, and because :math:`f` is evaluated on ALL
+    :math:`T` embeddings, each :math:`g_i` carries the global (all-tile) mean
+    query and softmax -- i.e. the TRUE full-bag attention context.
+
+    Stage 2 -- per-tile Jacobian, chunked.
+    For a block of tiles :math:`C`, recompute :math:`E_C=\mathrm{enc}(x_C)` WITH a
+    graph and seed the backward with the upstream gradient. For a vector-output
+    node, ``E_C.backward(g_C)`` injects :math:`g_C` as the cotangent, computing
+    the vector-Jacobian product
+    .. math::
+        \frac{\partial}{\partial x_i}\Big(g_i^\top E_i\Big)
+            \;=\; g_i^\top \frac{\partial E_i}{\partial x_i}
+            \;=\; g_i\,J_i
+            \;=\; \frac{\partial y}{\partial x_i}, \qquad i\in C .
+    The middle equality is exactly the chain-rule identity above, and there is no
+    cross-tile leakage because :math:`E_i` depends only on :math:`x_i` (so
+    :math:`\partial E_j/\partial x_i = 0` for :math:`j\neq i`). Only
+    :math:`O(|C|)` encoder graphs are alive at a time.
+
+    Exactness. Concatenating the stage-2 results over a partition of
+    :math:`\{1,\dots,T\}` reconstructs :math:`\partial y/\partial x` exactly:
+    .. math::
+        \big\{\, g_i J_i \,\big\}_{i=1}^{T}
+        \;=\; \frac{\partial y}{\partial x},
+    so the chunked saliency EQUALS the all-at-once saliency (differences are only
+    floating-point reduction order). The model weights and the map :math:`f` are
+    never modified.
+
+    Returns (output, saliency_scores[T], attention_scores), where each tile score
+    uses interpret_wsi's reduction: max over channels then mean over space.
+    """
+    # ---- Stage 1: g_i = dy/dE_i with the FULL attention context ----
+    with torch.no_grad():
+        tile_features = model.encode_wsi_tile_features(x_wsi)  # [T, d_enc], detached
+    embeddings_leaf = tile_features.detach().clone().requires_grad_(True)
+    model.zero_grad(set_to_none=True)
+    with torch.enable_grad():
+        output, _, _, _ = model.forward_from_wsi_tile_features(embeddings_leaf, x_omic)
+        output.sum().backward()
+    upstream_grad = embeddings_leaf.grad  # g, shape [T, d_enc]
+
+    attention_scores = None
+    if model.wsi_net.last_attention_weights is not None:
+        attention_scores = (
+            model.wsi_net.last_attention_weights.squeeze().detach().cpu().numpy()
+        )
+
+    # ---- Stage 2: vector-Jacobian product g_i^T (dE_i/dx_i), one chunk at a time ----
+    patient_tiles = model._normalize_x_wsi_patients(x_wsi)[0]  # [T, 3, H, W]
+    num_tiles = patient_tiles.shape[0]
+    saliency_scores = torch.zeros(num_tiles)
+
+    for start in range(0, num_tiles, chunk_size):
+        end = min(start + chunk_size, num_tiles)
+        tiles_chunk = patient_tiles[start:end].detach().clone().requires_grad_(True)
+        model.zero_grad(set_to_none=True)
+        with torch.enable_grad():
+            features_chunk = model.encode_wsi_tile_features(tiles_chunk)  # [|C|, d_enc]
+            # seed backward with g_C -> dy/dx_i = g_i^T dE_i/dx_i for i in C
+            features_chunk.backward(upstream_grad[start:end])
+        grads = tiles_chunk.grad  # [|C|, 3, H, W]
+        saliency_scores[start:end] = (
+            grads.abs().amax(dim=1).mean(dim=(1, 2)).detach().cpu()
+        )
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    logger.info(
+        "Computed chunked full-context saliency for %d tiles (chunk_size=%d)",
+        num_tiles,
+        chunk_size,
+    )
+    return output.detach(), saliency_scores.numpy(), attention_scores
+
+
+def self_check_chunked_saliency(model, x_wsi, x_omic, n_tiles=8, atol=1e-4):
+    r"""Validate the chunked path on the REAL model using a small sub-bag.
+
+    Two identities (both proven exact above) are checked numerically:
+      (i)  forward identity:
+           :math:`f(\mathrm{enc}(x)) = \texttt{forward}(x)`, i.e.
+           forward_from_wsi_tile_features(encode_wsi_tile_features(x)) == forward(x).
+      (ii) saliency identity:
+           chunked saliency == all-at-once saliency on the SAME bag.
+
+    A small ``n_tiles`` is used so the all-at-once reference fits in memory; the
+    chain-rule identity holds for any bag size, so this validates the method.
+    """
+    x_small = x_wsi[:, :n_tiles].contiguous()
+
+    # (i) forward identity
+    with torch.no_grad():
+        out_ref, _, _, _ = model(x_wsi=x_small, x_omic=x_omic)
+        feats = model.encode_wsi_tile_features(x_small)
+        out_dec, _, _, _ = model.forward_from_wsi_tile_features(feats, x_omic)
+    fwd_diff = float((out_ref - out_dec).abs().max().item())
+
+    # (ii) all-at-once reference saliency on the same small bag
+    x = x_small.detach().clone().requires_grad_(True)
+    model.zero_grad(set_to_none=True)
+    with torch.enable_grad():
+        outs, _, _, _ = run_inference(model, x, x_omic)
+        outs.sum().backward()
+    sal_full = x.grad[0].abs().amax(dim=1).mean(dim=(1, 2)).detach().cpu().numpy()
+
+    # chunked saliency on the same small bag
+    _, sal_chunk, _ = compute_saliency_chunked(
+        model, x_small, x_omic, chunk_size=max(1, n_tiles // 2)
+    )
+    sal_diff = float(np.abs(sal_full - sal_chunk).max())
+
+    passed = (fwd_diff <= atol) and (sal_diff <= atol)
+    logger.info(
+        "[self-check] forward max|Δ|=%.2e  saliency max|Δ|=%.2e  (atol=%.0e)  -> %s",
+        fwd_diff,
+        sal_diff,
+        atol,
+        "PASS" if passed else "FAIL",
+    )
+    if not passed:
+        logger.warning(
+            "[self-check] chunked saliency does NOT match the all-at-once reference"
+        )
+    return passed
+
+
 def export_integrated_gradients(
     model, config, tcga_id, x_omic, x_wsi, baseline, output_dir
 ):
@@ -443,31 +584,46 @@ def test_and_interpret(config, model, test_loader, device, baseline=None):
                 )
 
         if need_saliency:
-            saliency_tile_indices = get_saliency_subset_indices(
-                config,
-                tcga_id,
-                x_wsi,
-                x_omic,
-                model,
-            )
-            x_wsi_saliency, saliency_tile_names = subset_tiles(
-                x_wsi,
-                tile_names,
-                saliency_tile_indices,
-            )
-            saliency_outputs, saliency_scores, saliency_attention_scores = (
-                export_saliency_maps(
-                    config,
-                    model,
-                    device,
-                    tcga_id,
-                    x_wsi_saliency,
-                    x_omic,
-                    output_dirs["saliency"],
-                    saliency_tile_names,
-                    return_attention=need_attention,
+            if config.testing.saliency_chunked:
+                # Full-context saliency over ALL tiles, memory-bounded. Identical
+                # to the all-at-once backward (see compute_saliency_chunked).
+                if config.testing.saliency_self_check and batch_idx == 0:
+                    self_check_chunked_saliency(model, x_wsi, x_omic)
+                saliency_outputs, saliency_scores, saliency_attention_scores = (
+                    compute_saliency_chunked(
+                        model,
+                        x_wsi,
+                        x_omic,
+                        chunk_size=config.testing.saliency_chunk_size,
+                    )
                 )
-            )
+                saliency_tile_names = tile_names
+            else:
+                saliency_tile_indices = get_saliency_subset_indices(
+                    config,
+                    tcga_id,
+                    x_wsi,
+                    x_omic,
+                    model,
+                )
+                x_wsi_saliency, saliency_tile_names = subset_tiles(
+                    x_wsi,
+                    tile_names,
+                    saliency_tile_indices,
+                )
+                saliency_outputs, saliency_scores, saliency_attention_scores = (
+                    export_saliency_maps(
+                        config,
+                        model,
+                        device,
+                        tcga_id,
+                        x_wsi_saliency,
+                        x_omic,
+                        output_dirs["saliency"],
+                        saliency_tile_names,
+                        return_attention=need_attention,
+                    )
+                )
             if outputs is None:
                 outputs = saliency_outputs
             if attention_scores is None:

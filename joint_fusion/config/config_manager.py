@@ -63,8 +63,15 @@ class TestingConfig:
     calc_IG: bool = False
     calc_attention_maps: bool = False
     saliency_tile_selection: str = "all"
-    saliency_max_tiles: int = 10
     saliency_attention_scores_dir: Optional[str] = None
+    # Full-context saliency over ALL tiles via two-stage (chunked) backprop.
+    # Mathematically identical to the all-at-once backward (derivation in
+    # compute_saliency_chunked) but bounds memory; chunk_size = tiles per
+    # stage-2 pass. saliency_self_check validates the identity on a small bag
+    # against the reference all-at-once backward before the full run.
+    saliency_chunked: bool = False
+    saliency_chunk_size: int = 16
+    saliency_self_check: bool = False
 
 
 @dataclass

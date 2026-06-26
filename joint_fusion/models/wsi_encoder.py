@@ -383,3 +383,76 @@ class WSIEncoder(nn.Module):
         else:
             logger.warning("Using average pooling since no valid pooling selected")
             return embeddings_tensor.mean(dim=0)
+
+    # ------------------------------------------------------------------
+    # Split encode / pool, used ONLY by the chunked (memory-bounded) saliency
+    # path. These duplicate the logic of get_wsi_embeddings (and must be kept
+    # in sync with it) so the training/inference forward path above is left
+    # completely untouched -- an identically-trained model is unchanged.
+    #
+    # The decomposition is exact because the encoder is applied INDEPENDENTLY
+    # per tile, i.e. the i-th embedding is
+    #     \( E_i = \mathrm{enc}(x_i) \),
+    # a function of tile \(x_i\) ALONE. All cross-tile coupling lives later, in
+    # the attention pool. This per-tile independence is what lets stage 2 of the
+    # chunked saliency recompute \(E_i\) one chunk at a time without changing the
+    # gradient (see compute_saliency_chunked in testing/test.py).
+    # ------------------------------------------------------------------
+    def _prepare_tiles(self, x_wsi):
+        """Steps (1)-(5) of get_wsi_embeddings: type/shape normalize, move to
+        device, resize to 224, and apply the FM-specific normalization."""
+        if isinstance(x_wsi, list):
+            if len(x_wsi) == 0:
+                raise ValueError("Empty tile list for patient")
+            if not isinstance(x_wsi[0], torch.Tensor):
+                raise TypeError(f"Expected list of tensors, got {type(x_wsi[0])}")
+            tiles = torch.stack(x_wsi, dim=0)
+        elif isinstance(x_wsi, torch.Tensor):
+            tiles = x_wsi
+        else:
+            raise TypeError(f"Unsupported x_wsi type: {type(x_wsi)}")
+
+        if tiles.dim() == 5 and tiles.size(0) == 1:
+            tiles = tiles.squeeze(0)
+        if tiles.dim() != 4:
+            raise ValueError(f"Expected tiles [T,3,H,W], got {tuple(tiles.shape)}")
+        if tiles.size(1) != 3:
+            raise ValueError(
+                f"Expected RGB tiles with C=3, got shape {tuple(tiles.shape)}"
+            )
+
+        tiles = tiles.to(self.device)
+        tiles = TF.resize(tiles, [224, 224])
+        if self.wsi_fm == "uni":
+            tiles = self.uni_normalize(tiles)
+        elif self.wsi_fm == "lunit_DINO":
+            tiles = self.transform(tiles)
+        else:
+            raise ValueError(f"Unsupported wsi_fm: {self.wsi_fm}")
+        return tiles
+
+    def encode_tiles(self, x_wsi):
+        r"""Per-tile foundation-model features, *before* pooling.
+
+        Returns \( E = [\,E_1, \dots, E_T\,] \) of shape ``[T, encoder_dim]`` with
+        \( E_i = \mathrm{enc}(x_i) \). Mirrors steps (1)-(6) of
+        get_wsi_embeddings; the per-tile encode loop already runs in batches of
+        ``tile_batch_size``, so the only difference from training is that we stop
+        before pooling and hand the embeddings back.
+        """
+        tiles = self._prepare_tiles(x_wsi)
+        bs = self.tile_batch_size
+        embs = []
+        for i in range(0, tiles.size(0), bs):
+            feats = self.model(tiles[i : i + bs])
+            if feats.dim() == 1:
+                feats = feats.unsqueeze(0)
+            embs.append(feats)
+        return torch.cat(embs, dim=0)  # [T, encoder_dim]
+
+    def pool_tile_features(self, tile_features):
+        """Step (7) of get_wsi_embeddings, starting from per-tile features."""
+        if self.pooling in {"attention", "learned_weighted"}:
+            slide_embedding, attention_weights = self.attention_pool(tile_features)
+            return slide_embedding, attention_weights
+        return tile_features.mean(dim=0), None
