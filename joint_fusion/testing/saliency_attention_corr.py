@@ -30,6 +30,10 @@ import json
 import re
 from pathlib import Path
 
+import matplotlib
+
+matplotlib.use("Agg")  # headless-safe (no display on the remote)
+import matplotlib.pyplot as plt
 import numpy as np
 from scipy.stats import rankdata, wilcoxon
 
@@ -99,14 +103,16 @@ def load_slide_pairs(saliency_dir, attention_dir):
     return slides
 
 
-def two_stage_bootstrap_ci(slides, n_boot=2000, seed=40, statistic=np.nanmedian):
-    """Cluster (two-stage) bootstrap 95% CI of the cohort statistic.
+def two_stage_bootstrap(slides, n_boot=2000, seed=40, statistic=np.nanmedian):
+    """Cluster (two-stage) bootstrap replicates of the cohort statistic.
 
     Stage 1 -- patients: draw ``n_slides`` slides WITH replacement (independent unit).
     Stage 2 -- tiles: within each drawn slide, draw its tiles WITH replacement and
                recompute that slide's Spearman rho.
-    Record ``statistic`` (default median) over the resampled slides; return the
-    2.5/97.5 percentiles over ``n_boot`` resamples. Propagates BOTH sampling levels.
+    Record ``statistic`` (default median) over the resampled slides for each of the
+    ``n_boot`` resamples. Returns the full array of replicate statistics (the
+    bootstrap distribution); the caller takes percentiles for the CI and plots it.
+    Propagates BOTH sampling levels. Returns None if fewer than 2 usable slides.
     """
     usable = [s for s in slides if not np.isnan(s["rho"])]
     atts = [s["att"] for s in usable]
@@ -127,17 +133,57 @@ def two_stage_bootstrap_ci(slides, n_boot=2000, seed=40, statistic=np.nanmedian)
             rhos[j] = fast_spearman(a[tile_idx], s[tile_idx])
         boot_stats[b] = statistic(rhos)
 
-    return float(np.nanpercentile(boot_stats, 2.5)), float(
-        np.nanpercentile(boot_stats, 97.5)
+    return boot_stats
+
+
+def plot_bootstrap_distribution(boot_stats, output_path, median_rho=None, ci=None):
+    """Histogram + boxplot of the two-stage bootstrap distribution of the cohort
+    median rho (analogous to bootstrap.py's C-index boxplot, with quartiles)."""
+    boot = np.asarray(boot_stats, dtype=np.float64)
+    boot = boot[~np.isnan(boot)]
+    if boot.size == 0:
+        return None
+
+    fig, (ax_hist, ax_box) = plt.subplots(
+        1, 2, figsize=(12, 5), gridspec_kw={"width_ratios": [2, 1]}
     )
+
+    ax_hist.hist(boot, bins=40, color="#4C72B0", alpha=0.85, edgecolor="white")
+    if median_rho is not None:
+        ax_hist.axvline(
+            median_rho, color="black", lw=1.8, label=f"median rho = {median_rho:.3f}"
+        )
+    if ci is not None:
+        ax_hist.axvline(
+            ci[0], color="firebrick", ls="--", lw=1.6,
+            label=f"95% CI = [{ci[0]:.3f}, {ci[1]:.3f}]",
+        )
+        ax_hist.axvline(ci[1], color="firebrick", ls="--", lw=1.6)
+    ax_hist.set_xlabel("Cohort median Spearman rho (bootstrap replicate)")
+    ax_hist.set_ylabel("Count")
+    ax_hist.set_title("Two-stage bootstrap distribution (patients x tiles)")
+    ax_hist.legend(fontsize=9)
+
+    ax_box.boxplot(boot, vert=True, showmeans=True, whis=(2.5, 97.5))
+    ax_box.set_xticks([1])
+    ax_box.set_xticklabels(["attention vs saliency"])
+    ax_box.set_ylabel("Cohort median Spearman rho")
+    ax_box.set_title("Quartiles (Q1 / median / Q3)\nwhiskers = 2.5/97.5 pct")
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    return str(output_path)
 
 
 def summarize_cohort(slides, n_boot=2000, seed=40):
+    """Returns (summary_dict, boot_stats) where boot_stats is the bootstrap
+    distribution of the cohort median rho (or None)."""
     rhos = np.array([s["rho"] for s in slides], dtype=np.float64)
     valid = rhos[~np.isnan(rhos)]
     summary = {"n_slides_used": int(valid.size)}
     if valid.size == 0:
-        return summary
+        return summary, None
 
     summary.update(
         {
@@ -146,8 +192,12 @@ def summarize_cohort(slides, n_boot=2000, seed=40):
             "iqr": [float(np.percentile(valid, 25)), float(np.percentile(valid, 75))],
         }
     )
-    ci = two_stage_bootstrap_ci(slides, n_boot=n_boot, seed=seed)
-    if ci is not None:
+    boot_stats = two_stage_bootstrap(slides, n_boot=n_boot, seed=seed)
+    if boot_stats is not None:
+        ci = (
+            float(np.nanpercentile(boot_stats, 2.5)),
+            float(np.nanpercentile(boot_stats, 97.5)),
+        )
         summary["median_two_stage_bootstrap_ci95"] = list(ci)
         summary["bootstrap_n_resamples"] = int(n_boot)
 
@@ -160,7 +210,7 @@ def summarize_cohort(slides, n_boot=2000, seed=40):
             summary["wilcoxon_p_greater_than_0"] = float(p)
         except ValueError:
             summary["wilcoxon_p_greater_than_0"] = None
-    return summary
+    return summary, boot_stats
 
 
 def args():
@@ -173,6 +223,9 @@ def args():
     parser.add_argument("--attention-dir", required=True,
                         help="Directory of attention_scores_*.npz (attention_tile_scores).")
     parser.add_argument("--output", required=True, help="Output JSON path.")
+    parser.add_argument("--plot", default=None,
+                        help="Output PNG path for the bootstrap distribution plot. "
+                        "Defaults to <output>_bootstrap.png next to the JSON.")
     parser.add_argument("--bootstrap", type=int, default=2000,
                         help="Number of two-stage bootstrap resamples.")
     parser.add_argument("--bootstrap-seed", type=int, default=40)
@@ -187,9 +240,12 @@ def main():
         {"tcga_id": s["tcga_id"], "spearman_rho": s["rho"], "n_tiles": s["n_tiles"]}
         for s in slides
     ]
+    cohort, boot_stats = summarize_cohort(
+        slides, n_boot=opt.bootstrap, seed=opt.bootstrap_seed
+    )
     result = {
         "n_slides": len(slides),
-        "cohort": summarize_cohort(slides, n_boot=opt.bootstrap, seed=opt.bootstrap_seed),
+        "cohort": cohort,
         "per_slide": per_slide,
     }
 
@@ -207,6 +263,21 @@ def main():
             f"two-stage 95% CI=[{ci[0]:.3f}, {ci[1]:.3f}]  "
             f"Wilcoxon p(>0)={c.get('wilcoxon_p_greater_than_0')}"
         )
+
+    if boot_stats is not None:
+        plot_path = (
+            Path(opt.plot)
+            if opt.plot
+            else out_path.with_name(out_path.stem + "_bootstrap.png")
+        )
+        plot_path.parent.mkdir(parents=True, exist_ok=True)
+        plot_bootstrap_distribution(
+            boot_stats,
+            plot_path,
+            median_rho=c.get("median_rho"),
+            ci=c.get("median_two_stage_bootstrap_ci95"),
+        )
+        print(f"     bootstrap distribution plot -> {plot_path}")
 
 
 if __name__ == "__main__":
