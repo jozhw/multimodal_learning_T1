@@ -137,42 +137,19 @@ def two_stage_bootstrap(slides, n_boot=2000, seed=40, statistic=np.nanmedian):
 
 
 def plot_bootstrap_distribution(boot_stats, output_path, median_rho=None, ci=None):
-    """Histogram + boxplot of the two-stage bootstrap distribution of the cohort
-    median rho (analogous to bootstrap.py's C-index boxplot, with quartiles)."""
+    """Boxplot of the two-stage bootstrap distribution of the cohort median rho,
+    in the same format as bootstrap.py's C-index boxplot."""
     boot = np.asarray(boot_stats, dtype=np.float64)
     boot = boot[~np.isnan(boot)]
     if boot.size == 0:
         return None
 
-    fig, (ax_hist, ax_box) = plt.subplots(
-        1, 2, figsize=(12, 5), gridspec_kw={"width_ratios": [2, 1]}
-    )
-
-    ax_hist.hist(boot, bins=40, color="#4C72B0", alpha=0.85, edgecolor="white")
-    if median_rho is not None:
-        ax_hist.axvline(
-            median_rho, color="black", lw=1.8, label=f"median rho = {median_rho:.3f}"
-        )
-    if ci is not None:
-        ax_hist.axvline(
-            ci[0], color="firebrick", ls="--", lw=1.6,
-            label=f"95% CI = [{ci[0]:.3f}, {ci[1]:.3f}]",
-        )
-        ax_hist.axvline(ci[1], color="firebrick", ls="--", lw=1.6)
-    ax_hist.set_xlabel("Cohort median Spearman rho (bootstrap replicate)")
-    ax_hist.set_ylabel("Count")
-    ax_hist.set_title("Two-stage bootstrap distribution (patients x tiles)")
-    ax_hist.legend(fontsize=9)
-
-    ax_box.boxplot(boot, vert=True, showmeans=True, whis=(2.5, 97.5))
-    ax_box.set_xticks([1])
-    ax_box.set_xticklabels(["attention vs saliency"])
-    ax_box.set_ylabel("Cohort median Spearman rho")
-    ax_box.set_title("Quartiles (Q1 / median / Q3)\nwhiskers = 2.5/97.5 pct")
-
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=300, bbox_inches="tight")
-    plt.close(fig)
+    plt.figure(figsize=(10, 6))
+    plt.boxplot(boot, vert=True)
+    plt.title("Bootstrapped Attention-Saliency Spearman Correlation")
+    plt.xticks([1], ["Multimodal (joint fusion)"])
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close()
     return str(output_path)
 
 
