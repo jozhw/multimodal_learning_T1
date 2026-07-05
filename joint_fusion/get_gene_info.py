@@ -143,7 +143,7 @@ def load_gene_names_from_mapping(
 
 if __name__ == "__main__":
 
-    mapping_file_path = "/lus/eagle/clone/g2/projects/GeomicVar/jozhw/multimodal_learning_T1/joint_fusion/mapping_df.json"
+    mapping_file_path = "/lus/eagle/clone/g2/projects/GeomicVar/jozhw/multimodal_learning_T1/joint_fusion/mapping_data/31jan_256px_20x/mapping_df.json"
     output_dir = "./assets/gene_info"
 
     load_gene_names_from_mapping(
