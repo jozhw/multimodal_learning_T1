@@ -3,11 +3,14 @@ import csv
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 import numpy as np
 
 from joint_fusion.testing.reconstruct_slide_heatmap import (
     build_heatmap,
     infer_score_key,
+    infer_tile_footprint,
+    normalize_scores,
 )
 
 
@@ -69,6 +72,44 @@ def args():
         action="store_true",
         help="If a slide's dimensions are not found in the stats CSV, fall back to "
         "approximate tissue-bbox registration instead of skipping its overlay.",
+    )
+    parser.add_argument(
+        "--highlight-boxes",
+        action="store_true",
+        help="Also emit a pathologist-facing overlay that draws a square border "
+        "around each high-scoring tile (regions of interest to verify).",
+    )
+    parser.add_argument(
+        "--boxes-only",
+        action="store_true",
+        help="Emit ONLY the pathologist ROI boxes (implies --highlight-boxes); "
+        "skip the heatmap and heatmap-overlay rendering entirely.",
+    )
+    parser.add_argument(
+        "--highlight-percentile",
+        type=float,
+        default=90.0,
+        help="Tiles at/above this within-slide score percentile get a box "
+        "(default 90 = top 10%%). Ignored if --highlight-threshold is set.",
+    )
+    parser.add_argument(
+        "--highlight-threshold",
+        type=float,
+        default=None,
+        help="Absolute normalized-score cutoff in [0, 1] for boxing a tile. "
+        "Overrides --highlight-percentile when provided.",
+    )
+    parser.add_argument(
+        "--box-color",
+        type=str,
+        default="lime",
+        help="Edge color for highlight boxes.",
+    )
+    parser.add_argument(
+        "--box-linewidth",
+        type=float,
+        default=1.5,
+        help="Edge line width for highlight boxes.",
     )
     return parser.parse_args()
 
@@ -234,6 +275,106 @@ def render_overlay_tissue(heatmap, slide_asset_path, output_path, title):
     plt.close()
 
 
+def compute_highlight_boxes(
+    payload, score_key, tile_size, percentile=90.0, threshold=None
+):
+    """Return the level-0 boxes (x, y, size) for tiles whose score clears the
+    cutoff, plus the cutoff actually used.
+
+    Two selection modes:
+      * ``threshold`` (absolute): scores are min-max normalized within the slide
+        (same as the heatmap) and tiles with ``norm >= threshold`` are boxed.
+      * ``percentile`` (default): the top ``100 - percentile`` fraction of tiles
+        by score are boxed, chosen by RANK. Rank selection keeps the count
+        bounded (~top 10% at ``percentile=90``) even when many tiles are tied at
+        the percentile value, which a raw value cutoff would over-select.
+
+    Boxes are placed at each tile's true level-0 footprint, matching
+    build_heatmap's convention so they line up with the heatmap overlay exactly.
+    """
+    x_coords = np.asarray(payload["x_coords"], dtype=np.int64)
+    y_coords = np.asarray(payload["y_coords"], dtype=np.int64)
+    raw_scores = np.asarray(payload[score_key], dtype=np.float64)
+    footprint = infer_tile_footprint(x_coords, y_coords, tile_size)
+
+    if threshold is not None:
+        norm = normalize_scores(raw_scores)
+        keep = norm >= float(threshold)
+        cutoff = float(threshold)
+    else:
+        n_tiles = raw_scores.size
+        k = int(np.ceil(n_tiles * (100.0 - percentile) / 100.0))
+        k = max(1, min(k, n_tiles))
+        # indices of the top-k scores (ties broken arbitrarily but count is fixed)
+        top_idx = np.argsort(raw_scores)[-k:]
+        keep = np.zeros(n_tiles, dtype=bool)
+        keep[top_idx] = True
+        cutoff = float(raw_scores[top_idx].min())
+
+    boxes = [
+        (int(x), int(y), int(footprint))
+        for x, y, k in zip(x_coords, y_coords, keep)
+        if k
+    ]
+    return boxes, cutoff, int(keep.sum())
+
+
+def render_overlay_boxes(
+    boxes, slide_asset_path, slide_w, slide_h, output_path, title,
+    box_color="lime", box_linewidth=1.5,
+):
+    """Draw the slide thumbnail with an unfilled square around each high-scoring
+    tile, at its true absolute level-0 position (same coordinate frame as
+    render_overlay_faithful, so no rescaling guess)."""
+    slide_image = plt.imread(slide_asset_path)
+
+    fig, ax = plt.subplots(figsize=(12, 12))
+    ax.imshow(slide_image, origin="upper", extent=(0, slide_w, slide_h, 0))
+    for x, y, size in boxes:
+        ax.add_patch(
+            Rectangle(
+                (x, y), size, size,
+                fill=False, edgecolor=box_color, linewidth=box_linewidth,
+            )
+        )
+    ax.set_xlim(0, slide_w)
+    ax.set_ylim(slide_h, 0)
+    ax.set_title(f"{title} - regions of interest (n={len(boxes)})")
+    ax.axis("off")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def maybe_render_highlight_boxes(
+    payload, score_key, tile_size, slide_asset_path, dims, overlay_dir, stem, title,
+    percentile, threshold, box_color, box_linewidth,
+):
+    """Emit the pathologist-facing boxed overlay when slide dimensions are known.
+
+    Requires true slide dimensions: the boxes carry no meaning unless placed at
+    their absolute position, so (unlike the heatmap) there is no tissue-bbox
+    fallback here.
+    """
+    if dims is None:
+        print(
+            f"[warn] no slide dimensions for {stem}; skipping highlight boxes "
+            f"(needs --slide-stats-csv for absolute placement)"
+        )
+        return
+
+    boxes, cutoff, n = compute_highlight_boxes(
+        payload, score_key, tile_size, percentile=percentile, threshold=threshold
+    )
+    slide_w, slide_h = dims
+    boxes_output = overlay_dir / f"{stem}_boxes.png"
+    render_overlay_boxes(
+        boxes, slide_asset_path, slide_w, slide_h, boxes_output, title,
+        box_color=box_color, box_linewidth=box_linewidth,
+    )
+    print(f"[ok] {stem} -> {boxes_output.name} ({n} tiles boxed, cutoff={cutoff:.4g})")
+
+
 def iter_tile_score_files(tile_scores, tile_scores_dir):
     if tile_scores is not None:
         yield Path(tile_scores)
@@ -249,23 +390,20 @@ def iter_tile_score_files(tile_scores, tile_scores_dir):
 def process_tile_score_file(
     path, output_dir, slide_assets_dir, tile_size, score_key, save_array,
     dims_by_stem=None, dims_by_key=None, allow_tissue_fallback=False,
+    highlight_boxes=False, highlight_percentile=90.0, highlight_threshold=None,
+    box_color="lime", box_linewidth=1.5, boxes_only=False,
 ):
     payload = np.load(path, allow_pickle=True)
     resolved_score_key = infer_score_key(payload, score_key)
-    heatmap, heatmap_extent = build_heatmap(payload, resolved_score_key, tile_size)
     title = resolved_score_key.replace("_", " ")
 
-    heatmap_dir = output_dir / "heatmaps"
     overlay_dir = output_dir / "overlays"
-    heatmap_dir.mkdir(parents=True, exist_ok=True)
     overlay_dir.mkdir(parents=True, exist_ok=True)
 
-    heatmap_output = heatmap_dir / f"{path.stem}_heatmap.png"
-    render_heatmap(heatmap, heatmap_output, title)
+    # boxes_only implies the pathologist ROI boxes; the heatmap/overlay are skipped.
+    draw_boxes = highlight_boxes or boxes_only
 
-    if save_array:
-        np.save(heatmap_output.with_suffix(".npy"), heatmap)
-
+    # Slide asset + dimensions are needed by both the overlay and the boxes.
     tile_names = payload.get("tile_names")
     if tile_names is None or len(tile_names) == 0:
         return
@@ -276,36 +414,66 @@ def process_tile_score_file(
         print(f"[warn] no slide asset found for {slide_key}")
         return
 
-    overlay_output = overlay_dir / f"{path.stem}_overlay.png"
     dims = lookup_slide_dimensions(
         dims_by_stem, dims_by_key, slide_asset_path, slide_key
     )
 
-    if dims is not None:
-        slide_w, slide_h = dims
-        render_overlay_faithful(
-            heatmap,
-            heatmap_extent,
-            slide_asset_path,
-            slide_w,
-            slide_h,
-            overlay_output,
-            title,
-        )
-        mode = "faithful"
-    elif allow_tissue_fallback:
-        render_overlay_tissue(heatmap, slide_asset_path, overlay_output, title)
-        mode = "tissue-fallback"
-    else:
-        print(
-            f"[warn] no slide dimensions for {slide_key} in stats CSV; "
-            f"skipping overlay (use --allow-tissue-fallback to approximate)"
-        )
-        return
+    if not boxes_only:
+        heatmap, heatmap_extent = build_heatmap(payload, resolved_score_key, tile_size)
 
-    print(
-        f"[ok] {path.name} -> {heatmap_output.name}, {overlay_output.name} ({mode})"
-    )
+        heatmap_dir = output_dir / "heatmaps"
+        heatmap_dir.mkdir(parents=True, exist_ok=True)
+        heatmap_output = heatmap_dir / f"{path.stem}_heatmap.png"
+        render_heatmap(heatmap, heatmap_output, title)
+
+        if save_array:
+            np.save(heatmap_output.with_suffix(".npy"), heatmap)
+
+        overlay_output = overlay_dir / f"{path.stem}_overlay.png"
+        if dims is not None:
+            slide_w, slide_h = dims
+            render_overlay_faithful(
+                heatmap,
+                heatmap_extent,
+                slide_asset_path,
+                slide_w,
+                slide_h,
+                overlay_output,
+                title,
+            )
+            mode = "faithful"
+        elif allow_tissue_fallback:
+            render_overlay_tissue(heatmap, slide_asset_path, overlay_output, title)
+            mode = "tissue-fallback"
+        else:
+            print(
+                f"[warn] no slide dimensions for {slide_key} in stats CSV; "
+                f"skipping overlay (use --allow-tissue-fallback to approximate)"
+            )
+            # No overlay, but boxes may still be requested below.
+            mode = None
+
+        if mode is not None:
+            print(
+                f"[ok] {path.name} -> {heatmap_output.name}, "
+                f"{overlay_output.name} ({mode})"
+            )
+
+    if draw_boxes:
+        maybe_render_highlight_boxes(
+            payload=payload,
+            score_key=resolved_score_key,
+            tile_size=tile_size,
+            slide_asset_path=slide_asset_path,
+            dims=dims,
+            overlay_dir=overlay_dir,
+            stem=path.stem,
+            title=title,
+            percentile=highlight_percentile,
+            threshold=highlight_threshold,
+            box_color=box_color,
+            box_linewidth=box_linewidth,
+        )
 
 
 def main():
@@ -337,6 +505,12 @@ def main():
             dims_by_stem=dims_by_stem,
             dims_by_key=dims_by_key,
             allow_tissue_fallback=opt.allow_tissue_fallback,
+            highlight_boxes=opt.highlight_boxes,
+            highlight_percentile=opt.highlight_percentile,
+            highlight_threshold=opt.highlight_threshold,
+            box_color=opt.box_color,
+            box_linewidth=opt.box_linewidth,
+            boxes_only=opt.boxes_only,
         )
 
 
