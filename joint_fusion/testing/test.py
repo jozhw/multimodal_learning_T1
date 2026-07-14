@@ -74,15 +74,12 @@ def denormalize_image(image, mean, std):
 
 
 def calc_integrated_gradients(
-    model, config, tcga_id, x_omic, x_wsi, baseline=None, steps=10
+    model, config, tcga_id, x_omic, x_wsi, baseline=None, steps=50
 ):
-    # baseline = None
-    # baseline.shape
-    # torch.Size([1, 19962])
-    # set_trace()
     if baseline is None:
         logger.info("** using trivial zero baseline for IG **")
         baseline = torch.zeros_like(x_omic).to(x_omic.device)
+        baseline_kind = "zeros"
     else:
         logger.info(
             "** Using mean gene expression values over training samples as the baseline for IG **"
@@ -90,19 +87,20 @@ def calc_integrated_gradients(
         baseline = torch.from_numpy(baseline).to(x_omic.device)
         baseline = baseline.float()
         baseline = baseline * torch.ones_like(x_omic).to(x_omic.device)
-    # set_trace()
+        baseline_kind = "train_mean_expression"
+
     logger.info(f"CALCULATING INTEGRATED GRADIENTS OVER {steps} steps")
     model.zero_grad(set_to_none=True)
     with torch.no_grad():
         fixed_wsi_embedding = model.encode_wsi(x_wsi).detach()
 
+    # alpha = 0 is the baseline, alpha = 1 is the patient's real expression.
     scaled_inputs = [
         baseline + (float(i) / steps) * (x_omic - baseline) for i in range(steps + 1)
     ]
     gradients = []
-    steps_index = 0
-    for scaled_input in scaled_inputs:
-        logger.info(f"steps_index: {steps_index}")
+    endpoint_preds = {}
+    for step_index, scaled_input in enumerate(scaled_inputs):
         scaled_input = scaled_input.clone().detach().requires_grad_(True)
         model.zero_grad(set_to_none=True)
         with torch.enable_grad():
@@ -110,18 +108,55 @@ def calc_integrated_gradients(
                 fixed_wsi_embedding=fixed_wsi_embedding,
                 x_omic=scaled_input,
             )
-            logger.info(f"prediction: {pred}")
             output = pred.sum()
             output.backward()
         gradients.append(scaled_input.grad.detach().cpu().numpy())
-        steps_index += 1
-    # set_trace()
-    avg_gradients = np.mean(gradients[:-1], axis=0)
-    integrated_grads = (
-        x_omic.detach().cpu().numpy() - baseline.detach().cpu().numpy()
-    ) * avg_gradients
+        if step_index in (0, steps):
+            endpoint_preds[step_index] = float(output.detach().cpu())
 
-    return integrated_grads
+    # Trapezoidal Riemann sum of the gradient over alpha in [0, 1]. The interval has
+    # unit length, so the integral IS the path-averaged gradient. (The previous code
+    # took a left-endpoint sum over 10 steps, which biases the integral; trapezoid at
+    # the configured step count drives the completeness error below.)
+    grad_stack = np.stack(gradients, axis=0)
+    path_gradients = (grad_stack[:-1] + grad_stack[1:]).sum(axis=0) / (2.0 * steps)
+
+    x_np = x_omic.detach().cpu().numpy()
+    baseline_np = baseline.detach().cpu().numpy()
+    integrated_grads = (x_np - baseline_np) * path_gradients
+
+    # Completeness axiom: the attributions must sum to the change in the model output
+    # between the baseline and the real input. This is the one sanity check that tells
+    # us the attribution is trustworthy, so record it per patient rather than trusting it.
+    delta_pred = endpoint_preds[steps] - endpoint_preds[0]
+    attribution_sum = float(integrated_grads.sum())
+    completeness_error = attribution_sum - delta_pred
+    denom = abs(delta_pred) if abs(delta_pred) > 1e-8 else 1.0
+    logger.info(
+        f"[IG {tcga_id[0]}] risk(x)={endpoint_preds[steps]:.6f} "
+        f"risk(baseline)={endpoint_preds[0]:.6f} delta={delta_pred:.6f} "
+        f"sum(IG)={attribution_sum:.6f} completeness_error={completeness_error:.6f} "
+        f"({100.0 * abs(completeness_error) / denom:.2f}% of delta)"
+    )
+
+    return {
+        "integrated_grads": integrated_grads,
+        "path_gradients": path_gradients,
+        "vanilla_gradients": gradients[-1],
+        "x_omic": x_np,
+        "baseline": baseline_np,
+        "completeness": {
+            "tcga_id": tcga_id[0],
+            "risk_input": endpoint_preds[steps],
+            "risk_baseline": endpoint_preds[0],
+            "delta_risk": delta_pred,
+            "sum_ig": attribution_sum,
+            "completeness_error": completeness_error,
+            "rel_completeness_error": completeness_error / denom,
+            "steps": steps,
+            "baseline_kind": baseline_kind,
+        },
+    }
 
 
 def run_inference(model, x_wsi, x_omic, return_attention=False):
@@ -504,12 +539,54 @@ def self_check_chunked_saliency(model, x_wsi, x_omic, n_tiles=8, atol=1e-4):
 def export_integrated_gradients(
     model, config, tcga_id, x_omic, x_wsi, baseline, output_dir
 ):
-    integrated_grads = calc_integrated_gradients(
-        model, config, tcga_id, x_omic, x_wsi, baseline=baseline, steps=10
+    steps = getattr(config.testing, "ig_steps", 50)
+    result = calc_integrated_gradients(
+        model, config, tcga_id, x_omic, x_wsi, baseline=baseline, steps=steps
     )
-    save_path = os.path.join(output_dir, f"integrated_grads_{tcga_id[0]}.npy")
-    np.save(save_path, integrated_grads)
-    logger.info(f"Saved integrated gradients for {tcga_id[0]} to {save_path}")
+
+    tid = tcga_id[0]
+    for prefix, key in (
+        ("integrated_grads", "integrated_grads"),
+        ("path_gradients", "path_gradients"),
+        ("vanilla_gradients", "vanilla_gradients"),
+        ("omic_input", "x_omic"),
+    ):
+        np.save(os.path.join(output_dir, f"{prefix}_{tid}.npy"), result[key])
+
+    baseline_path = os.path.join(output_dir, "ig_baseline.npy")
+    if not os.path.exists(baseline_path):
+        np.save(baseline_path, result["baseline"])
+
+    logger.info(f"Saved IG attributions + gradients for {tid} to {output_dir}")
+    return result["completeness"]
+
+
+def export_ig_completeness(records, output_dir):
+    """Write the per-patient completeness check for the IG run.
+
+    sum(IG) should equal risk(x) - risk(baseline). A large relative error means the
+    Riemann sum is too coarse (raise testing.ig_steps) and the attributions -- and
+    therefore every pathway score derived from them -- are not to be trusted.
+    """
+    if not records:
+        return None
+    import pandas as pd
+
+    df = pd.DataFrame(records)
+    path = os.path.join(output_dir, "ig_completeness.csv")
+    df.to_csv(path, index=False)
+    worst = df["rel_completeness_error"].abs().max()
+    median = df["rel_completeness_error"].abs().median()
+    logger.info(
+        f"IG completeness over {len(df)} patients: median |error| "
+        f"{100 * median:.2f}% of delta-risk, worst {100 * worst:.2f}% -> {path}"
+    )
+    if worst > 0.05:
+        logger.warning(
+            "IG completeness error exceeds 5% for at least one patient; consider "
+            "raising testing.ig_steps."
+        )
+    return path
 
 
 def export_attention_tile_scores(tcga_id, tile_names, output_dir, attention_scores):
@@ -550,6 +627,7 @@ def test_and_interpret(config, model, test_loader, device, baseline=None):
     need_ig = config.testing.calc_IG
     need_attention = config.testing.calc_attention_maps
     validate_attribution_config(config)
+    ig_completeness_records = []
 
     for batch_idx, batch in enumerate(test_loader):
         tcga_id, days_to_event, event_occurred, x_wsi, x_omic, tile_names = (
@@ -645,14 +723,16 @@ def test_and_interpret(config, model, test_loader, device, baseline=None):
             )
 
         if need_ig:
-            export_integrated_gradients(
-                model,
-                config,
-                tcga_id,
-                x_omic,
-                x_wsi,
-                baseline,
-                output_dirs["ig"],
+            ig_completeness_records.append(
+                export_integrated_gradients(
+                    model,
+                    config,
+                    tcga_id,
+                    x_omic,
+                    x_wsi,
+                    baseline,
+                    output_dirs["ig"],
+                )
             )
 
         all_predictions.append(outputs.squeeze().detach().cpu().numpy())
@@ -664,6 +744,9 @@ def test_and_interpret(config, model, test_loader, device, baseline=None):
         all_events.append(event_occurred)
         model.zero_grad()
         torch.cuda.empty_cache()
+
+    if need_ig:
+        export_ig_completeness(ig_completeness_records, output_dirs["ig"])
 
     all_predictions_np = [pred.item() for pred in all_predictions]
     all_events_np = torch.stack(all_events).cpu().numpy()
