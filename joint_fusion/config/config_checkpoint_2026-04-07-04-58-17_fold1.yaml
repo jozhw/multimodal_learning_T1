@@ -52,6 +52,7 @@ testing: # add this after training.
   saliency_chunked: true
   saliency_chunk_size: 16
   saliency_self_check: false
+  ig_steps: 50  # completeness error is logged to IG_6sep/ig_completeness.csv
 
 gpu:
   gpu_ids: "0,1,2,3"

@@ -72,6 +72,9 @@ class TestingConfig:
     saliency_chunked: bool = False
     saliency_chunk_size: int = 16
     saliency_self_check: bool = False
+    # Riemann steps for integrated gradients. The completeness error (logged per
+    # patient to ig_completeness.csv) shrinks with more steps; 10 was too coarse.
+    ig_steps: int = 50
 
 
 @dataclass
