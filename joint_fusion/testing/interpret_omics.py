@@ -1,31 +1,59 @@
 """
 interpret_omics.py
 
-Rank genes by their Integrated Gradients (IG) attribution across patients using
-two complementary rankings, then annotate the top genes from their Ensembl IDs
-and assess how related they are to LUAD (lung adenocarcinoma):
+Gene-level view of the omic integrated gradients: rank the genes the model leans on,
+annotate them from their Ensembl IDs, and report each gene's direction of effect.
 
-  - SIGNED: mean signed IG identifies features associated with increased
-    (most positive) or decreased (most negative) predicted risk.
-  - MAGNITUDE: mean absolute IG quantifies attribution magnitude independent of
-    direction.
+This is the SUPPORTING layer. The headline analysis is pathway-level and lives in
+pathway_interpret.py, which follows Steyaert et al. (2023) by aggregating the same
+attributions over MSigDB gene sets and testing them. Read this table as "which
+individual genes carry the attribution", not as a biological claim on its own --
+a ranked gene list has no p-value attached to it.
 
-The deliverable is a table (CSV + JSON) of the top genes with:
-  - symbol / description / biotype (from the gene-info cache, gget.info for misses)
-  - mean & std signed IG, mean & std absolute IG, and the number of patients
-  - a LUAD driver-gene flag
-  - the LUAD-related pathways each gene appears in (from Enrichr)
+Two rankings, and they mean different things:
+
+  MAGNITUDE (mean |IG|)
+      How much attribution a gene carries, regardless of direction. This is the
+      honest importance ranking, and it is also what the paper ranks by (sum of
+      absolute attribution across samples).
+
+  DIRECTION (mean path gradient)
+      Whether raising a gene's expression pushes the predicted risk UP (positive,
+      poor prognosis) or DOWN (negative, protective).
+
+What is NOT used here, and why: the cohort-mean SIGNED IG. This model's IG is taken
+against a baseline of mean training expression, so IG carries a factor of
+(x - cohort_mean) whose sign flips depending on whether a given patient is above or
+below the cohort average. Averaged across the cohort, that sign cancels -- on this
+checkpoint the median gene keeps only ~10% of its magnitude in the signed mean, and
+only 5 of the top-20 magnitude genes survive into the top-20 signed list. Ranking by
+signed IG therefore sorts genes by how skewed their expression is, not by how they
+move risk. The earlier version of this script did exactly that; the direction now
+comes from the gradient instead. Full derivation:
+literature/ig_pathway_design_notes.md.
+
+Also removed deliberately: the hand-curated LUAD_DRIVER_GENES list and the
+LUAD_TERM_KEYWORDS substring matcher. Flagging a pathway as "LUAD-related" because
+its NAME contains "kras" or "cell cycle" is circular -- it confirms whatever the list
+was written to confirm, and it is not evidence. LUAD relevance is now something
+pathway_interpret.py tests (permutation FDR, GSEA, hypergeometric ORA against the
+measured-gene background) rather than something asserted here.
 
 Outputs (under <output_base_dir>/interpret_omics/):
-  - top_genes.csv               one row per top gene (both directions)
-  - top_genes.json              same content, nested + LUAD pathway context
-  - pathway_enrichment.csv      Enrichr terms for the top gene set, LUAD-flagged
+  top_genes.csv           one row per top gene, with IG magnitude plus path and
+                          vanilla gradient direction summaries
+  top_genes.json          same content, nested
+  patient_top_genes.csv   patient-level signed IG rows for the top |IG| genes per
+                          patient; this is where signed IG should be read
+  top_genes_gene_info.csv full gget.info specification rows for the top genes
+  missing_genes.txt       Ensembl IDs the annotation cache could not resolve
 
 Run from the repo root:
   python -m joint_fusion.testing.interpret_omics --config=<config.yaml> --top-n=20
 """
 
 import argparse
+import functools
 import glob
 import json
 import logging
@@ -33,7 +61,6 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-import gget
 import numpy as np
 import pandas as pd
 
@@ -43,100 +70,33 @@ from joint_fusion.utils.logging import setup_logging
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# LUAD reference sets
-# ---------------------------------------------------------------------------
+@functools.lru_cache(maxsize=1)
+def _get_gget():
+    """Import gget lazily so the script still runs where gget is unavailable.
 
+    Returns the gget module, or None if it cannot be imported (e.g. an offline
+    compute node). Warns exactly once. When None, annotation is served purely
+    from the on-disk cache and any cache miss is recorded in missing_genes.txt
+    (fetch those locally with get_gene_info.py and copy the CSVs into the cache).
+    """
+    try:
+        import gget
 
-# LUAD driver / recurrently altered genes.
-#
-# Main justification:
-# 1) TCGA LUAD landmark paper:
-#    The Cancer Genome Atlas Research Network. "Comprehensive molecular profiling of lung adenocarcinoma."
-#    Nature 511, 543–550 (2014).
-#    https://www.nature.com/articles/nature13385
-#
-#    This paper identifies recurrent/significantly altered LUAD genes including:
-#    TP53, KRAS, EGFR, STK11, KEAP1, NF1, BRAF, PIK3CA, MET, RB1, SMARCA4, CDKN2A,
-#    and discusses LUAD oncogenic alterations involving ALK, ROS1, RET, ERBB2, MET, etc.
-#
-# 2) NCCN NSCLC Guidelines / biomarker framework:
-#    NCCN NSCLC guidelines recommend molecular biomarker testing and targeted therapy selection
-#    for actionable NSCLC/LUAD alterations such as EGFR, ALK, ROS1, BRAF, MET, RET, ERBB2/HER2,
-#    KRAS, etc.
-#    https://jnccn.org/view/journals/jnccn/24/4/article-e260017.xml
-#
-# 3) OncoKB precision oncology knowledge base:
-#    Clinically actionable NSCLC oncogenes include EGFR, ALK, ROS1, RET, MET, BRAF, ERBB2/HER2,
-#    KRAS, and others.
-#    https://www.oncokb.org/
-#
-# Notes:
-# - NKX2-1 is also known as TTF-1. Use "NKX2-1" as the gene symbol; "TTF1" is the protein/pathology alias.
-# - MYC is less LUAD-specific than EGFR/KRAS/ALK/etc., but MYC amplification/pathway activation is recurrent
-#   in LUAD and is discussed in the TCGA LUAD paper.
-# - TP53, STK11, KEAP1, NF1, RB1, SMARCA4, and CDKN2A are mostly tumor suppressor/co-driver genes,
-#   not targetable oncogene drivers in the same sense as EGFR/ALK/ROS1/RET/MET/BRAF/ERBB2.
-LUAD_RELATED_GENES = {
-    "EGFR",  # Canonical actionable LUAD oncogene; recurrent EGFR mutations in TCGA LUAD and NCCN/OncoKB actionable NSCLC biomarker.
-    "KRAS",  # Canonical LUAD oncogene; TCGA reports KRAS as one of the most frequent LUAD mutations; KRAS G12C is actionable in NSCLC.
-    "TP53",  # Major tumor suppressor driver/co-driver; highly recurrently mutated in TCGA LUAD.
-    "STK11",  # LKB1 tumor suppressor; recurrent LUAD alteration in TCGA; major KRAS-associated LUAD co-driver.
-    "KEAP1",  # Recurrent LUAD tumor suppressor/co-driver affecting oxidative-stress/NRF2 biology; identified in TCGA LUAD.
-    "BRAF",  # Recurrent LUAD oncogene; actionable alteration in NSCLC, especially BRAF V600E.
-    "MET",  # Actionable LUAD/NSCLC driver; MET exon 14 skipping and amplification discussed in TCGA and NCCN/OncoKB.
-    "ALK",  # Canonical LUAD fusion driver; actionable NSCLC biomarker.
-    "ROS1",  # Canonical LUAD fusion driver; actionable NSCLC biomarker.
-    "RET",  # Canonical LUAD fusion driver; actionable NSCLC biomarker.
-    "ERBB2",  # HER2; recurrent/actionable LUAD alteration, including mutation/amplification.
-    "PIK3CA",  # Recurrent PI3K-pathway alteration in TCGA LUAD; less LUAD-specific but driver-relevant.
-    "NF1",  # Recurrent tumor suppressor alteration in TCGA LUAD; RAS pathway negative regulator.
-    "RB1",  # Tumor suppressor driver/co-driver; recurrently altered in TCGA LUAD.
-    "SMARCA4",  # Chromatin-remodeling tumor suppressor; recurrently altered in LUAD.
-    "NKX2-1",  # TTF-1 lineage-survival oncogene/lineage factor; recurrent LUAD amplification/lineage dependency.
-    "CDKN2A",  # Tumor suppressor/cell-cycle regulator; recurrently altered in TCGA LUAD.
-    "MYC",  # Recurrent amplification/pathway activation in LUAD; driver-like but not LUAD-specific.
-}
+        return gget
+    except Exception as e:  # ImportError, or a broken transitive dependency
+        logger.warning(
+            f"gget is unavailable ({e}); running in cache-only mode. Cache "
+            "misses will be listed in missing_genes.txt for local fetching."
+        )
+        return None
 
-# Substrings (lower-cased) used to flag an Enrichr term as plausibly LUAD-related.
-LUAD_TERM_KEYWORDS = [
-    "lung",
-    "luad",
-    "nsclc",
-    "non-small cell",
-    "adenocarcinoma",
-    "alveolar",
-    "pulmonary",
-    "surfactant",
-    "egfr",
-    "kras",
-    "erbb",
-    "pi3k",
-    "mapk",
-    "ras ",
-    "p53",
-    "cell cycle",
-    "wnt",
-]
-
-# Enrichr gene-set libraries queried for the top genes. KEGG/Hallmark/Reactome
-# cover canonical pathways; the disease/cell-type libraries surface LUAD- and
-# lung-specific signatures directly.
-DEFAULT_ENRICHR_LIBRARIES = [
-    "KEGG_2021_Human",
-    "MSigDB_Hallmark_2020",
-    "Reactome_2022",
-    "GO_Biological_Process_2021",
-    "PanglaoDB_Augmented_2021",
-    "Human_Gene_Atlas",
-]
 
 # On-disk per-gene info cache: one <clean_ensembl_id>.csv per gene, the same
 # layout get_gene_info.py writes to assets/gene_info.
 GENE_INFO_CACHE_DIR = "assets/gene_info"
 
 
-def _clean_ensembl_id(ensembl_id):
+def clean_ensembl_id(ensembl_id):
     """Strip the Ensembl version suffix (ENSG000....17 -> ENSG000...)."""
     return str(ensembl_id).split(".")[0]
 
@@ -173,113 +133,218 @@ def load_gene_names(mapping_file_path):
     return gene_names
 
 
-def load_ig_matrix(ig_directory, n_genes):
-    """Load every integrated_grads_<TCGA>.npy file into a (patients x genes) matrix.
+def load_ig_matrix(ig_directory, n_genes, prefix="integrated_grads"):
+    """Load every <prefix>_<TCGA>.npy file into a (patients x genes) matrix.
 
     Returns:
-        (ig_matrix, patient_ids). Files whose length does not match ``n_genes``
-        are skipped with a warning.
     """
-    ig_files = sorted(glob.glob(os.path.join(ig_directory, "integrated_grads_*.npy")))
-    if not ig_files:
-        raise FileNotFoundError(f"No integrated_grads_*.npy files in {ig_directory}")
+    files = sorted(glob.glob(os.path.join(ig_directory, f"{prefix}_*.npy")))
+    if not files:
+        return None, []
 
     rows, patient_ids = [], []
-    for file_path in ig_files:
-        tcga_id = (
-            os.path.basename(file_path)
-            .replace("integrated_grads_", "")
-            .replace(".npy", "")
-        )
-        ig_values = np.asarray(np.load(file_path)).flatten()
+    for file_path in files:
+        tcga_id = os.path.basename(file_path)[len(prefix) + 1 : -len(".npy")]
+        values = np.asarray(np.load(file_path)).flatten()
 
-        if len(ig_values) != n_genes:
+        if len(values) != n_genes:
             logger.warning(
-                f"Skipping {tcga_id}: {len(ig_values)} IG values != {n_genes} genes"
+                f"Skipping {tcga_id}: {len(values)} {prefix} values != {n_genes} genes"
             )
             continue
 
-        rows.append(ig_values)
+        rows.append(values)
         patient_ids.append(tcga_id)
 
     if not rows:
-        raise ValueError(f"No IG file matched the expected gene count ({n_genes}).")
+        raise ValueError(f"No {prefix} file matched the expected gene count ({n_genes}).")
 
-    logger.info(f"Loaded IG for {len(patient_ids)} patients x {n_genes} genes")
+    logger.info(f"Loaded {prefix} for {len(patient_ids)} patients x {n_genes} genes")
     return np.vstack(rows), patient_ids
 
 
 # ---------------------------------------------------------------------------
-# Rank genes by mean IG
+# Rank genes
 # ---------------------------------------------------------------------------
 
 
-def compute_gene_stats(ig_matrix, gene_names):
+def direction_label(value):
+    """Convert a signed model-sensitivity value into a risk-direction label."""
+    if value is None or pd.isna(value):
+        return "n/a"
+    if value > 0:
+        return "risk-increasing"
+    if value < 0:
+        return "risk-decreasing"
+    return "n/a"
+
+
+def contribution_label(value):
+    """Convert a signed IG value into patient-level contribution language."""
+    if value is None or pd.isna(value):
+        return "n/a"
+    if value > 0:
+        return "risk-up contribution"
+    if value < 0:
+        return "risk-down contribution"
+    return "no contribution"
+
+
+def rounded(value, digits):
+    """Round a scalar while preserving missing values for CSV/JSON output."""
+    if value is None or pd.isna(value):
+        return np.nan
+    return round(float(value), digits)
+
+
+def optional_bool(value):
+    """Return a JSON-serializable bool while preserving missing values."""
+    if value is None or pd.isna(value):
+        return np.nan
+    return bool(value)
+
+
+def sign_agreement(a, b):
+    """Per-gene fraction of patient rows where two gradient signs agree."""
+    sign_a = np.sign(a)
+    sign_b = np.sign(b)
+    valid = (sign_a != 0) & (sign_b != 0)
+    denom = valid.sum(axis=0)
+    numer = ((sign_a == sign_b) & valid).sum(axis=0)
+    return np.divide(
+        numer,
+        denom,
+        out=np.full(a.shape[1], np.nan, dtype=float),
+        where=denom > 0,
+    )
+
+
+def compute_gene_stats(
+    ig_matrix,
+    gene_names,
+    path_gradient_matrix=None,
+    vanilla_gradient_matrix=None,
+):
     """Per-gene attribution statistics across patients.
 
-    Carries both the SIGNED mean IG (direction: positive -> increased predicted
-    risk, negative -> decreased) and the mean ABSOLUTE IG (attribution magnitude
-    independent of direction). ``std_*`` are the matching across-patient spreads.
-    Medians add an outlier-robust view, and ``frac_positive``/``frac_negative``
-    show how consistent the attribution sign is across patients.
     """
     abs_matrix = np.abs(ig_matrix)
-    return pd.DataFrame(
+    mean_ig = ig_matrix.mean(axis=0)
+    mean_abs_ig = abs_matrix.mean(axis=0)
+
+    stats = pd.DataFrame(
         {
             "ensembl_id": gene_names,
-            "mean_ig": ig_matrix.mean(axis=0),
-            "std_ig": ig_matrix.std(axis=0),
-            "mean_abs_ig": abs_matrix.mean(axis=0),
+            "mean_abs_ig": mean_abs_ig,
             "std_abs_ig": abs_matrix.std(axis=0),
-            "median_ig": np.median(ig_matrix, axis=0),
             "median_abs_ig": np.median(abs_matrix, axis=0),
+            "mean_ig": mean_ig,
+            "std_ig": ig_matrix.std(axis=0),
+            "signed_retention": np.abs(mean_ig) / (mean_abs_ig + 1e-12),
             "frac_positive": (ig_matrix > 0).mean(axis=0),
             "frac_negative": (ig_matrix < 0).mean(axis=0),
             "n_patients": ig_matrix.shape[0],
         }
     )
 
+    if path_gradient_matrix is not None:
+        stats["mean_path_gradient"] = path_gradient_matrix.mean(axis=0)
+        stats["std_path_gradient"] = path_gradient_matrix.std(axis=0)
+        stats["frac_path_gradient_positive"] = (path_gradient_matrix > 0).mean(axis=0)
+    else:
+        stats["mean_path_gradient"] = np.nan
+        stats["std_path_gradient"] = np.nan
+        stats["frac_path_gradient_positive"] = np.nan
 
-def rank_top_genes(stats, top_n):
-    """Rank genes by SIGNED mean IG and return the top / bottom ``top_n``.
+    if vanilla_gradient_matrix is not None:
+        stats["mean_vanilla_gradient"] = vanilla_gradient_matrix.mean(axis=0)
+        stats["std_vanilla_gradient"] = vanilla_gradient_matrix.std(axis=0)
+        stats["frac_vanilla_gradient_positive"] = (
+            vanilla_gradient_matrix > 0
+        ).mean(axis=0)
+    else:
+        stats["mean_vanilla_gradient"] = np.nan
+        stats["std_vanilla_gradient"] = np.nan
+        stats["frac_vanilla_gradient_positive"] = np.nan
 
-    Identifies features associated with increased (most positive) or decreased
-    (most negative) predicted risk.
+    if path_gradient_matrix is not None and vanilla_gradient_matrix is not None:
+        stats["path_vanilla_sign_agreement"] = sign_agreement(
+            path_gradient_matrix, vanilla_gradient_matrix
+        )
+        path_sign = np.sign(stats["mean_path_gradient"].to_numpy())
+        vanilla_sign = np.sign(stats["mean_vanilla_gradient"].to_numpy())
+        stats["cohort_path_vanilla_direction_agree"] = (
+            (path_sign == vanilla_sign) & (path_sign != 0) & (vanilla_sign != 0)
+        )
+    else:
+        stats["path_vanilla_sign_agreement"] = np.nan
+        stats["cohort_path_vanilla_direction_agree"] = np.nan
 
-    Returns:
-        (top_positive, top_negative) DataFrames, each with columns
-        [rank, direction, ensembl_id, mean_ig, std_ig, mean_abs_ig, std_abs_ig,
-        n_patients], ordered from strongest attribution outward.
+    # Backward-compatible alias: the primary direction metric is path gradient when
+    # available, otherwise vanilla gradient. Signed IG is never used for direction.
+    if path_gradient_matrix is not None:
+        stats["mean_gradient"] = stats["mean_path_gradient"]
+        stats["std_gradient"] = stats["std_path_gradient"]
+        stats["frac_gradient_positive"] = stats["frac_path_gradient_positive"]
+        stats["direction_source"] = "path_gradient"
+    elif vanilla_gradient_matrix is not None:
+        stats["mean_gradient"] = stats["mean_vanilla_gradient"]
+        stats["std_gradient"] = stats["std_vanilla_gradient"]
+        stats["frac_gradient_positive"] = stats["frac_vanilla_gradient_positive"]
+        stats["direction_source"] = "vanilla_gradient"
+    else:
+        stats["mean_gradient"] = np.nan
+        stats["std_gradient"] = np.nan
+        stats["frac_gradient_positive"] = np.nan
+        stats["direction_source"] = "none"
+
+    return stats
+
+
+def rank_genes(stats, top_n, direction_source):
+    """Top genes by magnitude, and (if gradients exist) by direction of effect.
+
+    Returns a list of per-ranking DataFrames, each tagged with a ``ranking`` column:
+      magnitude       largest mean |IG| -- the genes the model leans on hardest
+      risk_increasing largest positive primary gradient -- raising expression raises risk
+      risk_decreasing largest negative primary gradient -- raising expression lowers risk
     """
-    signed = stats.sort_values("mean_ig", ascending=False, ignore_index=True)
+    frames = []
 
-    top_positive = signed.head(top_n).copy()
-    top_positive.insert(0, "direction", "positive")
-    top_positive.insert(0, "rank", range(1, len(top_positive) + 1))
-
-    # Most negative first.
-    top_negative = signed.tail(top_n).iloc[::-1].reset_index(drop=True)
-    top_negative.insert(0, "direction", "negative")
-    top_negative.insert(0, "rank", range(1, len(top_negative) + 1))
-
-    return top_positive, top_negative
-
-
-def rank_top_magnitude_genes(stats, top_n):
-    """Rank genes by mean ABSOLUTE IG to quantify attribution magnitude
-    independent of direction, and return the top ``top_n``.
-
-    Returns:
-        A DataFrame with the same columns as ``rank_top_genes`` output but with
-        ``direction == "magnitude"``, ordered from largest magnitude outward.
-    """
     magnitude = stats.sort_values("mean_abs_ig", ascending=False, ignore_index=True)
+    top = magnitude.head(top_n).copy()
+    top.insert(0, "ranking", "magnitude")
+    top.insert(0, "rank", range(1, len(top) + 1))
+    frames.append(top)
 
-    top_magnitude = magnitude.head(top_n).copy()
-    top_magnitude.insert(0, "direction", "magnitude")
-    top_magnitude.insert(0, "rank", range(1, len(top_magnitude) + 1))
+    if direction_source == "none":
+        logger.warning(
+            "No path_gradients_*.npy or vanilla_gradients_*.npy found: reporting the "
+            "magnitude ranking only. "
+            "Direction is NOT recoverable from the sign of a cohort-mean-baseline IG."
+        )
+        return frames
 
-    return top_magnitude
+    if direction_source == "vanilla_gradient":
+        logger.warning(
+            "No path_gradients_*.npy found; using vanilla gradients for direction. "
+            "That is a valid local Steyaert-style direction, but the preferred "
+            "IG-consistent direction is path_gradients_*."
+        )
+
+    by_gradient = stats.sort_values("mean_gradient", ascending=False, ignore_index=True)
+
+    up = by_gradient.head(top_n).copy()
+    up.insert(0, "ranking", "risk_increasing")
+    up.insert(0, "rank", range(1, len(up) + 1))
+    frames.append(up)
+
+    down = by_gradient.tail(top_n).iloc[::-1].reset_index(drop=True)
+    down.insert(0, "ranking", "risk_decreasing")
+    down.insert(0, "rank", range(1, len(down) + 1))
+    frames.append(down)
+
+    return frames
 
 
 # ---------------------------------------------------------------------------
@@ -309,9 +374,10 @@ def load_or_fetch_gene_csv(ensembl_id, cache_dir=GENE_INFO_CACHE_DIR):
     Checks ``cache_dir/<clean_id>.csv`` first; on a miss, fetches the gene with
     ``gget.info`` and writes ``<clean_id>.csv`` exactly like get_gene_info.py
     (raw gget.info frame, ``index=False``) so both share one cache format.
-    Returns None if the gene cannot be resolved.
+    Returns None if the gene cannot be resolved (cache miss with gget
+    unavailable, a failed fetch, or an empty result).
     """
-    clean = _clean_ensembl_id(ensembl_id)
+    clean = clean_ensembl_id(ensembl_id)
     fp = os.path.join(cache_dir, f"{clean}.csv")
 
     if os.path.exists(fp):
@@ -322,7 +388,11 @@ def load_or_fetch_gene_csv(ensembl_id, cache_dir=GENE_INFO_CACHE_DIR):
         except Exception:
             pass  # unreadable -> refetch below
 
-    # Miss: fetch a single gene and cache it, mirroring get_gene_info.py.
+    # Cache miss: fetch a single gene and cache it, mirroring get_gene_info.py.
+    # Without gget (offline node) we cannot fetch -> report as missing.
+    gget = _get_gget()
+    if gget is None:
+        return None
     try:
         info = gget.info(clean)
     except Exception as e:
@@ -358,21 +428,26 @@ def annotate_genes(ensembl_ids, cache_dir=GENE_INFO_CACHE_DIR):
     get_gene_info.py).
 
     Returns:
-        (details, full_info_df) where ``details`` maps each original ensembl_id
-        to {symbol, description, biotype}, and ``full_info_df`` concatenates the
-        complete gget.info specification rows for the resolved genes.
+        (details, full_info_df, missing_ids) where ``details`` maps each original
+        ensembl_id to {symbol, description, biotype}, ``full_info_df`` concatenates
+        the complete gget.info specification rows for the resolved genes, and
+        ``missing_ids`` is the list of clean Ensembl IDs that could not be resolved
+        (cache miss without gget, or a failed/empty fetch) -- fetch these locally
+        with get_gene_info.py and copy their CSVs into ``cache_dir``.
     """
     os.makedirs(cache_dir, exist_ok=True)
 
     details = {}
     full_rows = []
+    missing_ids = []
     n_hit = 0
     for eid in ensembl_ids:
-        fp = os.path.join(cache_dir, f"{_clean_ensembl_id(eid)}.csv")
+        fp = os.path.join(cache_dir, f"{clean_ensembl_id(eid)}.csv")
         cached = os.path.exists(fp)
         df = load_or_fetch_gene_csv(eid, cache_dir)
         if df is None or df.empty:
             details[eid] = {"symbol": None, "description": None, "biotype": None}
+            missing_ids.append(clean_ensembl_id(eid))
             continue
         n_hit += 1 if cached else 0
         full_rows.append(df)
@@ -386,97 +461,7 @@ def annotate_genes(ensembl_ids, cache_dir=GENE_INFO_CACHE_DIR):
     full_info_df = (
         pd.concat(full_rows, ignore_index=True) if full_rows else pd.DataFrame()
     )
-    return details, full_info_df
-
-
-# ---------------------------------------------------------------------------
-# LUAD relevance via Enrichr pathway enrichment
-# ---------------------------------------------------------------------------
-
-
-def _term_col(df):
-    return next(
-        (c for c in ("path_name", "term_name", "term", "Term") if c in df.columns),
-        None,
-    )
-
-
-def _genes_col(df):
-    return next(
-        (c for c in ("overlapping_genes", "genes", "Genes") if c in df.columns),
-        None,
-    )
-
-
-def run_enrichment(gene_symbols, libraries=None):
-    """Run gget.enrichr across libraries and return one LUAD-flagged DataFrame.
-
-    Adds a ``library`` column and a boolean ``luad_related`` column (term keyword
-    match OR overlap with a known LUAD driver gene). Empty DataFrame on no input.
-    """
-    if not gene_symbols:
-        logger.info("No resolvable gene symbols; skipping enrichment.")
-        return pd.DataFrame()
-
-    libraries = libraries or DEFAULT_ENRICHR_LIBRARIES
-    logger.info(f"Enrichr for {len(gene_symbols)} symbols: {gene_symbols}")
-
-    frames = []
-    for library in libraries:
-        try:
-            res = gget.enrichr(gene_symbols, database=library)
-        except Exception as e:
-            logger.exception(f"  enrichr failed for '{library}': {e}")
-            continue
-        if res is None or len(res) == 0:
-            continue
-        res = pd.DataFrame(res)
-        res.insert(0, "library", library)
-        frames.append(res)
-
-    if not frames:
-        return pd.DataFrame()
-
-    combined = pd.concat(frames, ignore_index=True)
-    term_col, genes_col = _term_col(combined), _genes_col(combined)
-
-    def _is_luad(row):
-        term = str(row[term_col]).lower() if term_col else ""
-        if any(kw in term for kw in LUAD_TERM_KEYWORDS):
-            return True
-        if genes_col is not None:
-            genes = row[genes_col]
-            if isinstance(genes, str):
-                genes = genes.replace(";", ",").split(",")
-            genes = {str(g).strip().upper() for g in (genes or [])}
-            if genes & LUAD_RELATED_GENES:
-                return True
-        return False
-
-    combined["luad_related"] = combined.apply(_is_luad, axis=1)
-    logger.info(
-        f"  {int(combined['luad_related'].sum())}/{len(combined)} terms LUAD-flagged"
-    )
-    return combined
-
-
-def luad_pathways_per_gene(enrich_df):
-    """Map each gene symbol -> sorted list of LUAD-related terms it appears in."""
-    if enrich_df is None or enrich_df.empty or "luad_related" not in enrich_df.columns:
-        return {}
-    term_col, genes_col = _term_col(enrich_df), _genes_col(enrich_df)
-    if term_col is None or genes_col is None:
-        return {}
-
-    mapping = {}
-    for _, row in enrich_df[enrich_df["luad_related"]].iterrows():
-        genes = row[genes_col]
-        if isinstance(genes, str):
-            genes = genes.replace(";", ",").split(",")
-        term = str(row[term_col])
-        for g in genes or []:
-            mapping.setdefault(str(g).strip().upper(), set()).add(term)
-    return {g: sorted(terms) for g, terms in mapping.items()}
+    return details, full_info_df, missing_ids
 
 
 # ---------------------------------------------------------------------------
@@ -484,55 +469,182 @@ def luad_pathways_per_gene(enrich_df):
 # ---------------------------------------------------------------------------
 
 
-def build_table(ranking_frames, details, gene_pathways):
-    """Return a single tidy DataFrame (one row per top gene, all rankings).
-
-    ``ranking_frames`` is an iterable of the per-direction DataFrames
-    (positive / negative / magnitude); each row keeps its ``direction`` and
-    within-direction ``rank``.
-    """
+def build_table(ranking_frames, details):
+    """One tidy row per (ranking, gene)."""
     rows = []
-    for df in ranking_frames:
-        for _, r in df.iterrows():
+    for frame in ranking_frames:
+        for _, r in frame.iterrows():
             eid = r["ensembl_id"]
             info = details.get(eid, {})
-            symbol = info.get("symbol")
-            luad_terms = gene_pathways.get(str(symbol).upper(), []) if symbol else []
+            gradient = float(r["mean_gradient"])
+            path_gradient = r.get("mean_path_gradient", np.nan)
+            vanilla_gradient = r.get("mean_vanilla_gradient", np.nan)
             rows.append(
                 {
-                    "direction": r["direction"],
+                    "ranking": r["ranking"],
                     "rank": int(r["rank"]),
                     "ensembl_id": eid,
-                    "symbol": symbol,
+                    "symbol": info.get("symbol"),
                     "description": info.get("description"),
                     "biotype": info.get("biotype"),
-                    "mean_ig": round(float(r["mean_ig"]), 6),
-                    "std_ig": round(float(r["std_ig"]), 6),
                     "mean_abs_ig": round(float(r["mean_abs_ig"]), 6),
                     "std_abs_ig": round(float(r["std_abs_ig"]), 6),
-                    "median_ig": round(float(r["median_ig"]), 6),
                     "median_abs_ig": round(float(r["median_abs_ig"]), 6),
-                    "frac_positive": round(float(r["frac_positive"]), 4),
-                    "frac_negative": round(float(r["frac_negative"]), 4),
+                    "direction_source": r.get("direction_source", "none"),
+                    # Backward-compatible primary direction columns. These are path
+                    # gradients when available, else vanilla gradients.
+                    "mean_gradient": rounded(gradient, 8),
+                    "std_gradient": rounded(r["std_gradient"], 8),
+                    "direction": direction_label(gradient),
+                    "frac_gradient_positive": rounded(r["frac_gradient_positive"], 4),
+                    "mean_path_gradient": rounded(path_gradient, 8),
+                    "std_path_gradient": rounded(r.get("std_path_gradient", np.nan), 8),
+                    "path_direction": direction_label(path_gradient),
+                    "frac_path_gradient_positive": rounded(
+                        r.get("frac_path_gradient_positive", np.nan), 4
+                    ),
+                    "mean_vanilla_gradient": rounded(vanilla_gradient, 8),
+                    "std_vanilla_gradient": rounded(
+                        r.get("std_vanilla_gradient", np.nan), 8
+                    ),
+                    "vanilla_direction": direction_label(vanilla_gradient),
+                    "frac_vanilla_gradient_positive": rounded(
+                        r.get("frac_vanilla_gradient_positive", np.nan), 4
+                    ),
+                    "path_vanilla_sign_agreement": rounded(
+                        r.get("path_vanilla_sign_agreement", np.nan), 4
+                    ),
+                    "cohort_path_vanilla_direction_agree": optional_bool(
+                        r.get("cohort_path_vanilla_direction_agree", np.nan)
+                    ),
+                    # Kept for transparency only. Its sign is patient-relative under a
+                    # cohort-mean baseline and must not be read as a risk direction;
+                    # signed_retention shows how little of the attribution it preserves.
+                    "mean_signed_ig": round(float(r["mean_ig"]), 6),
+                    "signed_retention": round(float(r["signed_retention"]), 4),
+                    "frac_ig_positive": round(float(r["frac_positive"]), 4),
                     "n_patients": int(r["n_patients"]),
-                    "luad_driver": bool(str(symbol).upper() in LUAD_RELATED_GENES),
-                    "n_luad_pathways": len(luad_terms),
-                    "luad_pathways": "; ".join(luad_terms),
                 }
             )
     return pd.DataFrame(rows)
 
 
-def export_results(table, enrich_df, full_info_df, output_dir, top_n):
-    """Write top_genes.csv/json, the full-spec CSV, and pathway_enrichment.csv."""
+def build_patient_top_table(
+    ig_matrix,
+    gene_names,
+    patient_ids,
+    top_n,
+    path_gradient_matrix=None,
+    vanilla_gradient_matrix=None,
+    omic_matrix=None,
+    baseline=None,
+):
+    """Top per-patient signed IG rows.
+
+    This is the correct place to read signed IG: each row says whether that patient's
+    expression of a gene, relative to the baseline, pushed predicted risk up or down.
+    Cohort-level gene direction still comes from gradients, not signed IG.
+    """
+    if top_n is None or top_n <= 0:
+        return None
+
+    baseline_vec = None
+    if baseline is not None:
+        baseline_vec = np.asarray(baseline).flatten()
+        if len(baseline_vec) != len(gene_names):
+            logger.warning(
+                f"Ignoring ig_baseline.npy: {len(baseline_vec)} values != "
+                f"{len(gene_names)} genes"
+            )
+            baseline_vec = None
+
+    rows = []
+    for patient_index, patient_id in enumerate(patient_ids):
+        row = ig_matrix[patient_index]
+        top_indices = np.argsort(-np.abs(row))[:top_n]
+        for rank, gene_index in enumerate(top_indices, start=1):
+            signed_ig = float(row[gene_index])
+            path_gradient = (
+                float(path_gradient_matrix[patient_index, gene_index])
+                if path_gradient_matrix is not None
+                else np.nan
+            )
+            vanilla_gradient = (
+                float(vanilla_gradient_matrix[patient_index, gene_index])
+                if vanilla_gradient_matrix is not None
+                else np.nan
+            )
+            expression = (
+                float(omic_matrix[patient_index, gene_index])
+                if omic_matrix is not None
+                else np.nan
+            )
+            baseline_value = (
+                float(baseline_vec[gene_index]) if baseline_vec is not None else np.nan
+            )
+            expression_delta = (
+                expression - baseline_value
+                if not pd.isna(expression) and not pd.isna(baseline_value)
+                else np.nan
+            )
+            rows.append(
+                {
+                    "patient_id": patient_id,
+                    "rank_by_abs_ig": rank,
+                    "ensembl_id": gene_names[gene_index],
+                    "signed_ig": rounded(signed_ig, 8),
+                    "abs_ig": rounded(abs(signed_ig), 8),
+                    "patient_ig_contribution": contribution_label(signed_ig),
+                    "path_gradient": rounded(path_gradient, 8),
+                    "path_direction": direction_label(path_gradient),
+                    "vanilla_gradient": rounded(vanilla_gradient, 8),
+                    "vanilla_direction": direction_label(vanilla_gradient),
+                    "expression": rounded(expression, 8),
+                    "baseline": rounded(baseline_value, 8),
+                    "expression_minus_baseline": rounded(expression_delta, 8),
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def load_baseline(ig_directory, n_genes):
+    path = os.path.join(ig_directory, "ig_baseline.npy")
+    if not os.path.exists(path):
+        logger.warning("No ig_baseline.npy found; patient_top_genes.csv will omit baseline.")
+        return None
+    baseline = np.asarray(np.load(path)).flatten()
+    if len(baseline) != n_genes:
+        logger.warning(f"Skipping ig_baseline.npy: {len(baseline)} values != {n_genes} genes")
+        return None
+    return baseline
+
+
+def validate_optional_patient_matrix(name, matrix, ids, patient_ids):
+    if matrix is None:
+        return None
+    if ids != patient_ids:
+        raise ValueError(
+            f"{name}_*.npy and integrated_grads_*.npy cover different patients; "
+            "re-run test.py so they are written in the same pass."
+        )
+    return matrix
+
+
+def export_results(table, full_info_df, output_dir, top_n, patient_table=None):
+    """Write top_genes.csv/json and the full gene-specification CSV."""
     os.makedirs(output_dir, exist_ok=True)
 
     csv_path = os.path.join(output_dir, "top_genes.csv")
     table.to_csv(csv_path, index=False)
     logger.info(f"Top gene table -> {csv_path}")
 
-    # Full gget.info specifications for the top genes (every column), concatenated
-    # from the per-gene cache files -- one combined table of gene specs.
+    patient_path = None
+    if patient_table is not None and not patient_table.empty:
+        patient_path = os.path.join(output_dir, "patient_top_genes.csv")
+        patient_table.to_csv(patient_path, index=False)
+        logger.info(f"Patient-level signed IG table -> {patient_path}")
+
     if full_info_df is not None and not full_info_df.empty:
         info_path = os.path.join(output_dir, "top_genes_gene_info.csv")
         full_info_df.to_csv(info_path, index=False)
@@ -541,68 +653,77 @@ def export_results(table, enrich_df, full_info_df, output_dir, top_n):
     json_path = os.path.join(output_dir, "top_genes.json")
     bundle = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
-        "top_n_per_direction": top_n,
+        "top_n_per_ranking": top_n,
         "ranking_metrics": {
-            "signed": "mean signed IG (positive -> increased predicted risk, "
-            "negative -> decreased)",
-            "magnitude": "mean absolute IG (attribution magnitude independent "
-            "of direction)",
+            "magnitude": "mean |IG| -- how much attribution the gene carries",
+            "risk_increasing": "largest positive primary mean gradient -- higher "
+            "expression raises predicted risk. Primary means path gradient when "
+            "available, otherwise vanilla gradient.",
+            "risk_decreasing": "largest negative primary mean gradient -- higher "
+            "expression lowers predicted risk. Primary means path gradient when "
+            "available, otherwise vanilla gradient.",
         },
-        "top_positive_genes": table[table["direction"] == "positive"].to_dict(
-            "records"
+        "patient_level_file": patient_path,
+        "caveat": (
+            "The cohort-mean SIGNED IG is reported but is not a direction: the "
+            "cohort-mean baseline makes its sign patient-relative, so it cancels "
+            "across patients. Direction comes from the path gradient when available "
+            "and vanilla gradients are reported as the local Steyaert-style "
+            "comparison. See literature/ig_pathway_design_notes.md."
         ),
-        "top_negative_genes": table[table["direction"] == "negative"].to_dict(
-            "records"
-        ),
-        "top_magnitude_genes": table[table["direction"] == "magnitude"].to_dict(
-            "records"
-        ),
+        "rankings": {
+            name: table[table["ranking"] == name].to_dict("records")
+            for name in table["ranking"].unique()
+        },
     }
     with open(json_path, "w") as fh:
         json.dump(bundle, fh, indent=2)
     logger.info(f"Top gene bundle -> {json_path}")
 
-    if enrich_df is not None and not enrich_df.empty:
-        enrich_path = os.path.join(output_dir, "pathway_enrichment.csv")
-        enrich_df.to_csv(enrich_path, index=False)
-        logger.info(f"Pathway enrichment -> {enrich_path}")
-
 
 def log_table(table):
     """Print a compact human-readable summary of the top genes."""
-    # (direction, headline, the metric column the ranking is sorted by).
-    sections = [
-        (
-            "positive",
-            "MOST POSITIVE GENES (increased predicted risk, by mean signed IG)",
-            "mean_ig",
-        ),
-        (
-            "negative",
-            "MOST NEGATIVE GENES (decreased predicted risk, by mean signed IG)",
-            "mean_ig",
-        ),
-        ("magnitude", "LARGEST-MAGNITUDE GENES (by mean absolute IG)", "mean_abs_ig"),
-    ]
-    for direction, headline, metric_col in sections:
-        subset = table[table["direction"] == direction]
+    headlines = {
+        "magnitude": "LARGEST ATTRIBUTION (mean |IG|)",
+        "risk_increasing": "RISK-INCREASING (largest positive primary mean gradient)",
+        "risk_decreasing": "RISK-DECREASING (largest negative primary mean gradient)",
+    }
+    for ranking, headline in headlines.items():
+        subset = table[table["ranking"] == ranking]
         if subset.empty:
             continue
-        metric_label = "Mean |IG|" if metric_col == "mean_abs_ig" else "Mean IG"
-        logger.info("\n" + "=" * 88)
-        logger.info(f"TOP {len(subset)} {headline}")
-        logger.info("=" * 88)
+        logger.info("\n" + "=" * 92)
+        logger.info(f"TOP {len(subset)} -- {headline}")
+        logger.info("=" * 92)
         logger.info(
-            f"{'Rank':<5}{'Symbol':<14}{metric_label:<12}{'LUAD drv':<9}"
-            f"{'LUAD paths':<11}Description"
+            f"{'Rank':<5}{'Symbol':<14}{'Mean |IG|':<12}{'Primary grad':<13}Description"
         )
         for _, r in subset.iterrows():
-            desc = (r["description"] or "")[:40]
+            desc = (r["description"] or "")[:42]
             logger.info(
                 f"{r['rank']:<5}{str(r['symbol'] or r['ensembl_id'])[:13]:<14}"
-                f"{r[metric_col]:<12.6f}{('yes' if r['luad_driver'] else '-'):<9}"
-                f"{r['n_luad_pathways']:<11}{desc}"
+                f"{r['mean_abs_ig']:<12.6f}{r['mean_gradient']:<+13.6f}{desc}"
             )
+
+
+def write_missing_genes(missing_ids, output_dir):
+    if not missing_ids:
+        return None
+
+    os.makedirs(output_dir, exist_ok=True)
+    missing_path = os.path.join(output_dir, "missing_genes.txt")
+    with open(missing_path, "w") as fh:
+        fh.write("\n".join(missing_ids) + "\n")
+
+    logger.error(
+        f"{len(missing_ids)} top gene(s) could not be annotated from the cache: "
+        f"{', '.join(missing_ids)}"
+    )
+    logger.error(
+        f"Wrote missing Ensembl IDs -> {missing_path}. Fetch them locally with "
+        f"get_gene_info.py and copy their CSVs into the gene-info cache."
+    )
+    return missing_path
 
 
 # ---------------------------------------------------------------------------
@@ -615,54 +736,100 @@ def run(
     ig_directory,
     output_dir,
     top_n,
+    patient_top_n,
     gene_info_cache_dir=GENE_INFO_CACHE_DIR,
-    libraries=None,
 ):
-    """Full pipeline: rank -> annotate -> LUAD relevance -> export."""
+    """Full pipeline: rank -> annotate -> export."""
     gene_names = load_gene_names(mapping_file_path)
-    ig_matrix, _ = load_ig_matrix(ig_directory, len(gene_names))
+    ig_matrix, patient_ids = load_ig_matrix(ig_directory, len(gene_names))
+    if ig_matrix is None:
+        raise FileNotFoundError(f"No integrated_grads_*.npy files in {ig_directory}")
 
-    stats = compute_gene_stats(ig_matrix, gene_names)
-    # Signed ranking: features tied to increased / decreased predicted risk.
-    top_positive, top_negative = rank_top_genes(stats, top_n)
-    # Magnitude ranking: attribution size independent of direction.
-    top_magnitude = rank_top_magnitude_genes(stats, top_n)
-    ranking_frames = [top_positive, top_negative, top_magnitude]
+    path_gradient_matrix, path_gradient_ids = load_ig_matrix(
+        ig_directory, len(gene_names), prefix="path_gradients"
+    )
+    path_gradient_matrix = validate_optional_patient_matrix(
+        "path_gradients", path_gradient_matrix, path_gradient_ids, patient_ids
+    )
 
-    # De-duplicate Ensembl IDs across rankings for annotation/enrichment
-    # (magnitude genes often overlap the signed extremes), preserving order.
+    vanilla_gradient_matrix, vanilla_gradient_ids = load_ig_matrix(
+        ig_directory, len(gene_names), prefix="vanilla_gradients"
+    )
+    vanilla_gradient_matrix = validate_optional_patient_matrix(
+        "vanilla_gradients", vanilla_gradient_matrix, vanilla_gradient_ids, patient_ids
+    )
+
+    omic_matrix, omic_ids = load_ig_matrix(ig_directory, len(gene_names), prefix="omic_input")
+    omic_matrix = validate_optional_patient_matrix(
+        "omic_input", omic_matrix, omic_ids, patient_ids
+    )
+    baseline = load_baseline(ig_directory, len(gene_names))
+
+    if path_gradient_matrix is not None:
+        direction_source = "path_gradient"
+    elif vanilla_gradient_matrix is not None:
+        direction_source = "vanilla_gradient"
+    else:
+        direction_source = "none"
+
+    stats = compute_gene_stats(
+        ig_matrix,
+        gene_names,
+        path_gradient_matrix=path_gradient_matrix,
+        vanilla_gradient_matrix=vanilla_gradient_matrix,
+    )
+    logger.info(
+        "signed-IG retention (|mean IG| / mean |IG|) across all genes: "
+        f"median {stats['signed_retention'].median():.3f}, "
+        f"90th pct {stats['signed_retention'].quantile(0.9):.3f} "
+        "-- low values are expected under a cohort-mean baseline and are why "
+        "direction is taken from gradients, not the signed IG."
+    )
+    logger.info(f"Primary direction source: {direction_source}")
+
+    ranking_frames = rank_genes(stats, top_n, direction_source)
+
     ensembl_ids = list(
         dict.fromkeys(eid for frame in ranking_frames for eid in frame["ensembl_id"])
     )
-    details, full_info_df = annotate_genes(ensembl_ids, gene_info_cache_dir)
+    details, full_info_df, missing_ids = annotate_genes(ensembl_ids, gene_info_cache_dir)
+    write_missing_genes(missing_ids, output_dir)
 
-    symbols = [d["symbol"] for d in details.values() if d["symbol"]]
-    enrich_df = run_enrichment(symbols, libraries)
-    gene_pathways = luad_pathways_per_gene(enrich_df)
-
-    table = build_table(ranking_frames, details, gene_pathways)
+    table = build_table(ranking_frames, details)
+    patient_table = build_patient_top_table(
+        ig_matrix,
+        gene_names,
+        patient_ids,
+        top_n=patient_top_n,
+        path_gradient_matrix=path_gradient_matrix,
+        vanilla_gradient_matrix=vanilla_gradient_matrix,
+        omic_matrix=omic_matrix,
+        baseline=baseline,
+    )
     log_table(table)
-    export_results(table, enrich_df, full_info_df, output_dir, top_n)
+    export_results(table, full_info_df, output_dir, top_n, patient_table=patient_table)
     return table
 
 
 def main(config, opt):
     base_dir = Path(config.testing.output_base_dir)
-    ig_directory = opt.ig_dir or str(base_dir / "IG_6sep")
-    output_dir = str(base_dir / "interpret_omics")
     run(
         mapping_file_path=opt.mapping_file or config.data.json_file,
-        ig_directory=ig_directory,
-        output_dir=output_dir,
+        ig_directory=opt.ig_dir or str(base_dir / "IG_6sep"),
+        output_dir=str(base_dir / "interpret_omics"),
         top_n=opt.top_n,
+        patient_top_n=opt.patient_top_n,
         gene_info_cache_dir=opt.gene_info_dir,
     )
-    logger.info("\nDone. See top_genes.csv / top_genes.json for the table.")
+    logger.info(
+        "\nDone. See top_genes.csv and patient_top_genes.csv. For the pathway-level "
+        "analysis and the statistical evidence, run joint_fusion.testing.pathway_interpret."
+    )
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Rank top IG genes and assess LUAD relevance."
+        description="Rank genes by their IG attribution and direction of effect."
     )
     parser.add_argument(
         "--config",
@@ -673,7 +840,13 @@ def parse_args():
         "--top-n",
         type=int,
         default=20,
-        help="Number of most-positive and most-negative genes to report (each).",
+        help="Number of genes to report per ranking.",
+    )
+    parser.add_argument(
+        "--patient-top-n",
+        type=int,
+        default=20,
+        help="Number of top |IG| genes to export per patient. Use 0 to disable.",
     )
     parser.add_argument(
         "--ig-dir",
