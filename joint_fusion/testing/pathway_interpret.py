@@ -1053,7 +1053,12 @@ def main(config, opt):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Pathway-level IG interpretability.")
-    parser.add_argument("--config", type=str, required=True)
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="joint_fusion/config/config_checkpoint_2026-04-07-04-58-17_fold1.yaml",
+        help="Defaults to the fold-1 config; pass another to use a different fold.",
+    )
     parser.add_argument("--ig-dir", type=str, default=None,
                         help="Defaults to <output_base_dir>/IG_6sep.")
     parser.add_argument("--mapping-file", type=str, default=None,
