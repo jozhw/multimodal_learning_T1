@@ -1163,7 +1163,8 @@ def run(
             "+ = raises risk)"
         )
 
-        # Gradient beeswarms, one per gradient flavour (local endpoint, path-averaged).
+        # Gradient beeswarms (x = gradient direction), coloured by the IG attribution so
+        # the colour is a DIFFERENT quantity than the x-axis (not a redundant re-encoding).
         if local_gradient_scores is not None:
             plot_beeswarm(
                 local_gradient_scores[:, order],
@@ -1171,9 +1172,9 @@ def run(
                 os.path.join(output_dir, "pathway_local_gradient_beeswarm.png"),
                 top_n,
                 xlabel="Local gradient (per patient; + = raises predicted risk)",
-                title="Pathway local gradients",
-                color_scores=local_gradient_scores[:, order],
-                color_label="Mean local gradient over pathway genes",
+                title="Pathway local gradients (coloured by IG attribution)",
+                color_scores=scores[:, order],
+                color_label="Mean IG attribution over pathway genes",
             )
         if path_gradient_scores is not None:
             plot_beeswarm(
@@ -1182,9 +1183,9 @@ def run(
                 os.path.join(output_dir, "pathway_path_gradient_beeswarm.png"),
                 top_n,
                 xlabel="Path-averaged integrated gradient (per patient; + = raises risk)",
-                title="Pathway path-averaged gradients",
-                color_scores=path_gradient_scores[:, order],
-                color_label="Mean path-averaged gradient over pathway genes",
+                title="Pathway path-averaged gradients (coloured by IG attribution)",
+                color_scores=scores[:, order],
+                color_label="Mean IG attribution over pathway genes",
             )
 
         # Headline IG beeswarms: x = per-patient IG (carries the spread), coloured by the
