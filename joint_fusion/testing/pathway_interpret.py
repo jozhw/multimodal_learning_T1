@@ -154,9 +154,7 @@ def load_collections(msigdb_dir=MSIGDB_DIR, collections=DEFAULT_COLLECTIONS):
     """Load every requested collection, tagging each set with its source collection."""
     gene_sets, source = {}, {}
     for prefix in collections:
-        matches = sorted(
-            glob.glob(os.path.join(msigdb_dir, f"{prefix}.v*.symbols.gmt"))
-        )
+        matches = sorted(glob.glob(os.path.join(msigdb_dir, f"{prefix}.v*.symbols.gmt")))
         if not matches:
             raise FileNotFoundError(
                 f"No .gmt for collection '{prefix}' in {msigdb_dir}. "
@@ -175,9 +173,7 @@ def load_chip(msigdb_dir=MSIGDB_DIR):
     MSigDB's own annotation file keeps the identifier map and gene sets on one release,
     and the run offline.
     """
-    matches = sorted(
-        glob.glob(os.path.join(msigdb_dir, "Human_Ensembl_Gene_ID_MSigDB.v*.chip"))
-    )
+    matches = sorted(glob.glob(os.path.join(msigdb_dir, "Human_Ensembl_Gene_ID_MSigDB.v*.chip")))
     if not matches:
         raise FileNotFoundError(
             f"No Ensembl .chip in {msigdb_dir}. Run: python -m joint_fusion.fetch_msigdb"
@@ -208,7 +204,9 @@ def load_matrix(ig_directory, prefix, n_genes, patient_ids=None):
         files = sorted(glob.glob(os.path.join(ig_directory, f"{prefix}_*.npy")))
         if not files:
             return None, []
-        patient_ids = [os.path.basename(f)[len(prefix) + 1 : -4] for f in files]
+        patient_ids = [
+            os.path.basename(f)[len(prefix) + 1 : -4] for f in files
+        ]
     else:
         files = [
             os.path.join(ig_directory, f"{prefix}_{pid}.npy") for pid in patient_ids
@@ -265,11 +263,9 @@ def load_attributions(ig_directory, n_genes, require_gradients=True):
         )
         if require_gradients:
             raise FileNotFoundError(message)
-        logger.error(
-            message + " Proceeding with --allow-missing-gradients: all "
-            "missing direction columns will be NaN and gradient plots/GSEA "
-            "may be skipped."
-        )
+        logger.error(message + " Proceeding with --allow-missing-gradients: all "
+                     "missing direction columns will be NaN and gradient plots/GSEA "
+                     "may be skipped.")
 
     return ig, path_gradients, local_gradients, expression, patient_ids
 
@@ -425,9 +421,7 @@ def score_luad_panel(
 
     missing = [name for name in KEGG_NSCLC_PANEL if name not in gene_sets]
     if missing:
-        logger.warning(
-            f"KEGG NSCLC panel: {len(missing)} module(s) absent from MSigDB."
-        )
+        logger.warning(f"KEGG NSCLC panel: {len(missing)} module(s) absent from MSigDB.")
 
     index = {s: i for i, s in enumerate(symbols)}
 
@@ -451,9 +445,7 @@ def score_luad_panel(
             return (matrix @ mem) / n
 
     rows = []
-    series = (
-        {}
-    )  # name -> per-patient vectors (ig / local / path / expr) for scored modules
+    series = {}  # name -> per-patient vectors (ig / local / path / expr) for scored modules
     for name, node in KEGG_NSCLC_PANEL.items():
         annotated = gene_sets.get(name)
         if annotated is None:
@@ -471,9 +463,7 @@ def score_luad_panel(
             mem = np.zeros(len(symbols), dtype=np.float64)
             mem[members] = 1.0
             n = len(members)
-            row["summed_abs_local_gradient"] = summed_abs(
-                local_gradient_symbols, mem, n
-            )
+            row["summed_abs_local_gradient"] = summed_abs(local_gradient_symbols, mem, n)
             row["summed_abs_path_gradient"] = summed_abs(path_gradient_symbols, mem, n)
             row["summed_abs_ig"] = summed_abs(ig_symbols, mem, n)
             row["mean_local_gradient"] = patient_mean(local_gradient_symbols, mem, n)
@@ -517,12 +507,12 @@ def score_luad_panel(
     # statistic the panel table is sorted by, so the top module sits at the top.
     if write_figures:
         ordered = [
-            name for name in table.loc[table["scored"], "pathway"] if name in series
+            name
+            for name in table.loc[table["scored"], "pathway"]
+            if name in series
         ]
         if not ordered:
-            logger.warning(
-                "KEGG NSCLC panel: no scored modules to plot; skipping figures."
-            )
+            logger.warning("KEGG NSCLC panel: no scored modules to plot; skipping figures.")
         else:
             labels = [series[name]["label"] for name in ordered]
 
@@ -545,7 +535,7 @@ def score_luad_panel(
 
             ig_x_label = (
                 "Mean IG attribution over module genes "
-                "[Δ log-risk per gene]\n"
+                "[Δ log-risk per gene, i.e. log hazard ratio]\n"
                 "(per patient, relative to the cohort-mean-expression baseline; "
                 "+ = raises risk)"
             )
@@ -553,30 +543,28 @@ def score_luad_panel(
             # Gradient-x beeswarms, coloured by IG (x and colour are different quantities).
             if panel_local is not None:
                 plot_beeswarm(
-                    panel_local,
-                    labels,
+                    panel_local, labels,
                     os.path.join(output_dir, "known_luad_local_gradient_beeswarm.png"),
                     n_mod,
                     xlabel=(
-                        "Mean local gradient over genes "
-                        "[Δ log-risk per unit expression]\n"
-                        "(per patient; + = raises predicted risk)"
-                    ),
+                    "Mean local gradient over genes "
+                    "[Δ log-risk per unit expression]\n"
+                    "(per patient; + = raises predicted risk)"
+                ),
                     title="KEGG NSCLC panel: local gradients (coloured by IG attribution)",
                     color_scores=panel_ig,
                     color_label="Mean IG attribution over module genes\n(Δ log-risk per gene)",
                 )
             if panel_path is not None:
                 plot_beeswarm(
-                    panel_path,
-                    labels,
+                    panel_path, labels,
                     os.path.join(output_dir, "known_luad_path_gradient_beeswarm.png"),
                     n_mod,
                     xlabel=(
-                        "Mean path-averaged gradient over genes "
-                        "[Δ log-risk per unit expression]\n"
-                        "(per patient; + = raises risk)"
-                    ),
+                    "Mean path-averaged gradient over genes "
+                    "[Δ log-risk per unit expression]\n"
+                    "(per patient; + = raises risk)"
+                ),
                     title="KEGG NSCLC panel: path-averaged gradients (coloured by IG)",
                     color_scores=panel_ig,
                     color_label="Mean IG attribution over module genes\n(Δ log-risk per gene)",
@@ -585,8 +573,7 @@ def score_luad_panel(
             # Headline IG beeswarms: x = IG spread, colour = gradient direction.
             if panel_ig is not None and panel_local is not None:
                 plot_beeswarm(
-                    panel_ig,
-                    labels,
+                    panel_ig, labels,
                     os.path.join(
                         output_dir, "known_luad_ig_beeswarm_local_gradient_color.png"
                     ),
@@ -601,8 +588,7 @@ def score_luad_panel(
                 )
             if panel_ig is not None and panel_path is not None:
                 plot_beeswarm(
-                    panel_ig,
-                    labels,
+                    panel_ig, labels,
                     os.path.join(
                         output_dir, "known_luad_ig_beeswarm_path_gradient_color.png"
                     ),
@@ -617,8 +603,7 @@ def score_luad_panel(
                 )
             if panel_ig is not None:
                 plot_beeswarm(
-                    panel_ig,
-                    labels,
+                    panel_ig, labels,
                     os.path.join(output_dir, "known_luad_ig_beeswarm.png"),
                     n_mod,
                     xlabel=ig_x_label,
@@ -628,8 +613,7 @@ def score_luad_panel(
                 )
             if panel_ig is not None and panel_expr is not None:
                 plot_beeswarm(
-                    panel_ig,
-                    labels,
+                    panel_ig, labels,
                     os.path.join(
                         output_dir, "known_luad_ig_beeswarm_expression_color.png"
                     ),
@@ -651,9 +635,7 @@ def score_luad_panel(
                 {
                     "pathway": labels,
                     "mean_gradient": [
-                        table.loc[table["pathway"] == name, "mean_local_gradient"].iloc[
-                            0
-                        ]
+                        table.loc[table["pathway"] == name, "mean_local_gradient"].iloc[0]
                         for name in ordered
                     ],
                 }
@@ -753,17 +735,13 @@ def member_gene_table(
                     "symbol": symbols[i],
                     "description": info.get("description"),
                     "mean_abs_ig": mean_abs[i],
-                    "share_of_pathway_attribution": (
-                        mean_abs[i] / total if total else np.nan
-                    ),
+                    "share_of_pathway_attribution": mean_abs[i] / total if total else np.nan,
                     # Aliases -> path gradient (the primary direction).
                     "mean_gradient": mean_path_gradient[i],
                     "direction": direction_label(mean_path_gradient[i]),
                     "mean_path_gradient": mean_path_gradient[i],
                     "path_direction": direction_label(mean_path_gradient[i]),
-                    "frac_patients_path_gradient_positive": frac_path_gradient_positive[
-                        i
-                    ],
+                    "frac_patients_path_gradient_positive": frac_path_gradient_positive[i],
                     "mean_local_gradient": mean_local_gradient[i],
                     "local_direction": direction_label(mean_local_gradient[i]),
                     "frac_patients_local_gradient_positive": (
@@ -859,7 +837,7 @@ def plot_beeswarm(
         xlabel
         or (
             "Mean integrated-gradient attribution over pathway genes "
-            "[Δ log-risk per gene]\n"
+            "[Δ log-risk per gene, i.e. log hazard ratio]\n"
             "(per patient, relative to the cohort-mean-expression baseline; "
             "positive = pushes THIS patient's predicted risk up)"
         )
@@ -889,8 +867,7 @@ def plot_direction(table, output_path, top_n=20):
         return
 
     labels = [
-        n.replace("HALLMARK_", "").replace("REACTOME_", "")[:52]
-        for n in subset["pathway"]
+        n.replace("HALLMARK_", "").replace("REACTOME_", "")[:52] for n in subset["pathway"]
     ]
     values = subset["mean_gradient"].to_numpy()
     colours = ["#d7191c" if v > 0 else "#2c7bb6" for v in values]
@@ -919,9 +896,7 @@ def plot_gradient_comparison(table, output_path, top_n=20):
         or "mean_local_gradient" not in table
         or table[["mean_path_gradient", "mean_local_gradient"]].isna().all().all()
     ):
-        logger.warning(
-            "Path/local gradient columns unavailable; skipping comparison plot."
-        )
+        logger.warning("Path/local gradient columns unavailable; skipping comparison plot.")
         return
 
     import matplotlib
@@ -971,9 +946,7 @@ def plot_gradient_comparison(table, output_path, top_n=20):
         "Mean gradient over pathway genes [Δ log-risk per unit expression]\n"
         "(positive = raises predicted risk)"
     )
-    ax.set_title(
-        "Path-averaged vs local gradient direction for top pathways", fontsize=11
-    )
+    ax.set_title("Path-averaged vs local gradient direction for top pathways", fontsize=11)
     ax.legend(loc="lower right", fontsize=8, frameon=False)
     fig.tight_layout()
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
@@ -982,13 +955,7 @@ def plot_gradient_comparison(table, output_path, top_n=20):
 
 
 def plot_gene_beeswarm(
-    top_pathways,
-    gene_sets,
-    symbols,
-    gene_gradient,
-    gene_magnitude,
-    output_path,
-    top_n=20,
+    top_pathways, gene_sets, symbols, gene_gradient, gene_magnitude, output_path, top_n=20
 ):
     """One row per pathway, one dot per MEMBER GENE -- the gene-level companion to
     plot_beeswarm (per patient). Shows how each pathway's own genes distribute their
@@ -1008,15 +975,17 @@ def plot_gene_beeswarm(
     rng = np.random.default_rng(0)
 
     all_mags = [
-        gene_magnitude[g] for p in pathways for g in gene_sets[p] if g in measured
+        gene_magnitude[g]
+        for p in pathways
+        for g in gene_sets[p]
+        if g in measured
     ]
     max_mag = max(all_mags) if all_mags else 1.0
 
     fig, ax = plt.subplots(figsize=(10, 0.42 * len(rows) + 2))
     for y, j in enumerate(rows):
         members = [
-            g
-            for g in gene_sets[pathways[j]]
+            g for g in gene_sets[pathways[j]]
             if g in measured and np.isfinite(gene_gradient[g])
         ]
         if not members:
@@ -1026,21 +995,14 @@ def plot_gene_beeswarm(
         colours = ["#d7191c" if v > 0 else "#2c7bb6" for v in x]
         jitter = rng.uniform(-0.18, 0.18, size=len(x))
         ax.scatter(
-            x,
-            np.full(len(x), y) + jitter,
-            c=colours,
-            s=dot_sizes,
-            alpha=0.7,
-            linewidths=0,
+            x, np.full(len(x), y) + jitter, c=colours, s=dot_sizes,
+            alpha=0.7, linewidths=0,
         )
 
     ax.axvline(0, color="0.3", lw=0.8, zorder=0)
     ax.set_yticks(range(len(rows)))
     ax.set_yticklabels(
-        [
-            pathways[j].replace("HALLMARK_", "").replace("REACTOME_", "")[:52]
-            for j in rows
-        ],
+        [pathways[j].replace("HALLMARK_", "").replace("REACTOME_", "")[:52] for j in rows],
         fontsize=8,
     )
     ax.set_xlabel(
@@ -1048,9 +1010,7 @@ def plot_gene_beeswarm(
         "[Δ log-risk per unit expression]\n"
         "(one dot per gene; red = raises risk, blue = protective; dot size = mean |IG|)"
     )
-    ax.set_title(
-        "Distribution of member-gene effects within each top pathway", fontsize=11
-    )
+    ax.set_title("Distribution of member-gene effects within each top pathway", fontsize=11)
     fig.tight_layout()
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
@@ -1164,9 +1124,7 @@ def run(
     local_gradient_symbols = collapsed["local_gradients"]
     expression_symbols = collapsed["expression"]
 
-    membership, names, sizes, coverage = build_membership(
-        gene_sets, symbols, min_members
-    )
+    membership, names, sizes, coverage = build_membership(gene_sets, symbols, min_members)
 
     # --- Layer A: the paper's pathway score ---------------------------------------
     scores = pathway_scores(ig_symbols, membership, sizes)
@@ -1184,9 +1142,7 @@ def run(
         mean_abs_path_gradient = np.full(len(names), np.nan)
 
     if local_gradient_symbols is not None:
-        local_gradient_scores = pathway_scores(
-            local_gradient_symbols, membership, sizes
-        )
+        local_gradient_scores = pathway_scores(local_gradient_symbols, membership, sizes)
         mean_local_gradient = local_gradient_scores.mean(axis=0)
         summed_abs_local_gradient = np.abs(local_gradient_scores).sum(axis=0)
         mean_abs_local_gradient = np.abs(local_gradient_scores).mean(axis=0)
@@ -1272,9 +1228,7 @@ def run(
     lung_table.to_csv(
         os.path.join(output_dir, "lung_named_pathway_scores.csv"), index=False
     )
-    subtype_counts = (
-        lung_table["lung_cancer_subtype_from_name"].value_counts().to_dict()
-    )
+    subtype_counts = lung_table["lung_cancer_subtype_from_name"].value_counts().to_dict()
     logger.info(
         f"Lung/NSCLC-named MSigDB subset -> "
         f"{output_dir}/lung_named_pathway_scores.csv "
@@ -1282,9 +1236,7 @@ def run(
         f"SCLC is not LUAD -- filter it out with lung_cancer_subtype_from_name != 'SCLC')"
     )
 
-    ig_table = table.sort_values(
-        "summed_abs_ig", ascending=False, ignore_index=True
-    ).copy()
+    ig_table = table.sort_values("summed_abs_ig", ascending=False, ignore_index=True).copy()
     ig_table.insert(0, "ig_magnitude_rank", range(1, len(ig_table) + 1))
     ig_table.to_csv(
         os.path.join(output_dir, "pathway_ig_magnitude_scores.csv"), index=False
@@ -1318,9 +1270,9 @@ def run(
     pd.DataFrame(scores[:, order], index=patient_ids, columns=top_pathways).to_csv(
         os.path.join(output_dir, "pathway_scores_matrix.csv")
     )
-    pd.DataFrame(
-        scores[:, ig_order], index=patient_ids, columns=ig_top_pathways
-    ).to_csv(os.path.join(output_dir, "pathway_ig_magnitude_scores_matrix.csv"))
+    pd.DataFrame(scores[:, ig_order], index=patient_ids, columns=ig_top_pathways).to_csv(
+        os.path.join(output_dir, "pathway_ig_magnitude_scores_matrix.csv")
+    )
     if path_gradient_scores is not None:
         pd.DataFrame(
             path_gradient_scores[:, order], index=patient_ids, columns=top_pathways
@@ -1358,9 +1310,7 @@ def run(
             local_gradient_symbols,
             gene_details,
         )
-        members.to_csv(
-            os.path.join(output_dir, "pathway_member_genes.csv"), index=False
-        )
+        members.to_csv(os.path.join(output_dir, "pathway_member_genes.csv"), index=False)
         logger.info(f"Member genes -> {output_dir}/pathway_member_genes.csv")
 
     # --- Save the bundle for the optional pathway_tests.py evidence step -----------
@@ -1383,7 +1333,7 @@ def run(
     if write_figures:
         ig_x_label = (
             "Mean IG attribution over pathway genes "
-            "[Δ log-risk per gene]\n"
+            "[Δ log-risk per gene, i.e. log hazard ratio]\n"
             "(per patient, relative to the cohort-mean-expression baseline; "
             "+ = raises risk)"
         )
@@ -1428,9 +1378,7 @@ def run(
             plot_beeswarm(
                 scores[:, order],
                 top_pathways,
-                os.path.join(
-                    output_dir, "pathway_ig_beeswarm_local_gradient_color.png"
-                ),
+                os.path.join(output_dir, "pathway_ig_beeswarm_local_gradient_color.png"),
                 top_n,
                 xlabel=ig_x_label,
                 title="IG attribution (x) coloured by local gradient (direction)",
@@ -1477,9 +1425,7 @@ def run(
             color_label="Mean IG attribution over pathway genes",
         )
         if expression_symbols is not None:
-            expression_top = pathway_scores(expression_symbols, membership, sizes)[
-                :, order
-            ]
+            expression_top = pathway_scores(expression_symbols, membership, sizes)[:, order]
             plot_beeswarm(
                 scores[:, order],
                 top_pathways,
@@ -1570,15 +1516,12 @@ def run(
     with open(os.path.join(output_dir, "run_metadata.json"), "w") as fh:
         json.dump(metadata, fh, indent=2)
 
-    log_summary(
-        table, top_n, ranking_column, ranking_description, collections, output_dir
-    )
+    log_summary(table, top_n, ranking_column, ranking_description, collections, output_dir)
     return table
 
 
-def log_summary(
-    table, top_n, ranking_column, ranking_description, collections=None, output_dir=None
-):
+def log_summary(table, top_n, ranking_column, ranking_description, collections=None,
+                output_dir=None):
     logger.info("\n" + "=" * 92)
     if collections is not None:
         logger.info(
@@ -1599,9 +1542,7 @@ def log_summary(
 
 def main(config, opt):
     base_dir = Path(config.testing.output_base_dir)
-    primary_collections = tuple(
-        c.strip() for c in opt.collections.split(",") if c.strip()
-    )
+    primary_collections = tuple(c.strip() for c in opt.collections.split(",") if c.strip())
     supplemental_collections = tuple(
         c.strip() for c in opt.supplemental_collections.split(",") if c.strip()
     )
@@ -1622,9 +1563,7 @@ def main(config, opt):
         write_member_genes=True,
         write_bundle=True,
     )
-    if not opt.no_supplemental_all and set(supplemental_collections) != set(
-        primary_collections
-    ):
+    if not opt.no_supplemental_all and set(supplemental_collections) != set(primary_collections):
         run(
             mapping_file_path=opt.mapping_file or config.data.json_file,
             ig_directory=opt.ig_dir or str(base_dir / "IG_6sep"),
@@ -1656,24 +1595,12 @@ def parse_args():
         default="joint_fusion/config/config_checkpoint_2026-04-07-04-58-17_fold1.yaml",
         help="Defaults to the fold-1 config; pass another to use a different fold.",
     )
-    parser.add_argument(
-        "--ig-dir",
-        type=str,
-        default=None,
-        help="Defaults to <output_base_dir>/IG_6sep.",
-    )
-    parser.add_argument(
-        "--mapping-file",
-        type=str,
-        default=None,
-        help="Mapping JSON. Defaults to config.data.json_file.",
-    )
-    parser.add_argument(
-        "--gene-axis",
-        type=str,
-        default=GENE_AXIS_CACHE,
-        help="Cached ordered gene axis; written on first run.",
-    )
+    parser.add_argument("--ig-dir", type=str, default=None,
+                        help="Defaults to <output_base_dir>/IG_6sep.")
+    parser.add_argument("--mapping-file", type=str, default=None,
+                        help="Mapping JSON. Defaults to config.data.json_file.")
+    parser.add_argument("--gene-axis", type=str, default=GENE_AXIS_CACHE,
+                        help="Cached ordered gene axis; written on first run.")
     parser.add_argument("--msigdb-dir", type=str, default=MSIGDB_DIR)
     parser.add_argument(
         "--collections",
@@ -1701,38 +1628,30 @@ def parse_args():
     parser.add_argument(
         "--ranking-statistic",
         choices=sorted(RANKING_COLUMNS),
-        default="local_gradient_abs",
+        default="ig_abs",
         help=(
-            "Primary pathway ranking. Default is summed absolute local gradients "
-            "to reproduce the local-gradient pathway ranking."
+            "Primary pathway ranking. Default is summed absolute IG: the completeness "
+            "axiom puts it on the scale of the patient's actual risk difference, "
+            "whereas gradients saturate and do not sum to anything "
+            "(literature/ig_pathway_design_notes.md section 3). Direction is taken from "
+            "the path gradient regardless. Use local_gradient_abs to reproduce the "
+            "Steyaert local-gradient ranking."
         ),
     )
-    parser.add_argument(
-        "--min-members",
-        type=int,
-        default=10,
-        help="Drop discovery gene sets with fewer measured genes than this.",
-    )
-    parser.add_argument(
-        "--panel-min-members",
-        type=int,
-        default=3,
-        help="Min measured genes to SCORE a KEGG NSCLC driver module "
-        "(lower than discovery, since driver modules are small; "
-        "modules below this still appear in the panel CSV, flagged "
-        "scored=False).",
-    )
-    parser.add_argument(
-        "--top-n", type=int, default=20, help="Pathways to plot and to drill into."
-    )
+    parser.add_argument("--min-members", type=int, default=10,
+                        help="Drop discovery gene sets with fewer measured genes than this.")
+    parser.add_argument("--panel-min-members", type=int, default=3,
+                        help="Min measured genes to SCORE a KEGG NSCLC driver module "
+                             "(lower than discovery, since driver modules are small; "
+                             "modules below this still appear in the panel CSV, flagged "
+                             "scored=False).")
+    parser.add_argument("--top-n", type=int, default=20,
+                        help="Pathways to plot and to drill into.")
     parser.add_argument("--gene-info-dir", type=str, default="assets/gene_info")
-    parser.add_argument(
-        "--allow-missing-gradients",
-        action="store_true",
-        help="Run without path_gradients_*.npy. Direction columns become "
-        "NaN and GSEA is skipped -- direction is NOT recoverable "
-        "from signed IG under a cohort-mean baseline.",
-    )
+    parser.add_argument("--allow-missing-gradients", action="store_true",
+                        help="Run without path_gradients_*.npy. Direction columns become "
+                             "NaN and GSEA is skipped -- direction is NOT recoverable "
+                             "from signed IG under a cohort-mean baseline.")
     return parser.parse_args()
 
 
