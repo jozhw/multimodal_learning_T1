@@ -1,12 +1,12 @@
 """
 pathway_interpret.py
 
-Pathway-level interpretability for the joint-fusion LUAD survival model, following
-Steyaert et al. (2023, Commun Med 3:44): aggregate the model's per-gene gradients
-onto MSigDB Reactome pathways, rank them, and draw the figures.
+Pathway-level interpretability for the joint-fusion LUAD survival model: aggregate
+the model's per-gene attribution/gradient signals onto MSigDB Reactome pathways,
+rank them, and draw the figures.
 
 Three per-gene signals, written per patient by test.py into IG_6sep/:
-  integrated_grads   attribution magnitude          -> separate IG magnitude table
+  integrated_grads   attribution magnitude          -> default ranking/table/plots
   path_gradients     signed effect on risk          -> IG-consistent comparison plot
   vanilla_gradients  the local (endpoint) gradient        -> local-gradient plot
 
@@ -22,9 +22,9 @@ reading MSigDB's own gene-set names (LUNG_NAME_TOKENS), never hand-curated and n
 used to rank or test.
 
 Layers:
-  A  score each pathway = mean gradient over its member genes; rank by summed
-     |local gradient| for the primary local-gradient result. IG magnitude is exported
-     as a separate baseline-aware attribution table/plot.
+  A  score each pathway = mean signal over its member genes. By default, rank by
+     summed |IG attribution| so the ranking matches pathway_tests.py's permutation
+     null; gradients are used for direction and comparison plots.
   B  drill-down: each top pathway's member genes, ranked by their own attribution.
 
 Optional statistical evidence (permutation null, GSEA prerank, hypergeometric ORA)
@@ -396,7 +396,7 @@ def score_luad_panel(
     path_gradient_symbols,
     local_gradient_symbols,
     output_dir,
-    primary_col="summed_abs_local_gradient",
+    primary_col="summed_abs_ig",
     min_members=3,
     discovery_ranking_values=None,
     expression_symbols=None,
@@ -406,10 +406,10 @@ def score_luad_panel(
     """Confirmatory KEGG NSCLC driver panel (nt06266) -- NOT part of discovery.
 
     Scores the KEGG_NSCLC_PANEL modules off the same per-patient attributions, using the
-    SAME primary statistic the discovery ranks by (default summed |local gradient|, the
-    local-gradient statistic), so percentile_vs_discovery is apples-to-apples with the headline
-    ranking. Reports summed |local gradient|, |path gradient| and |IG| side by side, plus
-    each module's direction and coverage. Writes known_luad_kegg_nsclc_scores.csv.
+    SAME primary statistic the discovery ranks by (default summed |IG|), so
+    percentile_vs_discovery is apples-to-apples with the headline ranking. Reports
+    summed |IG|, |local gradient| and |path gradient| side by side, plus each
+    module's direction and coverage. Writes known_luad_kegg_nsclc_scores.csv.
     min_members is low here (driver modules are small, ~5-20 genes); modules below it still
     appear, flagged scored=False.
     """
@@ -1094,7 +1094,7 @@ def run(
     top_n=20,
     gene_info_cache_dir="assets/gene_info",
     require_gradients=True,
-    ranking_statistic="local_gradient_abs",
+    ranking_statistic="ig_abs",
     write_figures=True,
     write_member_genes=True,
     write_bundle=True,
@@ -1126,7 +1126,7 @@ def run(
 
     membership, names, sizes, coverage = build_membership(gene_sets, symbols, min_members)
 
-    # --- Layer A: the paper's pathway score ---------------------------------------
+    # --- Layer A: pathway scores ---------------------------------------------------
     scores = pathway_scores(ig_symbols, membership, sizes)
     summed_abs_ig = np.abs(scores).sum(axis=0)
 
@@ -1164,10 +1164,10 @@ def run(
             "collection": [collection_of[n] for n in names],
             "n_measured_genes": sizes,
             "coverage": coverage,
-            # Baseline-aware attribution magnitude; exported as a separate IG table.
+            # Baseline-aware attribution magnitude; default primary ranking.
             "summed_abs_ig": summed_abs_ig,
             "mean_abs_ig": np.abs(scores).mean(axis=0),
-            # Primary ranking statistic (local gradient).
+            # Gradient companion statistics for optional ranking and direction checks.
             "summed_abs_local_gradient": summed_abs_local_gradient,
             "mean_abs_local_gradient": mean_abs_local_gradient,
             "summed_abs_path_gradient": summed_abs_path_gradient,
@@ -1461,12 +1461,23 @@ def run(
                 top_n,
             )
 
+    primary_method_by_statistic = {
+        "ig_abs": "integrated gradients",
+        "local_gradient_abs": "local gradients",
+        "path_gradient_abs": "path-averaged gradients",
+    }
+    primary_figure_by_statistic = {
+        "ig_abs": "pathway_ig_beeswarm.png",
+        "local_gradient_abs": "pathway_local_gradient_beeswarm.png",
+        "path_gradient_abs": "pathway_path_gradient_beeswarm.png",
+    }
+
     metadata = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "n_patients": len(patient_ids),
         "analysis_bundle": ANALYSIS_BUNDLE_NAME if write_bundle else None,
         "attribution": {
-            "primary_method": "local gradients",
+            "primary_method": primary_method_by_statistic[ranking_statistic],
             "comparison_method": "path-averaged gradients",
             "ig_method": "integrated gradients",
             "baseline": "mean RNA-seq expression over the training split",
@@ -1477,12 +1488,15 @@ def run(
             "ranking_column": ranking_column,
             "ranking_description": ranking_description,
             "ig_magnitude_output": "pathway_ig_magnitude_scores.csv",
-            "primary_figure": "pathway_local_gradient_beeswarm.png",
+            "primary_figure": primary_figure_by_statistic[ranking_statistic],
+            "local_gradient_companion_figure": "pathway_local_gradient_beeswarm.png",
             "path_gradient_companion_figure": "pathway_path_gradient_beeswarm.png",
             "note": (
-                "The primary pathway plot uses local endpoint gradients over Reactome "
-                "endpoint gradients and Reactome pathways. IG is exported separately "
-                "as a baseline-aware attribution magnitude layer. The sign of a "
+                f"The primary pathway ranking uses {ranking_description} over "
+                "Reactome pathways. The default CLI ranking is summed absolute IG, "
+                "matching pathway_tests.py's permutation null. "
+                "Gradient views are exported as direction-aware companion layers. "
+                "The sign of a "
                 "cohort-mean-baseline IG is patient-relative and should not be used "
                 "as cohort-level direction. See literature/ig_pathway_design_notes.md."
             ),
