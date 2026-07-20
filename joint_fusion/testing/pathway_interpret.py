@@ -559,7 +559,7 @@ def score_luad_panel(
                     n_mod,
                     xlabel=(
                         "Mean local gradient over genes "
-                        "[Δ log-risk per SD of expression]\n"
+                        "[Δ log-risk per unit expression]\n"
                         "(per patient; + = raises predicted risk)"
                     ),
                     title="KEGG NSCLC panel: local gradients (coloured by IG attribution)",
@@ -574,7 +574,7 @@ def score_luad_panel(
                     n_mod,
                     xlabel=(
                         "Mean path-averaged gradient over genes "
-                        "[Δ log-risk per SD of expression]\n"
+                        "[Δ log-risk per unit expression]\n"
                         "(per patient; + = raises risk)"
                     ),
                     title="KEGG NSCLC panel: path-averaged gradients (coloured by IG)",
@@ -596,7 +596,7 @@ def score_luad_panel(
                     color_scores=panel_local,
                     color_label=(
                         "Mean local gradient over module genes\n"
-                        "(Δ log-risk per SD of expression; red = raises risk)"
+                        "(Δ log-risk per unit expression; red = raises risk)"
                     ),
                 )
             if panel_ig is not None and panel_path is not None:
@@ -612,7 +612,7 @@ def score_luad_panel(
                     color_scores=panel_path,
                     color_label=(
                         "Mean path-averaged gradient over module genes\n"
-                        "(Δ log-risk per SD of expression; red = raises risk)"
+                        "(Δ log-risk per unit expression; red = raises risk)"
                     ),
                 )
             if panel_ig is not None:
@@ -637,7 +637,10 @@ def score_luad_panel(
                     xlabel=ig_x_label,
                     title="KEGG NSCLC panel: IG (x) coloured by module expression",
                     color_scores=panel_expr,
-                    color_label="Mean expression over module genes (z)",
+                    color_label=(
+                        "Mean expression over module genes\n"
+                        "(row-standardised across patients for display)"
+                    ),
                     standardize_color_by_row=True,
                     center_color_at_zero=True,
                     color_limits=(-2, 2),
@@ -897,7 +900,7 @@ def plot_direction(table, output_path, top_n=20):
     ax.axvline(0, color="k", lw=0.8)
     ax.set_xlabel(
         "Mean path gradient over pathway genes "
-        "[Δ log-risk per SD of expression]\n"
+        "[Δ log-risk per unit expression]\n"
         "(positive = raises predicted risk / poor prognosis; negative = protective)"
     )
     ax.tick_params(axis="y", labelsize=8)
@@ -965,7 +968,7 @@ def plot_gradient_comparison(table, output_path, top_n=20):
     ax.set_yticks(y)
     ax.set_yticklabels(labels, fontsize=8)
     ax.set_xlabel(
-        "Mean gradient over pathway genes [Δ log-risk per SD of expression]\n"
+        "Mean gradient over pathway genes [Δ log-risk per unit expression]\n"
         "(positive = raises predicted risk)"
     )
     ax.set_title(
@@ -1042,7 +1045,7 @@ def plot_gene_beeswarm(
     )
     ax.set_xlabel(
         "Mean path gradient of each member gene "
-        "[Δ log-risk per SD of expression]\n"
+        "[Δ log-risk per unit expression]\n"
         "(one dot per gene; red = raises risk, blue = protective; dot size = mean |IG|)"
     )
     ax.set_title(
@@ -1395,7 +1398,7 @@ def run(
                 top_n,
                 xlabel=(
                     "Mean local gradient over genes "
-                    "[Δ log-risk per SD of expression]\n"
+                    "[Δ log-risk per unit expression]\n"
                     "(per patient; + = raises predicted risk)"
                 ),
                 title="Pathway local gradients (coloured by IG attribution)",
@@ -1410,7 +1413,7 @@ def run(
                 top_n,
                 xlabel=(
                     "Mean path-averaged gradient over genes "
-                    "[Δ log-risk per SD of expression]\n"
+                    "[Δ log-risk per unit expression]\n"
                     "(per patient; + = raises risk)"
                 ),
                 title="Pathway path-averaged gradients (coloured by IG attribution)",
@@ -1434,7 +1437,7 @@ def run(
                 color_scores=local_gradient_scores[:, order],
                 color_label=(
                     "Mean local gradient over pathway genes\n"
-                    "(Δ log-risk per SD of expression; red = raises risk)"
+                    "(Δ log-risk per unit expression; red = raises risk)"
                 ),
             )
         if path_gradient_scores is not None:
@@ -1448,7 +1451,7 @@ def run(
                 color_scores=path_gradient_scores[:, order],
                 color_label=(
                     "Mean path-averaged gradient over pathway genes\n"
-                    "(Δ log-risk per SD of expression; red = raises risk)"
+                    "(Δ log-risk per unit expression; red = raises risk)"
                 ),
             )
 
@@ -1485,7 +1488,10 @@ def run(
                 xlabel=ig_x_label,
                 title="IG attribution (x) coloured by pathway expression",
                 color_scores=expression_top,
-                color_label="Mean expression over pathway genes (z)",
+                color_label=(
+                    "Mean expression over pathway genes\n"
+                    "(row-standardised across patients for display)"
+                ),
                 standardize_color_by_row=True,
                 center_color_at_zero=True,
                 color_limits=(-2, 2),
