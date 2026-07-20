@@ -8,7 +8,7 @@ onto MSigDB Reactome pathways, rank them, and draw the figures.
 Three per-gene signals, written per patient by test.py into IG_6sep/:
   integrated_grads   attribution magnitude          -> separate IG magnitude table
   path_gradients     signed effect on risk          -> IG-consistent comparison plot
-  vanilla_gradients  raw endpoint gradient           -> primary Steyaert-style plot
+  vanilla_gradients  the local (endpoint) gradient        -> local-gradient plot
 
 Direction comes from the gradient, NOT the sign of IG: the IG baseline is cohort-mean
 expression, so IG's sign describes the patient (above/below average), not the gene, and
@@ -16,14 +16,14 @@ cancels across the cohort. Magnitude survives, direction does not. Derivation:
 literature/ig_pathway_design_notes.md.
 
 Database-only: gene sets and genes come from MSigDB; the primary analysis uses
-Reactome only, matching Steyaert's pathway universe. Optional all-collections output
+Reactome only, matching the reference paper's pathway universe. Optional all-collections output
 can be written for sensitivity analysis. Lung/NSCLC relevance is flagged solely by
 reading MSigDB's own gene-set names (LUNG_NAME_TOKENS), never hand-curated and never
 used to rank or test.
 
 Layers:
   A  score each pathway = mean gradient over its member genes; rank by summed
-     |vanilla gradient| for the primary Steyaert-style result. IG magnitude is exported
+     |local gradient| for the primary local-gradient result. IG magnitude is exported
      as a separate baseline-aware attribution table/plot.
   B  drill-down: each top pathway's member genes, ranked by their own attribution.
 
@@ -70,7 +70,7 @@ logger = logging.getLogger(__name__)
 MSIGDB_DIR = "assets/msigdb"
 GENE_AXIS_CACHE = "assets/gene_axis.txt"
 
-# Primary collection: Reactome C2:CP, matching the Steyaert pathway-gradient figure.
+# Primary collection: Reactome C2:CP (the pathway universe used by the reference paper).
 PRIMARY_COLLECTIONS = ("c2.cp.reactome",)
 
 # Sensitivity universe: keep broader pathway/signature collections out of the headline
@@ -86,9 +86,9 @@ ALL_COLLECTIONS = (
 DEFAULT_COLLECTIONS = PRIMARY_COLLECTIONS
 
 RANKING_COLUMNS = {
-    "vanilla_gradient_abs": (
-        "summed_abs_vanilla_gradient",
-        "sum over patients of |mean member-gene vanilla gradient|",
+    "local_gradient_abs": (
+        "summed_abs_local_gradient",
+        "sum over patients of |mean member-gene local gradient|",
     ),
     "path_gradient_abs": (
         "summed_abs_path_gradient",
@@ -230,7 +230,7 @@ def load_matrix(ig_directory, prefix, n_genes, patient_ids=None):
 
 
 def load_attributions(ig_directory, n_genes, require_gradients=True):
-    """Load the IG, path-gradient, vanilla-gradient and expression matrices, row-aligned.
+    """Load the IG, path-gradient, local-gradient and expression matrices, row-aligned.
 
     Gradients are written by the current test.py; an older IG run has only
     integrated_grads_*.npy, so direction is unavailable -- hence the hard failure unless
@@ -244,7 +244,7 @@ def load_attributions(ig_directory, n_genes, require_gradients=True):
     path_gradients, _ = load_matrix(
         ig_directory, "path_gradients", n_genes, patient_ids
     )
-    vanilla_gradients, _ = load_matrix(
+    local_gradients, _ = load_matrix(
         ig_directory, "vanilla_gradients", n_genes, patient_ids
     )
     expression, _ = load_matrix(ig_directory, "omic_input", n_genes, patient_ids)
@@ -252,13 +252,13 @@ def load_attributions(ig_directory, n_genes, require_gradients=True):
     missing = []
     if path_gradients is None:
         missing.append("path_gradients_*.npy")
-    if vanilla_gradients is None:
+    if local_gradients is None:
         missing.append("vanilla_gradients_*.npy")
     if missing:
         message = (
             f"Missing {', '.join(missing)} in {ig_directory}. The direction of a gene's "
             "effect on risk cannot be recovered from signed cohort-mean-baseline IG; "
-            "re-run test.py, which now exports path and vanilla gradients alongside "
+            "re-run test.py, which now exports path and local gradients alongside "
             "the attributions."
         )
         if require_gradients:
@@ -267,7 +267,7 @@ def load_attributions(ig_directory, n_genes, require_gradients=True):
                      "missing direction columns will be NaN and gradient plots/GSEA "
                      "may be skipped.")
 
-    return ig, path_gradients, vanilla_gradients, expression, patient_ids
+    return ig, path_gradients, local_gradients, expression, patient_ids
 
 
 # ---------------------------------------------------------------------------
@@ -394,18 +394,21 @@ def score_luad_panel(
     symbols,
     ig_symbols,
     path_gradient_symbols,
-    vanilla_gradient_symbols,
+    local_gradient_symbols,
     output_dir,
+    primary_col="summed_abs_local_gradient",
     min_members=3,
-    discovery_summed_abs=None,
+    discovery_ranking_values=None,
 ):
     """Confirmatory KEGG NSCLC driver panel (nt06266) -- NOT part of discovery.
 
-    Scores the KEGG_NSCLC_PANEL modules off the same per-patient attributions used for the
-    Reactome discovery ranking, and writes known_luad_kegg_nsclc_scores.csv (rank of each
-    driver module by summed |IG|, its direction, coverage, and its percentile against the
-    Reactome discovery distribution). The discovery ranking is untouched. min_members is
-    lowered (5) here because these driver modules are small (~9-20 genes).
+    Scores the KEGG_NSCLC_PANEL modules off the same per-patient attributions, using the
+    SAME primary statistic the discovery ranks by (default summed |local gradient|, the
+    local-gradient statistic), so percentile_vs_discovery is apples-to-apples with the headline
+    ranking. Reports summed |local gradient|, |path gradient| and |IG| side by side, plus
+    each module's direction and coverage. Writes known_luad_kegg_nsclc_scores.csv.
+    min_members is low here (driver modules are small, ~5-20 genes); modules below it still
+    appear, flagged scored=False.
     """
     try:
         gene_sets, _ = load_collections(msigdb_dir, ("c2.cp.kegg_medicus",))
@@ -418,6 +421,19 @@ def score_luad_panel(
         logger.warning(f"KEGG NSCLC panel: {len(missing)} module(s) absent from MSigDB.")
 
     index = {s: i for i, s in enumerate(symbols)}
+
+    def summed_abs(matrix, mem, n):
+        if matrix is None:
+            return np.nan
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            return float(np.abs((matrix @ mem) / n).sum())
+
+    def patient_mean(matrix, mem, n):
+        if matrix is None:
+            return np.nan
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            return float((matrix @ mem).mean() / n)
+
     rows = []
     for name, node in KEGG_NSCLC_PANEL.items():
         annotated = gene_sets.get(name)
@@ -435,20 +451,20 @@ def score_luad_panel(
         if len(members) >= min_members:
             mem = np.zeros(len(symbols), dtype=np.float64)
             mem[members] = 1.0
-            with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
-                ig_score = (ig_symbols @ mem) / len(members)
-                row["summed_abs_ig"] = float(np.abs(ig_score).sum())
-                if path_gradient_symbols is not None:
-                    pg = float((path_gradient_symbols @ mem).mean() / len(members))
-                    row["mean_path_gradient"] = pg
-                    row["direction"] = direction_label(pg)
-                if vanilla_gradient_symbols is not None:
-                    row["mean_local_gradient"] = float(
-                        (vanilla_gradient_symbols @ mem).mean() / len(members)
-                    )
-            if discovery_summed_abs is not None:
-                row["percentile_vs_reactome"] = float(
-                    np.mean(np.asarray(discovery_summed_abs) < row["summed_abs_ig"])
+            n = len(members)
+            row["summed_abs_local_gradient"] = summed_abs(local_gradient_symbols, mem, n)
+            row["summed_abs_path_gradient"] = summed_abs(path_gradient_symbols, mem, n)
+            row["summed_abs_ig"] = summed_abs(ig_symbols, mem, n)
+            row["mean_local_gradient"] = patient_mean(local_gradient_symbols, mem, n)
+            row["mean_path_gradient"] = patient_mean(path_gradient_symbols, mem, n)
+            direction_val = row["mean_local_gradient"]
+            if np.isnan(direction_val):
+                direction_val = row["mean_path_gradient"]
+            row["direction"] = direction_label(direction_val)
+            primary = row.get(primary_col, np.nan)
+            if discovery_ranking_values is not None and not np.isnan(primary):
+                row["percentile_vs_discovery"] = float(
+                    np.mean(np.asarray(discovery_ranking_values) < primary)
                 )
         rows.append(row)
 
@@ -456,14 +472,15 @@ def score_luad_panel(
         logger.warning("No KEGG NSCLC panel modules found; skipping.")
         return None
 
+    sort_col = primary_col if any(primary_col in r for r in rows) else "summed_abs_ig"
     table = pd.DataFrame(rows).sort_values(
-        ["scored", "summed_abs_ig"], ascending=[False, False], na_position="last"
+        ["scored", sort_col], ascending=[False, False], na_position="last"
     )
     path = os.path.join(output_dir, "known_luad_kegg_nsclc_scores.csv")
     table.to_csv(path, index=False)
     n_scored = int(table["scored"].sum())
     logger.info(
-        f"KEGG NSCLC driver panel (nt06266) -> {path} "
+        f"KEGG NSCLC driver panel (nt06266), primary={primary_col} -> {path} "
         f"({n_scored}/{len(table)} modules scored at min_members={min_members})"
     )
     return table
@@ -511,7 +528,7 @@ def member_gene_table(
     symbols,
     ig_symbols,
     path_gradient_symbols,
-    vanilla_gradient_symbols,
+    local_gradient_symbols,
     gene_details,
 ):
     """For each top pathway, its member genes ranked by their own attribution.
@@ -529,15 +546,15 @@ def member_gene_table(
     else:
         mean_path_gradient = np.full(len(symbols), np.nan)
         frac_path_gradient_positive = np.full(len(symbols), np.nan)
-    if vanilla_gradient_symbols is not None:
-        mean_vanilla_gradient = vanilla_gradient_symbols.mean(axis=0)
-        frac_vanilla_gradient_positive = (vanilla_gradient_symbols > 0).mean(axis=0)
+    if local_gradient_symbols is not None:
+        mean_local_gradient = local_gradient_symbols.mean(axis=0)
+        frac_local_gradient_positive = (local_gradient_symbols > 0).mean(axis=0)
     else:
-        mean_vanilla_gradient = np.full(len(symbols), np.nan)
-        frac_vanilla_gradient_positive = np.full(len(symbols), np.nan)
+        mean_local_gradient = np.full(len(symbols), np.nan)
+        frac_local_gradient_positive = np.full(len(symbols), np.nan)
 
     gene_gradient_agreement = sign_agreement_by_column(
-        path_gradient_symbols, vanilla_gradient_symbols
+        path_gradient_symbols, local_gradient_symbols
     )
     if gene_gradient_agreement is None:
         gene_gradient_agreement = np.full(len(symbols), np.nan)
@@ -562,12 +579,12 @@ def member_gene_table(
                     "mean_path_gradient": mean_path_gradient[i],
                     "path_direction": direction_label(mean_path_gradient[i]),
                     "frac_patients_path_gradient_positive": frac_path_gradient_positive[i],
-                    "mean_vanilla_gradient": mean_vanilla_gradient[i],
-                    "vanilla_direction": direction_label(mean_vanilla_gradient[i]),
-                    "frac_patients_vanilla_gradient_positive": (
-                        frac_vanilla_gradient_positive[i]
+                    "mean_local_gradient": mean_local_gradient[i],
+                    "local_direction": direction_label(mean_local_gradient[i]),
+                    "frac_patients_local_gradient_positive": (
+                        frac_local_gradient_positive[i]
                     ),
-                    "path_vanilla_sign_agreement": gene_gradient_agreement[i],
+                    "path_local_sign_agreement": gene_gradient_agreement[i],
                     "mean_signed_ig_DO_NOT_USE_FOR_DIRECTION": mean_signed[i],
                     "frac_patients_ig_positive": frac_positive[i],
                 }
@@ -596,7 +613,7 @@ def plot_beeswarm(
     """The paper's Fig. 6 analog: one row per pathway, one dot per patient.
 
     x = the patient's mean pathway score. By default, colour = the same pathway score,
-    matching the Steyaert/SHAP-style convention where red/blue reflects high/low
+    matching the SHAP-style convention where red/blue reflects high/low
     gradient value. Pass expression scores explicitly for an expression-coloured
     supplemental view.
     """
@@ -707,13 +724,13 @@ def plot_direction(table, output_path, top_n=20):
 
 
 def plot_gradient_comparison(table, output_path, top_n=20):
-    """Paired pathway-level path vs vanilla gradient means."""
+    """Paired pathway-level path vs local gradient means."""
     if (
         "mean_path_gradient" not in table
-        or "mean_vanilla_gradient" not in table
-        or table[["mean_path_gradient", "mean_vanilla_gradient"]].isna().all().all()
+        or "mean_local_gradient" not in table
+        or table[["mean_path_gradient", "mean_local_gradient"]].isna().all().all()
     ):
-        logger.warning("Path/vanilla gradient columns unavailable; skipping comparison plot.")
+        logger.warning("Path/local gradient columns unavailable; skipping comparison plot.")
         return
 
     import matplotlib
@@ -741,16 +758,16 @@ def plot_gradient_comparison(table, output_path, top_n=20):
         color="#b2182b",
     )
     ax.scatter(
-        subset["mean_vanilla_gradient"],
+        subset["mean_local_gradient"],
         y - 0.08,
-        label="vanilla gradient",
+        label="local gradient",
         s=24,
         color="#2166ac",
     )
     for yi, (_, row) in zip(y, subset.iterrows()):
-        if pd.notna(row["mean_path_gradient"]) and pd.notna(row["mean_vanilla_gradient"]):
+        if pd.notna(row["mean_path_gradient"]) and pd.notna(row["mean_local_gradient"]):
             ax.plot(
-                [row["mean_path_gradient"], row["mean_vanilla_gradient"]],
+                [row["mean_path_gradient"], row["mean_local_gradient"]],
                 [yi, yi],
                 color="0.75",
                 lw=0.8,
@@ -760,7 +777,7 @@ def plot_gradient_comparison(table, output_path, top_n=20):
     ax.set_yticks(y)
     ax.set_yticklabels(labels, fontsize=8)
     ax.set_xlabel("Mean gradient over pathway genes (positive = raises predicted risk)")
-    ax.set_title("Path-averaged vs vanilla gradient direction for top pathways", fontsize=11)
+    ax.set_title("Path-averaged vs local gradient direction for top pathways", fontsize=11)
     ax.legend(loc="lower right", fontsize=8, frameon=False)
     fig.tight_layout()
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
@@ -907,7 +924,7 @@ def run(
     top_n=20,
     gene_info_cache_dir="assets/gene_info",
     require_gradients=True,
-    ranking_statistic="vanilla_gradient_abs",
+    ranking_statistic="local_gradient_abs",
     write_figures=True,
     write_member_genes=True,
     write_bundle=True,
@@ -915,7 +932,7 @@ def run(
     os.makedirs(output_dir, exist_ok=True)
 
     gene_names = resolve_gene_axis(mapping_file_path, gene_axis_path)
-    ig, path_gradients, vanilla_gradients, expression, patient_ids = load_attributions(
+    ig, path_gradients, local_gradients, expression, patient_ids = load_attributions(
         ig_directory, len(gene_names), require_gradients
     )
 
@@ -926,7 +943,7 @@ def run(
         {
             "ig": ig,
             "path_gradients": path_gradients,
-            "vanilla_gradients": vanilla_gradients,
+            "local_gradients": local_gradients,
             "expression": expression,
         },
         gene_names,
@@ -934,7 +951,7 @@ def run(
     )
     ig_symbols = collapsed["ig"]
     path_gradient_symbols = collapsed["path_gradients"]
-    vanilla_gradient_symbols = collapsed["vanilla_gradients"]
+    local_gradient_symbols = collapsed["local_gradients"]
     expression_symbols = collapsed["expression"]
 
     membership, names, sizes, coverage = build_membership(gene_sets, symbols, min_members)
@@ -954,19 +971,19 @@ def run(
         summed_abs_path_gradient = np.full(len(names), np.nan)
         mean_abs_path_gradient = np.full(len(names), np.nan)
 
-    if vanilla_gradient_symbols is not None:
-        vanilla_gradient_scores = pathway_scores(vanilla_gradient_symbols, membership, sizes)
-        mean_vanilla_gradient = vanilla_gradient_scores.mean(axis=0)
-        summed_abs_vanilla_gradient = np.abs(vanilla_gradient_scores).sum(axis=0)
-        mean_abs_vanilla_gradient = np.abs(vanilla_gradient_scores).mean(axis=0)
+    if local_gradient_symbols is not None:
+        local_gradient_scores = pathway_scores(local_gradient_symbols, membership, sizes)
+        mean_local_gradient = local_gradient_scores.mean(axis=0)
+        summed_abs_local_gradient = np.abs(local_gradient_scores).sum(axis=0)
+        mean_abs_local_gradient = np.abs(local_gradient_scores).mean(axis=0)
     else:
-        vanilla_gradient_scores = None
-        mean_vanilla_gradient = np.full(len(names), np.nan)
-        summed_abs_vanilla_gradient = np.full(len(names), np.nan)
-        mean_abs_vanilla_gradient = np.full(len(names), np.nan)
+        local_gradient_scores = None
+        mean_local_gradient = np.full(len(names), np.nan)
+        summed_abs_local_gradient = np.full(len(names), np.nan)
+        mean_abs_local_gradient = np.full(len(names), np.nan)
 
     pathway_gradient_agreement = sign_agreement_by_column(
-        path_gradient_scores, vanilla_gradient_scores
+        path_gradient_scores, local_gradient_scores
     )
     if pathway_gradient_agreement is None:
         pathway_gradient_agreement = np.full(len(names), np.nan)
@@ -980,16 +997,16 @@ def run(
             # Baseline-aware attribution magnitude; exported as a separate IG table.
             "summed_abs_ig": summed_abs_ig,
             "mean_abs_ig": np.abs(scores).mean(axis=0),
-            # Primary Steyaert-style ranking statistic.
-            "summed_abs_vanilla_gradient": summed_abs_vanilla_gradient,
-            "mean_abs_vanilla_gradient": mean_abs_vanilla_gradient,
+            # Primary ranking statistic (local gradient).
+            "summed_abs_local_gradient": summed_abs_local_gradient,
+            "mean_abs_local_gradient": mean_abs_local_gradient,
             "summed_abs_path_gradient": summed_abs_path_gradient,
             "mean_abs_path_gradient": mean_abs_path_gradient,
             "mean_path_gradient": mean_path_gradient,
             "path_direction": [direction_label(g) for g in mean_path_gradient],
-            "mean_vanilla_gradient": mean_vanilla_gradient,
-            "vanilla_direction": [direction_label(g) for g in mean_vanilla_gradient],
-            "path_vanilla_sign_agreement": pathway_gradient_agreement,
+            "mean_local_gradient": mean_local_gradient,
+            "local_direction": [direction_label(g) for g in mean_local_gradient],
+            "path_local_sign_agreement": pathway_gradient_agreement,
             "mean_signed_ig_DO_NOT_USE_FOR_DIRECTION": scores.mean(axis=0),
         }
     )
@@ -1011,9 +1028,9 @@ def run(
         ranking_column = fallback_column
         ranking_description = fallback_description
 
-    if ranking_statistic == "vanilla_gradient_abs":
-        direction_column = "mean_vanilla_gradient"
-        direction_source = "vanilla_gradient"
+    if ranking_statistic == "local_gradient_abs":
+        direction_column = "mean_local_gradient"
+        direction_source = "local_gradient"
     elif ranking_statistic == "path_gradient_abs":
         direction_column = "mean_path_gradient"
         direction_source = "path_gradient"
@@ -1021,8 +1038,8 @@ def run(
         direction_column = "mean_path_gradient"
         direction_source = "path_gradient"
     else:
-        direction_column = "mean_vanilla_gradient"
-        direction_source = "vanilla_gradient"
+        direction_column = "mean_local_gradient"
+        direction_source = "local_gradient"
 
     table["mean_gradient"] = table[direction_column]
     table["direction"] = [direction_label(g) for g in table[direction_column]]
@@ -1066,10 +1083,11 @@ def run(
         symbols,
         ig_symbols,
         path_gradient_symbols,
-        vanilla_gradient_symbols,
+        local_gradient_symbols,
         output_dir,
+        primary_col=ranking_column,
         min_members=panel_min_members,
-        discovery_summed_abs=table["summed_abs_ig"].to_numpy(),
+        discovery_ranking_values=table[ranking_column].to_numpy(),
     )
 
     top_pathways = table["pathway"].head(top_n).tolist()
@@ -1086,10 +1104,10 @@ def run(
         pd.DataFrame(
             path_gradient_scores[:, order], index=patient_ids, columns=top_pathways
         ).to_csv(os.path.join(output_dir, "pathway_path_gradient_scores_matrix.csv"))
-    if vanilla_gradient_scores is not None:
+    if local_gradient_scores is not None:
         pd.DataFrame(
-            vanilla_gradient_scores[:, order], index=patient_ids, columns=top_pathways
-        ).to_csv(os.path.join(output_dir, "pathway_vanilla_gradient_scores_matrix.csv"))
+            local_gradient_scores[:, order], index=patient_ids, columns=top_pathways
+        ).to_csv(os.path.join(output_dir, "pathway_local_gradient_scores_matrix.csv"))
 
     # --- Layer B: member genes of the top pathways --------------------------------
     if write_member_genes:
@@ -1116,7 +1134,7 @@ def run(
             symbols,
             ig_symbols,
             path_gradient_symbols,
-            vanilla_gradient_symbols,
+            local_gradient_symbols,
             gene_details,
         )
         members.to_csv(os.path.join(output_dir, "pathway_member_genes.csv"), index=False)
@@ -1140,109 +1158,39 @@ def run(
 
     # --- Figures -------------------------------------------------------------------
     if write_figures:
-        expression_top = (
-            pathway_scores(expression_symbols, membership, sizes)[:, order]
-            if expression_symbols is not None
-            else None
+        ig_x_label = (
+            "Integrated-gradient attribution (per patient, baseline-relative; "
+            "+ = raises risk)"
         )
 
-        if vanilla_gradient_scores is not None:
-            vanilla_top = vanilla_gradient_scores[:, order]
-            for filename in (
-                "pathway_steyaert_vanilla_gradient_beeswarm.png",
-                "pathway_vanilla_gradient_beeswarm.png",
-            ):
-                plot_beeswarm(
-                    vanilla_top,
-                    top_pathways,
-                    os.path.join(output_dir, filename),
-                    top_n,
-                    xlabel=(
-                        "Mean vanilla gradient over normalized pathway gene inputs\n"
-                        "(per patient endpoint; positive = higher predicted risk)"
-                    ),
-                    title="Steyaert-style pathway gradients",
-                    color_scores=vanilla_top,
-                    color_label="Gradient value",
-                )
-
-        if path_gradient_scores is not None:
-            path_top = path_gradient_scores[:, order]
-            for filename in (
-                "pathway_steyaert_path_gradient_beeswarm.png",
-                "pathway_path_gradient_beeswarm.png",
-            ):
-                plot_beeswarm(
-                    path_top,
-                    top_pathways,
-                    os.path.join(output_dir, filename),
-                    top_n,
-                    xlabel=(
-                        "Mean path-averaged gradient over normalized pathway gene inputs\n"
-                        "(per patient; positive = higher predicted risk)"
-                    ),
-                    title="Pathway sensitivity by path-averaged gradients",
-                    color_scores=path_top,
-                    color_label="Gradient value",
-                )
-
-        plot_beeswarm(
-            scores[:, order],
-            top_pathways,
-            os.path.join(output_dir, "pathway_beeswarm.png"),
-            top_n,
-            xlabel=(
-                "Mean integrated-gradient attribution over pathway genes\n"
-                "(per patient; positive = pushes this patient's predicted risk up)"
-            ),
-            title="Baseline-aware pathway attribution for Steyaert-ranked pathways",
-            color_scores=scores[:, order],
-            color_label="IG attribution value",
-        )
-        plot_beeswarm(
-            scores[:, ig_order],
-            ig_top_pathways,
-            os.path.join(output_dir, "pathway_ig_magnitude_beeswarm.png"),
-            top_n,
-            xlabel=(
-                "Mean integrated-gradient attribution over pathway genes\n"
-                "(per patient; positive = pushes this patient's predicted risk up)"
-            ),
-            title="Top pathways by summed |IG| attribution",
-            color_scores=scores[:, ig_order],
-            color_label="IG attribution value",
-        )
-
-        if expression_top is not None:
+        # Gradient beeswarms, one per gradient flavour (local endpoint, path-averaged).
+        if local_gradient_scores is not None:
             plot_beeswarm(
-                scores[:, order],
+                local_gradient_scores[:, order],
                 top_pathways,
-                os.path.join(output_dir, "pathway_expression_colored_ig_beeswarm.png"),
+                os.path.join(output_dir, "pathway_local_gradient_beeswarm.png"),
                 top_n,
-                xlabel=(
-                    "Mean integrated-gradient attribution over pathway genes\n"
-                    "(per patient; positive = pushes this patient's predicted risk up)"
-                ),
-                title="Expression-coloured IG attribution for Steyaert-ranked pathways",
-                color_scores=expression_top,
-                color_label="Pathway mean expression (z)",
-                standardize_color_by_row=True,
-                center_color_at_zero=True,
-                color_limits=(-2, 2),
+                xlabel="Local gradient (per patient; + = raises predicted risk)",
+                title="Pathway local gradients",
+                color_scores=local_gradient_scores[:, order],
+                color_label="Mean local gradient over pathway genes",
+            )
+        if path_gradient_scores is not None:
+            plot_beeswarm(
+                path_gradient_scores[:, order],
+                top_pathways,
+                os.path.join(output_dir, "pathway_path_gradient_beeswarm.png"),
+                top_n,
+                xlabel="Path-averaged integrated gradient (per patient; + = raises risk)",
+                title="Pathway path-averaged gradients",
+                color_scores=path_gradient_scores[:, order],
+                color_label="Mean path-averaged gradient over pathway genes",
             )
 
-        # The two requested headline beeswarms: x = per-patient IG attribution (which is
-        # baseline-relative and carries the spread), coloured by the gradient DIRECTION --
-        # local (endpoint) gradient on one, path-averaged gradient on the other. The
-        # gradient is near-constant per patient, so each row's colour reads as that
-        # pathway's true risk direction (red = raises risk, blue = protective), which the
-        # baseline-relative IG x-position cannot show on its own.
-        ig_x_label = (
-            "Mean integrated-gradient attribution over pathway genes\n"
-            "(per patient, relative to the training-mean baseline; "
-            "positive = pushes this patient's predicted risk up)"
-        )
-        if vanilla_gradient_scores is not None:
+        # Headline IG beeswarms: x = per-patient IG (carries the spread), coloured by the
+        # gradient DIRECTION (local / path). The gradient is near-constant per patient, so
+        # each row's colour reads as that pathway's risk direction (red = raises risk).
+        if local_gradient_scores is not None:
             plot_beeswarm(
                 scores[:, order],
                 top_pathways,
@@ -1250,8 +1198,8 @@ def run(
                 top_n,
                 xlabel=ig_x_label,
                 title="IG attribution (x) coloured by local gradient (direction)",
-                color_scores=vanilla_gradient_scores[:, order],
-                color_label="Local gradient (direction: red = raises risk)",
+                color_scores=local_gradient_scores[:, order],
+                color_label="Mean local gradient over pathway genes\n(red = raises risk)",
             )
         if path_gradient_scores is not None:
             plot_beeswarm(
@@ -1260,9 +1208,46 @@ def run(
                 os.path.join(output_dir, "pathway_ig_beeswarm_path_gradient_color.png"),
                 top_n,
                 xlabel=ig_x_label,
-                title="IG attribution (x) coloured by path-integrated gradient (direction)",
+                title="IG attribution (x) coloured by path-averaged gradient (direction)",
                 color_scores=path_gradient_scores[:, order],
-                color_label="Path-integrated gradient (direction: red = raises risk)",
+                color_label="Mean path-averaged gradient over pathway genes\n(red = raises risk)",
+            )
+
+        # IG attribution coloured by its own value, and the |IG|-ranked ordering.
+        plot_beeswarm(
+            scores[:, order],
+            top_pathways,
+            os.path.join(output_dir, "pathway_ig_beeswarm.png"),
+            top_n,
+            xlabel=ig_x_label,
+            title="Baseline-aware IG attribution (top pathways)",
+            color_scores=scores[:, order],
+            color_label="Mean IG attribution over pathway genes",
+        )
+        plot_beeswarm(
+            scores[:, ig_order],
+            ig_top_pathways,
+            os.path.join(output_dir, "pathway_ig_magnitude_beeswarm.png"),
+            top_n,
+            xlabel=ig_x_label,
+            title="Top pathways by summed |IG| attribution",
+            color_scores=scores[:, ig_order],
+            color_label="Mean IG attribution over pathway genes",
+        )
+        if expression_symbols is not None:
+            expression_top = pathway_scores(expression_symbols, membership, sizes)[:, order]
+            plot_beeswarm(
+                scores[:, order],
+                top_pathways,
+                os.path.join(output_dir, "pathway_ig_beeswarm_expression_color.png"),
+                top_n,
+                xlabel=ig_x_label,
+                title="IG attribution (x) coloured by pathway expression",
+                color_scores=expression_top,
+                color_label="Mean expression over pathway genes (z)",
+                standardize_color_by_row=True,
+                center_color_at_zero=True,
+                color_limits=(-2, 2),
             )
 
         plot_direction(table, os.path.join(output_dir, "pathway_direction.png"), top_n)
@@ -1288,21 +1273,21 @@ def run(
         "n_patients": len(patient_ids),
         "analysis_bundle": ANALYSIS_BUNDLE_NAME if write_bundle else None,
         "attribution": {
-            "primary_method": "vanilla gradients",
+            "primary_method": "local gradients",
             "comparison_method": "path-averaged gradients",
             "ig_method": "integrated gradients",
             "baseline": "mean RNA-seq expression over the training split",
             "direction_statistic": f"cohort-mean {direction_source.replace('_', ' ')}",
             "direction_source": direction_source,
-            "local_comparison_statistic": "cohort-mean vanilla gradient",
+            "local_comparison_statistic": "cohort-mean local gradient",
             "ranking_statistic": ranking_statistic,
             "ranking_column": ranking_column,
             "ranking_description": ranking_description,
             "ig_magnitude_output": "pathway_ig_magnitude_scores.csv",
-            "primary_figure": "pathway_steyaert_vanilla_gradient_beeswarm.png",
-            "path_gradient_companion_figure": "pathway_steyaert_path_gradient_beeswarm.png",
+            "primary_figure": "pathway_local_gradient_beeswarm.png",
+            "path_gradient_companion_figure": "pathway_path_gradient_beeswarm.png",
             "note": (
-                "The primary pathway plot follows Steyaert et al. by using local "
+                "The primary pathway plot uses local endpoint gradients over Reactome "
                 "endpoint gradients and Reactome pathways. IG is exported separately "
                 "as a baseline-aware attribution magnitude layer. The sign of a "
                 "cohort-mean-baseline IG is patient-relative and should not be used "
@@ -1338,12 +1323,18 @@ def run(
     with open(os.path.join(output_dir, "run_metadata.json"), "w") as fh:
         json.dump(metadata, fh, indent=2)
 
-    log_summary(table, top_n, ranking_column, ranking_description)
+    log_summary(table, top_n, ranking_column, ranking_description, collections, output_dir)
     return table
 
 
-def log_summary(table, top_n, ranking_column, ranking_description):
+def log_summary(table, top_n, ranking_column, ranking_description, collections=None,
+                output_dir=None):
     logger.info("\n" + "=" * 92)
+    if collections is not None:
+        logger.info(
+            f"DISCOVERY RUN over {len(collections)} collection(s): {', '.join(collections)}"
+            + (f"  ->  {os.path.basename(str(output_dir))}" if output_dir else "")
+        )
     logger.info(f"TOP {top_n} PATHWAYS BY {ranking_column} ({ranking_description})")
     logger.info("=" * 92)
     logger.info(f"{'Rank':<5}{'Pathway':<58}{'RankVal':<10}{'Dir':<6}Genes")
@@ -1424,7 +1415,7 @@ def parse_args():
         default=",".join(DEFAULT_COLLECTIONS),
         help=(
             "Primary pathway collections. Defaults to Reactome only, matching "
-            "Steyaert et al.'s pathway-gradient figure."
+            "the reference paper's pathway-gradient figure."
         ),
     )
     parser.add_argument(
@@ -1444,10 +1435,10 @@ def parse_args():
     parser.add_argument(
         "--ranking-statistic",
         choices=sorted(RANKING_COLUMNS),
-        default="vanilla_gradient_abs",
+        default="local_gradient_abs",
         help=(
-            "Primary pathway ranking. Default is summed absolute vanilla gradients "
-            "to reproduce Steyaert-style local-gradient pathway ranking."
+            "Primary pathway ranking. Default is summed absolute local gradients "
+            "to reproduce the local-gradient pathway ranking."
         ),
     )
     parser.add_argument("--min-members", type=int, default=10,
