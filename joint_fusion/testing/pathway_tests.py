@@ -65,47 +65,78 @@ GPD_N_EXCEED = 250
 def _gpd_tail_pvalues(
     null, observed, exceed, min_exceed=GPD_MIN_EXCEED, n_exceed=GPD_N_EXCEED
 ):
-    """Peaks-over-threshold permutation p-values (Knijnenburg et al. 2009).
+    """Peaks-over-threshold permutation p-values (Knijnenburg et al. 2009), with an
+    exponential fallback for the bounded-support overshoot case.
 
     ``null`` is the (n_perm, n_pathways) null matrix, ``observed`` the per-pathway
     statistic, ``exceed`` the count of null draws >= observed. Where >= min_exceed draws
-    exceed the observed the empirical p is reliable and kept; otherwise (the floored
-    pathways) a GPD is fitted to the top n_exceed null values and its tail probability
-    used. By Pickands-Balkema-de Haan the threshold exceedances converge to a GPD for any
-    parent null, so no shape is assumed. A failed/degenerate fit falls back to the
-    floored empirical p.
+    exceed the observed the empirical p is reliable and kept; otherwise a GPD is fitted to
+    the top n_exceed null values and its tail probability used. By Pickands-Balkema-de
+    Haan the threshold exceedances converge to a GPD for any parent null, so no shape is
+    assumed.
+
+    ``summed |IG|`` is bounded above (a finite gene pool), so the fitted shape xi is
+    usually < 0 and the GPD has a *finite* upper endpoint -beta/xi. For the strongest
+    pathways the observed statistic lands beyond that endpoint, where ``genpareto.sf()``
+    returns exactly 0 -- not a real p, just the observation exceeding the estimated
+    support, whose location is high-variance. The old code floored that 0 to ~2.2e-308,
+    fabricating astronomical significance (pathways with near-identical z got p-values 300
+    orders of magnitude apart). Instead we refit the tail with the shape fixed to 0 (an
+    exponential, unbounded support): a deliberately conservative misspecification -- the
+    exponential is heavier than the true bounded tail, so the p is if anything too large,
+    never falsely tiny -- that always yields a finite positive probability.
+
+    Returns ``(p, method)`` where ``method[j]`` records how pathway j's p was obtained:
+    "empirical", "gpd", "gpd_exp" (overshoot -> exponential refit), or "gpd_degenerate"
+    (fit unusable -> empirical p kept).
     """
     n_perm = null.shape[0]
     p = (exceed + 1) / (n_perm + 1)  # empirical default for every pathway
+    method = np.array(["empirical"] * len(observed), dtype=object)
     if n_perm < 100:
         logger.warning(
             "GPD tail needs ~100+ permutations to populate the tail; "
             "falling back to empirical p-values."
         )
-        return p
+        return p, method
 
     n_tail = min(n_exceed, n_perm - 1)
     tiny = np.finfo(np.float64).tiny
     for j in np.flatnonzero(exceed < min_exceed):
         tail_sorted = np.sort(null[:, j])[-n_tail:]  # ascending top n_tail
         threshold = float(tail_sorted[0])
-        if float(observed[j]) <= threshold:
-            continue  # observed sits where the empirical p is already resolved
+        ex = float(observed[j]) - threshold
+        if ex <= 0:
+            continue  # observed sits inside the bulk; empirical p already resolves it
         excess = (tail_sorted - threshold).astype(np.float64)
+
+        tail_p, label = np.nan, None
         try:
             xi, _, beta = genpareto.fit(excess, floc=0.0)
-            if not (np.isfinite(xi) and np.isfinite(beta) and beta > 0):
-                continue
-            tail_p = float(
-                genpareto.sf(float(observed[j]) - threshold, xi, loc=0.0, scale=beta)
-            )
+            if np.isfinite(xi) and np.isfinite(beta) and beta > 0:
+                sf = float(genpareto.sf(ex, xi, loc=0.0, scale=beta))
+                if np.isfinite(sf) and sf > 0:
+                    tail_p, label = sf, "gpd"
         except Exception:
+            pass
+
+        # Overshoot (bounded xi<0 support -> sf==0) or a degenerate fit: refit as an
+        # exponential (shape fixed to 0). Its MLE scale is the mean excess, so
+        # sf(ex) = exp(-ex / mean_excess) -- always positive until float underflow.
+        if label is None:
+            beta0 = float(np.mean(excess))
+            if np.isfinite(beta0) and beta0 > 0:
+                sf = float(np.exp(-ex / beta0))
+                if np.isfinite(sf) and sf > 0:
+                    tail_p, label = sf, "gpd_exp"
+
+        if label is None:  # both fits unusable -> keep the empirical p already in p[j]
+            method[j] = "gpd_degenerate"
             continue
-        if not np.isfinite(tail_p):
-            continue
-        # tail_p == 0: observed beyond the bounded (xi<0) GPD support; floor final p > 0.
+
         p[j] = max((n_tail / n_perm) * tail_p, tiny)
-    return p
+        method[j] = label
+    return p, method
 
 
 def permutation_null(ig_symbols, membership, sizes, n_perm=1000, seed=0, tail="gpd"):
@@ -120,9 +151,12 @@ def permutation_null(ig_symbols, membership, sizes, n_perm=1000, seed=0, tail="g
                   as their only support was one calibration run, not a tail shape.
       "empirical" the raw floored p, no extrapolation.
 
-    Returns ``p_value`` (chosen tail) and ``p_empirical`` (always). ``z`` is a
-    size-corrected ranking effect size (log-space standardised observed vs null), not a
-    p-value; reported for any ``tail``.
+    Returns ``p_value`` (chosen tail) and ``p_empirical`` (always). ``tail`` is a
+    per-pathway array recording how each p was obtained ("empirical", "gpd", "gpd_exp",
+    or "gpd_degenerate"), so the output shows exactly which pathways the GPD extrapolated
+    and which used the exponential-overshoot fallback. ``z`` is a size-corrected ranking
+    effect size (log-space standardised observed vs null), not a p-value; reported for any
+    ``tail``.
     """
     observed = np.abs(pathway_scores(ig_symbols, membership, sizes)).sum(axis=0)
     if not np.isfinite(observed).all():
@@ -158,8 +192,9 @@ def permutation_null(ig_symbols, membership, sizes, n_perm=1000, seed=0, tail="g
 
     if tail == "empirical":
         p_value = p_empirical
+        tail_method = np.array(["empirical"] * n_pathways, dtype=object)
     elif tail == "gpd":
-        p_value = _gpd_tail_pvalues(null, observed, exceed)
+        p_value, tail_method = _gpd_tail_pvalues(null, observed, exceed)
     else:
         raise ValueError(f"Unknown tail model: {tail!r} (use 'gpd' or 'empirical').")
 
@@ -169,7 +204,7 @@ def permutation_null(ig_symbols, membership, sizes, n_perm=1000, seed=0, tail="g
         "z": z_scores,
         "p_value": p_value,
         "p_empirical": p_empirical,
-        "tail": tail,
+        "tail": tail_method,
     }
 
 
