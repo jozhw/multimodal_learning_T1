@@ -12,11 +12,11 @@ MSIGDB_DIR="assets/msigdb"
 
 # Discovery settings. The discovery universe is whatever collection the bundle was
 # built with (Reactome C2:CP by default in pathway_interpret.py).
-N_PERM=1000
+N_PERM=10000
 SEED=40
 TAIL="gpd"           # permutation tail below the empirical floor: gpd (default) or empirical
 ORA_TOP_N=100        # top genes per ORA list (magnitude / up / down)
-MIN_MEMBERS=10       # drop discovery sets with fewer than this many measured genes
+MIN_MEMBERS=15       # drop discovery sets with fewer than this many measured genes
 GSEA_THREADS=1
 # GSEA is computed with GSEApy; it must be installed in your active Python env
 # (set SKIP_GSEA=1 to run only the permutation stats + ORA).
