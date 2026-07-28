@@ -8,7 +8,10 @@ attribution matrices + membership); the known-LUAD panel additionally loads the 
 Medicus NSCLC modules from MSigDB, since it is scored outside the discovery universe.
 
 --tail sets how the permutation p is extrapolated below the empirical floor: gpd
-(default; Knijnenburg 2009 GPD hybrid, tail shape estimated from the data) or empirical.
+(default; peaks-over-threshold with the tail shape fixed to xi=0, i.e. the exponential
+member of the GPD family -- conservative under the statistic's bounded support and free of
+the free-shape MLE's endpoint ill-conditioning) or empirical (raw floored p, no
+extrapolation).
 
 Run (bare uses the fold-1 config's output folder; override with --dir or --bundle):
     python -m joint_fusion.testing.pathway_tests
@@ -19,7 +22,8 @@ Run (bare uses the fold-1 config's output folder; override with --dir or --bundl
 
     Outputs (written next to the bundle):
         pathway_permutation_stats.csv   per-pathway summed|IG|, perm_z, p, empirical p,
-                                        FDR, perm_tail (the tail model used)
+                                        FDR, perm_tail (the tail model used),
+                                        perm_gpd_shape (diagnostic free-shape GPD xi)
         pathway_scores_with_stats.csv   pathway_scores.csv + the permutation columns
                                         (only if pathway_scores.csv is present)
         gsea_prerank.csv                GSEApy prerank NES / p / FDR / leading edge
@@ -32,6 +36,7 @@ Run (bare uses the fold-1 config's output folder; override with --dir or --bundl
 import argparse
 import logging
 import os
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -56,8 +61,9 @@ logger = logging.getLogger(__name__)
 # Layer C: permutation null on the pathway statistic
 # ---------------------------------------------------------------------------
 
-# GPD tail (Knijnenburg 2009): keep the empirical p where >= GPD_MIN_EXCEED null draws
-# exceed the observed; otherwise fit a GPD to the top GPD_N_EXCEED null values.
+# Peaks-over-threshold tail (Knijnenburg 2009): keep the empirical p where
+# >= GPD_MIN_EXCEED null draws exceed the observed; otherwise extrapolate with a
+# fixed-shape (xi=0) exponential tail fitted to the top GPD_N_EXCEED null values.
 GPD_MIN_EXCEED = 10
 GPD_N_EXCEED = 250
 
@@ -65,40 +71,50 @@ GPD_N_EXCEED = 250
 def _gpd_tail_pvalues(
     null, observed, exceed, min_exceed=GPD_MIN_EXCEED, n_exceed=GPD_N_EXCEED
 ):
-    """Peaks-over-threshold permutation p-values (Knijnenburg et al. 2009), with an
-    exponential fallback for the bounded-support overshoot case.
+    """Peaks-over-threshold permutation p-values with the tail shape fixed to xi=0 (the
+    exponential member of the GPD family). See literature/gpd_permutation_derivation.tex.
 
     ``null`` is the (n_perm, n_pathways) null matrix, ``observed`` the per-pathway
     statistic, ``exceed`` the count of null draws >= observed. Where >= min_exceed draws
-    exceed the observed the empirical p is reliable and kept; otherwise a GPD is fitted to
-    the top n_exceed null values and its tail probability used. By Pickands-Balkema-de
-    Haan the threshold exceedances converge to a GPD for any parent null, so no shape is
-    assumed.
+    exceed the observed the empirical p is reliable and kept as-is. Otherwise the pathway
+    is below the empirical resolution floor 1/(n_perm+1) and we extrapolate its upper tail
+    from the top n_exceed null values, whose smallest sets the threshold u.
 
-    ``summed |IG|`` is bounded above (a finite gene pool), so the fitted shape xi is
-    usually < 0 and the GPD has a *finite* upper endpoint -beta/xi. For the strongest
-    pathways the observed statistic lands beyond that endpoint, where ``genpareto.sf()``
-    returns exactly 0 -- not a real p, just the observation exceeding the estimated
-    support, whose location is high-variance. The old code floored that 0 to ~2.2e-308,
-    fabricating astronomical significance (pathways with near-identical z got p-values 300
-    orders of magnitude apart). Instead we refit the tail with the shape fixed to 0 (an
-    exponential, unbounded support): a deliberately conservative misspecification -- the
-    exponential is heavier than the true bounded tail, so the p is if anything too large,
-    never falsely tiny -- that always yields a finite positive probability.
+    Why the exponential (xi=0), not the free-shape GPD. By Pickands-Balkema-de-Haan the
+    threshold exceedances converge to a GPD for any parent null; the summed-|IG| statistic
+    is a bounded sum over a finite gene pool, so its null has *bounded support* and hence a
+    light tail, xi <= 0. Two problems make the free-shape MLE xi unusable here:
+      * ill-conditioning -- for xi<0 the GPD has a finite endpoint u-beta/xi, and the tail
+        probability near that endpoint is pathologically sensitive to xi: a ~0.03 change in
+        an xi estimated from ~250 noisy draws moves the extrapolated p by tens of decades,
+        and the endpoint-overshoot case (observed beyond u-beta/xi) makes genpareto.sf
+        return exactly 0. This produced non-monotone, ~1e-300 "p-values".
+      * variance -- estimating a second tail parameter from a small exceedance sample is
+        high-variance regardless of conditioning.
+    Fixing xi=0 (exponential) is the boundary member of the same family. Under bounded
+    support (xi<=0) the exponential tail is the *heaviest admissible* tail, so its tail
+    probability is an upper bound on the truth -- the p is conservative (never falsely
+    tiny) -- while removing the shape-estimation variance and the endpoint cliff. Its MLE
+    scale is the mean excess, so sf(ex) = exp(-ex / mean_excess), always positive until
+    float underflow. The free-shape GPD is still fitted, but only as a *reported
+    diagnostic* (``shape``); it does not enter the p-value.
 
-    Returns ``(p, method)`` where ``method[j]`` records how pathway j's p was obtained:
-    "empirical", "gpd", "gpd_exp" (overshoot -> exponential refit), or "gpd_degenerate"
-    (fit unusable -> empirical p kept).
+    Returns ``(p, method, shape)`` where ``method[j]`` is how pathway j's p was obtained
+    ("empirical", "exponential", or "degenerate" -> exponential unusable, empirical kept)
+    and ``shape[j]`` is the diagnostic free-shape GPD xi for the extrapolated pathways
+    (NaN where the empirical p was kept). shape<0 across the extrapolated sets is the
+    empirical check on the bounded-support premise.
     """
     n_perm = null.shape[0]
     p = (exceed + 1) / (n_perm + 1)  # empirical default for every pathway
     method = np.array(["empirical"] * len(observed), dtype=object)
+    shape = np.full(len(observed), np.nan, dtype=float)
     if n_perm < 100:
         logger.warning(
-            "GPD tail needs ~100+ permutations to populate the tail; "
+            "Tail extrapolation needs ~100+ permutations to populate the tail; "
             "falling back to empirical p-values."
         )
-        return p, method
+        return p, method, shape
 
     n_tail = min(n_exceed, n_perm - 1)
     tiny = np.finfo(np.float64).tiny
@@ -110,59 +126,88 @@ def _gpd_tail_pvalues(
             continue  # observed sits inside the bulk; empirical p already resolves it
         excess = (tail_sorted - threshold).astype(np.float64)
 
-        tail_p, label = np.nan, None
+        # Free-shape GPD fit: reported diagnostic only (xi<0 supports bounded support).
         try:
-            xi, _, beta = genpareto.fit(excess, floc=0.0)
-            if np.isfinite(xi) and np.isfinite(beta) and beta > 0:
-                sf = float(genpareto.sf(ex, xi, loc=0.0, scale=beta))
-                if np.isfinite(sf) and sf > 0:
-                    tail_p, label = sf, "gpd"
+            xi, _, _ = genpareto.fit(excess, floc=0.0)
+            if np.isfinite(xi):
+                shape[j] = xi
         except Exception:
             pass
 
-        # Overshoot (bounded xi<0 support -> sf==0) or a degenerate fit: refit as an
-        # exponential (shape fixed to 0). Its MLE scale is the mean excess, so
-        # sf(ex) = exp(-ex / mean_excess) -- always positive until float underflow.
-        if label is None:
-            beta0 = float(np.mean(excess))
-            if np.isfinite(beta0) and beta0 > 0:
-                sf = float(np.exp(-ex / beta0))
-                if np.isfinite(sf) and sf > 0:
-                    tail_p, label = sf, "gpd_exp"
+        # Exponential (xi=0) tail probability -- the value actually used. MLE scale =
+        # mean excess; conservative under bounded support and free of the endpoint cliff.
+        beta0 = float(np.mean(excess))
+        if np.isfinite(beta0) and beta0 > 0:
+            sf = float(np.exp(-ex / beta0))
+            if np.isfinite(sf) and sf > 0:
+                p[j] = max((n_tail / n_perm) * sf, tiny)
+                method[j] = "exponential"
+                continue
 
-        if label is None:  # both fits unusable -> keep the empirical p already in p[j]
-            method[j] = "gpd_degenerate"
-            continue
-
-        p[j] = max((n_tail / n_perm) * tail_p, tiny)
-        method[j] = label
-    return p, method
+        method[j] = "degenerate"  # exponential unusable -> keep the empirical p in p[j]
+    return p, method, shape
 
 
-def permutation_null(ig_symbols, membership, sizes, n_perm=1000, seed=0, tail="gpd"):
+# ---------------------------------------------------------------------------
+# Parallel permutation workers (module level so ProcessPoolExecutor can pickle them).
+# Each worker holds the read-only IG/membership/sizes arrays in a module global (shipped
+# once at pool start) and computes a batch of independent permutations.
+# ---------------------------------------------------------------------------
+_PERM_ARRAYS = {}
+
+
+def _perm_worker_init(ig, membership, sizes):
+    _PERM_ARRAYS["ig"] = ig
+    _PERM_ARRAYS["membership"] = membership
+    _PERM_ARRAYS["sizes"] = sizes
+
+
+def _perm_worker_chunk(seed_seqs):
+    ig = _PERM_ARRAYS["ig"]
+    membership = _PERM_ARRAYS["membership"]
+    sizes = _PERM_ARRAYS["sizes"]
+    n_genes = membership.shape[1]
+    out = np.empty((len(seed_seqs), membership.shape[0]), dtype=np.float32)
+    for k, ss in enumerate(seed_seqs):
+        rng = np.random.default_rng(ss)
+        permuted = membership[:, rng.permutation(n_genes)]
+        out[k] = np.abs(pathway_scores(ig, permuted, sizes)).sum(axis=0)
+    return out
+
+
+def permutation_null(
+    ig_symbols, membership, sizes, n_perm=1000, seed=0, tail="gpd", n_jobs=1
+):
     """Is a pathway's summed |mean IG| bigger than a size-matched random set? Shuffle
     gene labels (each set keeps its size) n_perm times and recompute.
+
+    ``n_jobs`` parallelises the (independent) permutations across processes: 1 = serial,
+    -1 = all cores, N = N workers. A per-permutation RNG stream (SeedSequence.spawn) makes
+    the null identical for a given seed regardless of worker count -- but it differs from
+    the pre-parallel single-stream draws, so p-values shift slightly (within Monte-Carlo
+    error) on the first run after this change, then stay reproducible.
 
     The empirical p is floored at 1/(n_perm+1), which sits above the BH threshold once
     ~1e3 sets are tested, so alone it calls everything non-significant. ``tail`` sets the
     extrapolation below that floor:
-      "gpd"       (default) Knijnenburg 2009 hybrid; the tail shape is estimated from the
-                  data (GPD), not assumed. Parametric fits (log-normal/gamma) were dropped
-                  as their only support was one calibration run, not a tail shape.
+      "gpd"       (default) peaks-over-threshold extrapolation with the tail shape fixed to
+                  xi=0 (the exponential member of the GPD family). Conservative under the
+                  statistic's bounded support and free of the free-shape MLE's endpoint
+                  ill-conditioning; see _gpd_tail_pvalues and
+                  literature/gpd_permutation_derivation.tex. (The flag value stays "gpd"
+                  for back-compatibility; the free-shape xi is reported as a diagnostic.)
       "empirical" the raw floored p, no extrapolation.
 
     Returns ``p_value`` (chosen tail) and ``p_empirical`` (always). ``tail`` is a
-    per-pathway array recording how each p was obtained ("empirical", "gpd", "gpd_exp",
-    or "gpd_degenerate"), so the output shows exactly which pathways the GPD extrapolated
-    and which used the exponential-overshoot fallback. ``z`` is a size-corrected ranking
-    effect size (log-space standardised observed vs null), not a p-value; reported for any
-    ``tail``.
+    per-pathway array recording how each p was obtained ("empirical", "exponential", or
+    "degenerate"), and ``shape`` the diagnostic free-shape GPD xi on the extrapolated
+    pathways (NaN elsewhere). ``z`` is a size-corrected ranking effect size (log-space
+    standardised observed vs null), not a p-value; reported for any ``tail``.
     """
     observed = np.abs(pathway_scores(ig_symbols, membership, sizes)).sum(axis=0)
     if not np.isfinite(observed).all():
         raise ValueError("Non-finite pathway score; check the IG arrays for NaN/Inf.")
 
-    rng = np.random.default_rng(seed)
     n_genes = ig_symbols.shape[1]
     n_pathways = len(sizes)
 
@@ -171,13 +216,57 @@ def permutation_null(ig_symbols, membership, sizes, n_perm=1000, seed=0, tail="g
     sizes32 = sizes.astype(np.float32)
     observed32 = observed.astype(np.float32)
 
+    # One independent RNG stream per permutation -> the null is identical whether run
+    # serially or across any number of workers.
+    seed_seqs = np.random.SeedSequence(seed).spawn(n_perm)
+
     # Full null so empirical and GPD tails read the same draws (~8 MB at 1000 x 1900).
-    null = np.empty((n_perm, n_pathways), dtype=np.float32)
-    for i in range(n_perm):
-        permuted = membership32[:, rng.permutation(n_genes)]
-        null[i] = np.abs(pathway_scores(ig32, permuted, sizes32)).sum(axis=0)
-        if (i + 1) % 200 == 0:
-            logger.info(f"  pathway permutation {i + 1}/{n_perm}")
+    if n_jobs in (None, 0, 1):
+        null = np.empty((n_perm, n_pathways), dtype=np.float32)
+        for i in range(n_perm):
+            rng = np.random.default_rng(seed_seqs[i])
+            permuted = membership32[:, rng.permutation(n_genes)]
+            null[i] = np.abs(pathway_scores(ig32, permuted, sizes32)).sum(axis=0)
+            if (i + 1) % 200 == 0:
+                logger.info(f"  pathway permutation {i + 1}/{n_perm}")
+    else:
+        n_cores = os.cpu_count() or 1
+        workers = n_cores if n_jobs < 0 else min(n_jobs, n_cores)
+        chunk = max(1, n_perm // (workers * 4))
+        batches = [seed_seqs[i : i + chunk] for i in range(0, n_perm, chunk)]
+        logger.info(
+            f"  permuting with {workers} workers "
+            f"({len(batches)} batches of ~{chunk}, n_perm={n_perm})"
+        )
+        # Pin BLAS to one thread per worker. Each permutation is one large matmul that
+        # BLAS already multithreads across all cores, so the *serial* path is already
+        # core-parallel. Without pinning, W workers x (BLAS threads each) oversubscribe
+        # the cores and the parallel run is SEVERAL TIMES SLOWER than serial. Set before
+        # the pool is created so spawned workers inherit it at their numpy import.
+        thread_vars = (
+            "OMP_NUM_THREADS",
+            "OPENBLAS_NUM_THREADS",
+            "MKL_NUM_THREADS",
+            "VECLIB_MAXIMUM_THREADS",
+            "NUMEXPR_NUM_THREADS",
+        )
+        saved = {k: os.environ.get(k) for k in thread_vars}
+        for k in thread_vars:
+            os.environ[k] = "1"
+        try:
+            with ProcessPoolExecutor(
+                max_workers=workers,
+                initializer=_perm_worker_init,
+                initargs=(ig32, membership32, sizes32),
+            ) as ex:
+                parts = list(ex.map(_perm_worker_chunk, batches))
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        null = np.vstack(parts)
 
     null_mean = null.mean(axis=0, dtype=np.float64)
     exceed = (null >= observed32).sum(axis=0)
@@ -193,8 +282,9 @@ def permutation_null(ig_symbols, membership, sizes, n_perm=1000, seed=0, tail="g
     if tail == "empirical":
         p_value = p_empirical
         tail_method = np.array(["empirical"] * n_pathways, dtype=object)
+        tail_shape = np.full(n_pathways, np.nan, dtype=float)
     elif tail == "gpd":
-        p_value, tail_method = _gpd_tail_pvalues(null, observed, exceed)
+        p_value, tail_method, tail_shape = _gpd_tail_pvalues(null, observed, exceed)
     else:
         raise ValueError(f"Unknown tail model: {tail!r} (use 'gpd' or 'empirical').")
 
@@ -205,6 +295,7 @@ def permutation_null(ig_symbols, membership, sizes, n_perm=1000, seed=0, tail="g
         "p_value": p_value,
         "p_empirical": p_empirical,
         "tail": tail_method,
+        "shape": tail_shape,
     }
 
 
@@ -220,6 +311,31 @@ def benjamini_hochberg(p_values):
     if finite.any():
         q[finite] = multipletests(p[finite], method="fdr_bh")[1]
     return q
+
+
+def _bh_adjust_with_m(p_values, m):
+    """Benjamini-Hochberg where the correction denominator is ``m`` -- the number of tests
+    actually performed -- which may exceed ``len(p_values)``.
+
+    ORA reports only the gene sets that overlap the hit list, but every size-eligible set
+    was *tested* (the non-overlapping ones simply have p = 1). Correcting over the reported
+    subset alone undercounts the tests and makes q anti-conservative; the honest denominator
+    is the eligible-set count. Because the omitted sets all have p = 1 (the largest possible
+    value) they occupy the top ranks and never lower another set's q, so passing ``m`` here
+    is exactly equivalent to running BH over the full eligible set.
+    """
+    p = np.asarray(p_values, dtype=float)
+    n = len(p)
+    if n == 0:
+        return p
+    order = np.argsort(p)
+    ranked = p[order]
+    q = ranked * m / np.arange(1, n + 1)
+    q = np.minimum.accumulate(q[::-1])[::-1]
+    q = np.clip(q, 0.0, 1.0)
+    out = np.empty(n, dtype=float)
+    out[order] = q
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -352,13 +468,15 @@ def over_representation(hits, gene_sets, background, min_members=10):
     hit_set = set(hits)
 
     rows = []
+    n_eligible = 0  # every size-eligible set is a test, whether or not it overlaps
     for name, members in sorted(gene_sets.items()):
         in_universe = members & background
         if len(in_universe) < min_members:
             continue
+        n_eligible += 1
         overlap = hit_set & in_universe
         if not overlap:
-            continue
+            continue  # p would be 1.0; kept out of the table but counted in n_eligible
         p = hypergeom.sf(len(overlap) - 1, universe, len(in_universe), n_drawn)
         expected = n_drawn * len(in_universe) / universe
         rows.append(
@@ -368,6 +486,7 @@ def over_representation(hits, gene_sets, background, min_members=10):
                 "pathway_size_K": len(in_universe),
                 "list_size_n": n_drawn,
                 "universe_N": universe,
+                "n_tests": n_eligible,  # BH denominator (filled after the loop)
                 "fold_enrichment": len(overlap) / expected if expected else np.nan,
                 "p_value": p,
                 "overlap_genes": ";".join(sorted(overlap)),
@@ -378,7 +497,9 @@ def over_representation(hits, gene_sets, background, min_members=10):
         return pd.DataFrame()
 
     table = pd.DataFrame(rows)
-    table["fdr_q"] = benjamini_hochberg(table["p_value"].to_numpy())
+    table["n_tests"] = n_eligible
+    # BH over ALL size-eligible sets, not just the overlapping ones that made the table.
+    table["fdr_q"] = _bh_adjust_with_m(table["p_value"].to_numpy(), n_eligible)
     return table.sort_values("fdr_q", ignore_index=True)
 
 
@@ -481,17 +602,34 @@ def known_luad_panel_membership(symbols, msigdb_dir=MSIGDB_DIR, min_members=3):
 
 
 def bootstrap_panel_scores(
-    ig_scores, path_gradient_scores=None, n_boot=2000, seed=0, ci_level=0.95
+    ig_scores, path_gradient_scores=None, n_boot=2000, seed=0, ci_level=0.95,
+    boot_batch=512,
 ):
     """Patient bootstrap CIs for panel effect-size summaries.
 
     Complements the permutation test's competitive p-value: measures how stable the panel
-    score is across the patient cohort.
+    score is across the patient cohort. Note this is the bootstrap, NOT the permutation
+    null -- it resamples patients with replacement and reports percentile CIs, and does
+    not use the exponential/GPD tail model (that is permutation-only; see
+    ``permutation_null`` and ``_gpd_tail_pvalues``).
+
+    Vectorised: the per-resample means are computed with NumPy fancy-indexing over batches
+    of ``boot_batch`` resamples at a time rather than in a Python loop, so the arithmetic
+    runs in compiled/SIMD array code over the whole cohort at once. The draws are
+    *identical* to the equivalent serial loop for a given ``seed`` -- ``rng.integers`` fills
+    the (batch, n_patients) block row-major, so each row is exactly one loop iteration's
+    resample -- so the CIs are unchanged bit-for-bit; only the wall-clock differs.
+    Batching bounds peak memory to ``boot_batch * n_patients * n_pathways`` floats; the
+    panel is small (~15 modules), a few MB even at ``n_boot=2000``. (Process-level
+    parallelism is unwarranted here: this is elementwise abs/mean, not the large matmul the
+    permutation null runs, and the panel work completes well under a second.)
     """
     if n_boot < 1:
         raise ValueError("n_boot must be at least 1.")
     if not 0 < ci_level < 1:
         raise ValueError("ci_level must be between 0 and 1.")
+    if boot_batch < 1:
+        raise ValueError("boot_batch must be at least 1.")
 
     rng = np.random.default_rng(seed)
     n_patients, n_pathways = ig_scores.shape
@@ -504,11 +642,13 @@ def bootstrap_panel_scores(
         else None
     )
 
-    for i in range(n_boot):
-        idx = rng.integers(0, n_patients, size=n_patients)
-        boot_mean_abs_ig[i] = np.abs(ig_scores[idx]).mean(axis=0)
+    for start in range(0, n_boot, boot_batch):
+        b = min(boot_batch, n_boot - start)
+        # (b, n_patients) resample indices; row-major fill == b consecutive serial draws.
+        idx = rng.integers(0, n_patients, size=(b, n_patients))
+        boot_mean_abs_ig[start : start + b] = np.abs(ig_scores[idx]).mean(axis=1)
         if path_gradient_scores is not None:
-            boot_mean_gradient[i] = path_gradient_scores[idx].mean(axis=0)
+            boot_mean_gradient[start : start + b] = path_gradient_scores[idx].mean(axis=1)
 
     out = {
         "mean_abs_ig_boot_mean": boot_mean_abs_ig.mean(axis=0),
@@ -543,6 +683,7 @@ def run_known_luad_panel(
     skip_gsea=False,
     gsea_threads=1,
     tail="gpd",
+    n_jobs=1,
 ):
     """Targeted evidence layer for the pre-specified KEGG NSCLC driver panel."""
     ig_symbols = bundle["ig_symbols"]
@@ -562,7 +703,9 @@ def run_known_luad_panel(
         f"Known LUAD/NSCLC panel permutation for {len(names)} scored modules "
         f"({n_perm} permutations)"
     )
-    null = permutation_null(ig_symbols, membership, sizes, n_perm, seed, tail=tail)
+    null = permutation_null(
+        ig_symbols, membership, sizes, n_perm, seed, tail=tail, n_jobs=n_jobs
+    )
     ig_scores = pathway_scores(ig_symbols, membership, sizes)
     path_scores = (
         pathway_scores(path_gradient_symbols, membership, sizes)
@@ -589,6 +732,7 @@ def run_known_luad_panel(
             "perm_p_empirical": null["p_empirical"],
             "perm_fdr_q": benjamini_hochberg(null["p_value"]),
             "perm_tail": null["tail"],
+            "perm_gpd_shape": null["shape"],
             "mean_path_gradient": (
                 path_scores.mean(axis=0)
                 if path_scores is not None
@@ -659,6 +803,7 @@ def run_layer_c(
     skip_known_luad=False,
     gsea_threads=1,
     tail="gpd",
+    n_jobs=1,
 ):
     ig_symbols = bundle["ig_symbols"]
     path_gradient_symbols = bundle["path_gradient_symbols"]
@@ -671,7 +816,9 @@ def run_layer_c(
 
     # 1. Permutation null on the paper's own pathway statistic.
     logger.info(f"Permutation null for {len(names)} pathways ({n_perm} permutations)")
-    null = permutation_null(ig_symbols, membership, sizes, n_perm, seed, tail=tail)
+    null = permutation_null(
+        ig_symbols, membership, sizes, n_perm, seed, tail=tail, n_jobs=n_jobs
+    )
     stats = pd.DataFrame(
         {
             "pathway": names,
@@ -684,6 +831,7 @@ def run_layer_c(
             "perm_p_empirical": null["p_empirical"],
             "perm_fdr_q": benjamini_hochberg(null["p_value"]),
             "perm_tail": null["tail"],
+            "perm_gpd_shape": null["shape"],
         }
     ).sort_values("summed_abs_ig", ascending=False, ignore_index=True)
     stats_path = os.path.join(output_dir, "pathway_permutation_stats.csv")
@@ -701,6 +849,7 @@ def run_layer_c(
             "perm_p_empirical",
             "perm_fdr_q",
             "perm_tail",
+            "perm_gpd_shape",
         ]
         base = base.drop(
             columns=[c for c in stat_cols if c in base.columns], errors="ignore"
@@ -768,6 +917,7 @@ def run_layer_c(
                 skip_gsea=skip_gsea,
                 gsea_threads=gsea_threads,
                 tail=tail,
+                n_jobs=n_jobs,
             )
         except FileNotFoundError as e:
             logger.warning(f"Known LUAD panel skipped: {e}")
@@ -817,9 +967,10 @@ def main():
         choices=("gpd", "empirical"),
         default="gpd",
         help="Tail model for the permutation p-value below the empirical floor. "
-        "gpd (default) is the Knijnenburg 2009 Generalized-Pareto hybrid, which estimates "
-        "the tail shape from the data (no parametric assumption); empirical is the "
-        "floored ground-truth p, kept for comparison.",
+        "gpd (default) is the peaks-over-threshold extrapolation with the tail shape fixed "
+        "to xi=0 (the exponential member of the GPD family): conservative under the "
+        "statistic's bounded support and free of the free-shape MLE's endpoint "
+        "ill-conditioning. empirical is the floored ground-truth p, kept for comparison.",
     )
     parser.add_argument(
         "--n-boot",
@@ -853,6 +1004,18 @@ def main():
         type=int,
         default=1,
         help="Worker threads passed to GSEApy prerank.",
+    )
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help="Processes for the permutation null (each permutation is independent). "
+        "1 = serial (default), -1 = all cores, N = N workers. Note the serial default is "
+        "ALREADY core-parallel: each permutation is one large matmul that BLAS "
+        "multithreads across all cores, so serial is typically as fast as (or faster "
+        "than) multiprocessing here. --jobs auto-pins BLAS to one thread per worker to "
+        "avoid oversubscription; it is worth setting only if numpy is linked against a "
+        "single-threaded BLAS.",
     )
     parser.add_argument("--skip-gsea", action="store_true")
     parser.add_argument(
@@ -890,6 +1053,7 @@ def main():
             skip_gsea=opt.skip_gsea,
             gsea_threads=opt.gsea_threads,
             tail=opt.tail,
+            n_jobs=opt.jobs,
         )
         logger.info(
             "\nDone. See known_luad_panel_stats.csv and, unless skipped, "
@@ -911,6 +1075,7 @@ def main():
             skip_known_luad=opt.skip_known_luad,
             gsea_threads=opt.gsea_threads,
             tail=opt.tail,
+            n_jobs=opt.jobs,
         )
         logger.info(
             "\nDone. See pathway_scores_with_stats.csv, gsea_prerank.csv, "
