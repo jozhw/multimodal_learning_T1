@@ -53,13 +53,12 @@ PY
 # presets:
 #   qsub joint_fusion/run/qsub_discovery_hallmark.sh    # Hallmark named driver buckets
 #   qsub joint_fusion/run/qsub_discovery_c6.sh          # C6 oncogenic signatures
-# BUILD_BUNDLE=1 builds the shared, collection-independent gene bundle first -- REQUIRED the
-# first time (the tests read gene_attribution_bundle.npz and rebuild membership per
-# collection). Once the gene bundle exists, any collection's tests reuse it, so omit
-# BUILD_BUNDLE. JOBS / GSEA_THREADS / NCORES / SKIP_GSEA are overridable by exporting them.
+# Like those two, this preset always BUILDS then TESTS: run_interpret_pathway.sh writes this
+# collection's scores/figures + the shared collection-independent gene bundle, then
+# run_discovery_pathway_tests.sh runs perm/GSEA/ORA. All three presets are symmetric -- no
+# BUILD_BUNDLE flag. JOBS / GSEA_THREADS / NCORES / SKIP_GSEA are overridable by exporting.
+# (The presets all rewrite the shared gene bundle, so run them SEQUENTIALLY, not at once.)
 export COLLECTIONS="${COLLECTIONS:-c2.cp.reactome}"
 export OUT_NAME="${OUT_NAME:-pathway_interpret_reactome}"
-if [[ "${BUILD_BUNDLE:-0}" == "1" ]]; then
-  ./joint_fusion/run/run_interpret_pathway.sh
-fi
+./joint_fusion/run/run_interpret_pathway.sh
 ./joint_fusion/run/run_discovery_pathway_tests.sh

@@ -23,8 +23,15 @@ PATHWAY_DIR="${PATHWAY_DIR:-$CKPT_BASE/$OUT_NAME}"
 # The gene bundle is shared across collections (written to CKPT_BASE by pathway_interpret).
 GENE_BUNDLE="${GENE_BUNDLE:-$CKPT_BASE/gene_attribution_bundle.npz}"
 
+# Cores this job may use. sched_getaffinity respects PBS cpu-binding on Linux/Polaris;
+# falls back to the logical CPU count elsewhere. Override by exporting NCORES.
 NCORES="${NCORES:-$(python -c 'import os; print(len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 4))' 2>/dev/null || echo 4)}"
 
+# The PERMUTATION null is one large matmul per iteration; numpy's BLAS parallelises it
+# across cores automatically -- so "run the permutation on all cores" needs nothing more
+# than letting BLAS see them. Setting the thread caps to $NCORES does exactly that (and
+# guards against an HPC module env that pins them to 1, which would force it single-
+# threaded). No --jobs / process pool is needed on a normal multithreaded BLAS.
 export OMP_NUM_THREADS="$NCORES" OPENBLAS_NUM_THREADS="$NCORES" MKL_NUM_THREADS="$NCORES"
 export VECLIB_MAXIMUM_THREADS="$NCORES" NUMEXPR_NUM_THREADS="$NCORES"
 
@@ -42,6 +49,14 @@ MIN_MEMBERS="${MIN_MEMBERS:-10}"
 
 # GSEA is computed with GSEApy; it must be installed in your active Python env
 # (set SKIP_GSEA=1 to run only the permutation stats + ORA). Unlike the permutation,
+# GSEApy prerank is genuinely single-threaded unless told otherwise and is the longest
+# step at N_PERM=10000, so give it all the cores too. Override with GSEA_THREADS.
+GSEA_THREADS="${GSEA_THREADS:-$NCORES}"
+
+# --jobs (process parallelism for the permutation) is NOT used by default: the BLAS
+# threading set above already runs the permutation on every core and is the fast path.
+# It is only worth setting on a single-threaded BLAS build -- then submit with e.g.
+#   JOBS=-1 qsub joint_fusion/run/qsub_discovery_pathway_tests.sh   (or JOBS=$NCORES).
 
 # Set to 1 to skip GSEA (permutation stats + ORA only).
 SKIP_GSEA=0
@@ -79,6 +94,7 @@ if [[ "$SKIP_KNOWN_LUAD" == "1" ]]; then
   ARGS+=(--skip-known-luad)
 fi
 
+# Opt-in process parallelism (single-threaded-BLAS fallback only): JOBS=-1 qsub ...
 if [[ -n "${JOBS:-}" ]]; then
   ARGS+=(--jobs "$JOBS")
 fi
