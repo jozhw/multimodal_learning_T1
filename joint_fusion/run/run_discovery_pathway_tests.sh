@@ -43,9 +43,11 @@ NCORES="${NCORES:-$(python -c 'import os; print(os.cpu_count() or 8)' 2>/dev/nul
 
 # Discovery settings. The discovery universe is whatever collection the bundle was
 # built with (Reactome C2:CP by default in pathway_interpret.py).
-N_PERM=10000
-SEED=40
-TAIL="gpd"           # permutation tail below the empirical floor: gpd (default) or empirical
+# N_PERM is overridable: e.g. N_PERM=1000 for a fast first pass (10x cheaper); 10000 is the
+# documented run. The GPD tail still works at 1000 (empirical floor 1/1001, then extrapolated).
+N_PERM="${N_PERM:-10000}"
+SEED="${SEED:-40}"
+TAIL="${TAIL:-exponential}"  # tail below the empirical floor: exponential (default, xi=0) or empirical
 ORA_TOP_N=100                       # top genes per ORA list (magnitude / up / down)
 # Size floor for the WHOLE tested family (perm / GSEA / ORA), since membership is now
 # rebuilt at test time. 10 matches the documented Reactome discovery (1,118 sets; see

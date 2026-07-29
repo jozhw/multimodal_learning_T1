@@ -8,11 +8,12 @@ writing their p-values / FDR / leading-edge tables. Because membership is rebuil
 time, ONE gene bundle serves every collection (Reactome, Hallmark, C6, ...); run one
 collection per invocation so each keeps its own FDR family (do not pool).
 
---tail sets how the permutation p is extrapolated below the empirical floor: gpd
-(default; peaks-over-threshold with the tail shape fixed to xi=0, i.e. the exponential
+--tail sets how the permutation p is extrapolated below the empirical floor: exponential
+(default; peaks-over-threshold with the tail shape FIXED at xi=0, i.e. the exponential
 member of the GPD family -- conservative under the statistic's bounded support and free of
 the free-shape MLE's endpoint ill-conditioning) or empirical (raw floored p, no
-extrapolation).
+extrapolation). The free-shape GPD xi is reported only as a diagnostic (perm_gpd_shape).
+("gpd" is accepted as a legacy alias for "exponential".)
 
 Run (bare uses the fold-1 config's output folder; --out-dir sets the per-collection folder,
 --gene-bundle the shared bundle, --collections which universe):
@@ -23,8 +24,10 @@ Run (bare uses the fold-1 config's output folder; --out-dir sets the per-collect
     python -m joint_fusion.testing.pathway_tests --tail empirical   # floored ground truth
 
     Outputs (written to --out-dir):
-        pathway_permutation_stats.csv   per-pathway summed|IG|, perm_z, p, empirical p,
-                                        FDR, perm_tail (the tail model used),
+        pathway_permutation_stats.csv   per-pathway summed|IG|, perm_z, perm_p_value (the
+                                        chosen p), perm_p_empirical, perm_p_exponential
+                                        (both reported side by side), FDR, perm_tail (which
+                                        one was chosen: empirical/exponential/degenerate),
                                         perm_gpd_shape (diagnostic free-shape GPD xi)
         pathway_scores_with_stats.csv   pathway_scores.csv + the permutation columns
                                         (only if pathway_scores.csv is present)
@@ -99,14 +102,25 @@ def _gpd_tail_pvalues(
     float underflow. The free-shape GPD is still fitted, but only as a *reported
     diagnostic* (``shape``); it does not enter the p-value.
 
-    Returns ``(p, method, shape)`` where ``method[j]`` is how pathway j's p was obtained
-    ("empirical", "exponential", or "degenerate" -> exponential unusable, empirical kept)
-    and ``shape[j]`` is the diagnostic free-shape GPD xi for the extrapolated pathways
-    (NaN where the empirical p was kept). shape<0 across the extrapolated sets is the
-    empirical check on the bounded-support premise.
+    Returns ``(p, method, shape, p_exp)`` where:
+      ``p[j]``      is the CHOSEN p -- empirical where >= min_exceed draws exceed the
+                    observed, else the exponential extrapolation (or empirical if the
+                    exponential is unusable).
+      ``method[j]`` is how ``p[j]`` was obtained ("empirical", "exponential", or
+                    "degenerate" -> exponential unusable, empirical kept).
+      ``shape[j]``  is the diagnostic free-shape GPD xi for the extrapolated (below-floor)
+                    pathways (NaN elsewhere); xi<0 across those sets checks the
+                    bounded-support premise.
+      ``p_exp[j]``  is the pure exponential-tail p for EVERY pathway whose observed exceeds
+                    its 75%-point threshold u (NaN where the observed sits within the bulk,
+                    so the exponential tail is undefined). This is reported alongside the
+                    empirical p so the two can be compared throughout the table -- above the
+                    floor, agreement of p_exp with the (reliable) empirical p validates the
+                    extrapolation model.
     """
     n_perm = null.shape[0]
-    p = (exceed + 1) / (n_perm + 1)  # empirical default for every pathway
+    p = (exceed + 1) / (n_perm + 1)  # empirical default (chosen p) for every pathway
+    p_exp = np.full(len(observed), np.nan, dtype=float)
     method = np.array(["empirical"] * len(observed), dtype=object)
     shape = np.full(len(observed), np.nan, dtype=float)
     if n_perm < 100:
@@ -114,38 +128,43 @@ def _gpd_tail_pvalues(
             "Tail extrapolation needs ~100+ permutations to populate the tail; "
             "falling back to empirical p-values."
         )
-        return p, method, shape
+        return p, method, shape, p_exp
 
     n_tail = min(n_exceed, n_perm - 1)
     tiny = np.finfo(np.float64).tiny
-    for j in np.flatnonzero(exceed < min_exceed):
+    for j in range(len(observed)):
         tail_sorted = np.sort(null[:, j])[-n_tail:]  # ascending top n_tail
         threshold = float(tail_sorted[0])
         ex = float(observed[j]) - threshold
         if ex <= 0:
-            continue  # observed sits inside the bulk; empirical p already resolves it
+            continue  # observed sits within the bulk (<= u); exponential tail undefined
         excess = (tail_sorted - threshold).astype(np.float64)
 
-        # Free-shape GPD fit: reported diagnostic only (xi<0 supports bounded support).
-        try:
-            xi, _, _ = genpareto.fit(excess, floc=0.0)
-            if np.isfinite(xi):
-                shape[j] = xi
-        except Exception:
-            pass
-
-        # Exponential (xi=0) tail probability -- the value actually used. MLE scale =
-        # mean excess; conservative under bounded support and free of the endpoint cliff.
+        # Exponential (xi=0) tail probability. MLE scale = mean excess; conservative under
+        # bounded support and free of the endpoint cliff. Computed for EVERY pathway with
+        # observed > u so p_exp populates the whole table, not just the below-floor sets.
         beta0 = float(np.mean(excess))
         if np.isfinite(beta0) and beta0 > 0:
             sf = float(np.exp(-ex / beta0))
             if np.isfinite(sf) and sf > 0:
-                p[j] = max((n_tail / n_perm) * sf, tiny)
-                method[j] = "exponential"
-                continue
+                p_exp[j] = max((n_tail / n_perm) * sf, tiny)
 
-        method[j] = "degenerate"  # exponential unusable -> keep the empirical p in p[j]
-    return p, method, shape
+        # Below the empirical floor the exponential becomes the CHOSEN p, and the free-shape
+        # GPD xi is fitted as a diagnostic (only here -- the fit is slow and only needed to
+        # check bounded support on the extrapolated sets).
+        if exceed[j] < min_exceed:
+            try:
+                xi, _, _ = genpareto.fit(excess, floc=0.0)
+                if np.isfinite(xi):
+                    shape[j] = xi
+            except Exception:
+                pass
+            if np.isfinite(p_exp[j]):
+                p[j] = p_exp[j]
+                method[j] = "exponential"
+            else:
+                method[j] = "degenerate"  # exponential unusable -> keep the empirical p
+    return p, method, shape, p_exp
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +195,7 @@ def _perm_worker_chunk(seed_seqs):
 
 
 def permutation_null(
-    ig_symbols, membership, sizes, n_perm=1000, seed=0, tail="gpd", n_jobs=1
+    ig_symbols, membership, sizes, n_perm=1000, seed=0, tail="exponential", n_jobs=1
 ):
     """Is a pathway's summed |mean IG| bigger than a size-matched random set? Shuffle
     gene labels (each set keeps its size) n_perm times and recompute.
@@ -190,19 +209,22 @@ def permutation_null(
     The empirical p is floored at 1/(n_perm+1), which sits above the BH threshold once
     ~1e3 sets are tested, so alone it calls everything non-significant. ``tail`` sets the
     extrapolation below that floor:
-      "gpd"       (default) peaks-over-threshold extrapolation with the tail shape fixed to
-                  xi=0 (the exponential member of the GPD family). Conservative under the
-                  statistic's bounded support and free of the free-shape MLE's endpoint
-                  ill-conditioning; see _gpd_tail_pvalues and
-                  literature/gpd_permutation_derivation.tex. (The flag value stays "gpd"
-                  for back-compatibility; the free-shape xi is reported as a diagnostic.)
+      "exponential" (default) peaks-over-threshold extrapolation with the tail shape fixed
+                  to xi=0 -- the exponential member of the GPD family (NOT the free-shape
+                  GPD). Conservative under the statistic's bounded support and free of the
+                  free-shape MLE's endpoint ill-conditioning; see _gpd_tail_pvalues and
+                  literature/gpd_permutation_derivation.tex. The free-shape GPD xi is fitted
+                  only as a reported diagnostic (perm_gpd_shape). ("gpd" is accepted as a
+                  legacy alias for this option.)
       "empirical" the raw floored p, no extrapolation.
 
-    Returns ``p_value`` (chosen tail) and ``p_empirical`` (always). ``tail`` is a
-    per-pathway array recording how each p was obtained ("empirical", "exponential", or
-    "degenerate"), and ``shape`` the diagnostic free-shape GPD xi on the extrapolated
-    pathways (NaN elsewhere). ``z`` is a size-corrected ranking effect size (log-space
-    standardised observed vs null), not a p-value; reported for any ``tail``.
+    Returns ``p_value`` (the chosen tail), ``p_empirical`` (always) and ``p_exponential``
+    (the exponential-tail p wherever defined, always computed regardless of ``tail`` so both
+    can be compared). ``tail`` is a per-pathway array recording how ``p_value`` was obtained
+    ("empirical", "exponential", or "degenerate"), and ``shape`` the diagnostic free-shape
+    GPD xi on the extrapolated pathways (NaN elsewhere). ``z`` is a size-corrected ranking
+    effect size (log-space standardised observed vs null), not a p-value; reported for any
+    ``tail``.
     """
     observed = np.abs(pathway_scores(ig_symbols, membership, sizes)).sum(axis=0)
     if not np.isfinite(observed).all():
@@ -279,14 +301,20 @@ def permutation_null(
     log_sd[log_sd == 0] = np.nan
     z_scores = (np.log(np.maximum(observed, 1e-300)) - log_mean) / log_sd
 
+    # Always compute the exponential-tail extrapolation + its chosen-p/method/diagnostic, so
+    # p_exponential is reported for every run; --tail only selects which becomes p_value.
+    exp_p_value, exp_method, tail_shape, p_exponential = _gpd_tail_pvalues(
+        null, observed, exceed
+    )
     if tail == "empirical":
         p_value = p_empirical
         tail_method = np.array(["empirical"] * n_pathways, dtype=object)
-        tail_shape = np.full(n_pathways, np.nan, dtype=float)
-    elif tail == "gpd":
-        p_value, tail_method, tail_shape = _gpd_tail_pvalues(null, observed, exceed)
+    elif tail in ("exponential", "gpd"):  # "gpd" kept as a legacy alias
+        p_value, tail_method = exp_p_value, exp_method
     else:
-        raise ValueError(f"Unknown tail model: {tail!r} (use 'gpd' or 'empirical').")
+        raise ValueError(
+            f"Unknown tail model: {tail!r} (use 'exponential' or 'empirical')."
+        )
 
     return {
         "observed": observed,
@@ -294,6 +322,7 @@ def permutation_null(
         "z": z_scores,
         "p_value": p_value,
         "p_empirical": p_empirical,
+        "p_exponential": p_exponential,
         "tail": tail_method,
         "shape": tail_shape,
     }
@@ -550,7 +579,7 @@ def run_layer_c(
     skip_gsea=False,
     msigdb_dir=MSIGDB_DIR,
     gsea_threads=1,
-    tail="gpd",
+    tail="exponential",
     n_jobs=1,
 ):
     ig_symbols = bundle["ig_symbols"]
@@ -583,6 +612,7 @@ def run_layer_c(
             "perm_null_mean": null["null_mean"],
             "perm_p_value": null["p_value"],
             "perm_p_empirical": null["p_empirical"],
+            "perm_p_exponential": null["p_exponential"],
             "perm_fdr_q": benjamini_hochberg(null["p_value"]),
             "perm_tail": null["tail"],
             "perm_gpd_shape": null["shape"],
@@ -601,6 +631,7 @@ def run_layer_c(
             "perm_null_mean",
             "perm_p_value",
             "perm_p_empirical",
+            "perm_p_exponential",
             "perm_fdr_q",
             "perm_tail",
             "perm_gpd_shape",
@@ -718,13 +749,15 @@ def main():
     parser.add_argument("--n-perm", type=int, default=1000)
     parser.add_argument(
         "--tail",
-        choices=("gpd", "empirical"),
-        default="gpd",
+        choices=("exponential", "empirical", "gpd"),
+        default="exponential",
         help="Tail model for the permutation p-value below the empirical floor. "
-        "gpd (default) is the peaks-over-threshold extrapolation with the tail shape fixed "
-        "to xi=0 (the exponential member of the GPD family): conservative under the "
+        "exponential (default) is the peaks-over-threshold extrapolation with the tail shape "
+        "FIXED at xi=0 -- the exponential member of the GPD family (not the free-shape GPD, "
+        "whose xi is only reported as the diagnostic perm_gpd_shape): conservative under the "
         "statistic's bounded support and free of the free-shape MLE's endpoint "
-        "ill-conditioning. empirical is the floored ground-truth p, kept for comparison.",
+        "ill-conditioning. empirical is the floored ground-truth p, kept for comparison. "
+        "('gpd' is accepted as a legacy alias for 'exponential'.)",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--ora-top-n", type=int, default=100)
