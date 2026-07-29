@@ -107,29 +107,6 @@ RANKING_COLUMNS = {
 # all-collections supplement can include KEGG lung cancer maps and C6 KRAS.LUNG sets.
 LUNG_NAME_TOKENS = ("LUNG", "NSCLC", "ADENOCARCINOMA")
 
-# Confirmatory panel (NOT discovery): the KEGG NSCLC driver network nt06266 (hsa05223),
-# decomposed into its N-numbered driver perturbation modules as packaged in MSigDB
-# KEGG_MEDICUS. Reports how the model's attributions land on the established NSCLC
-# drivers; it never enters the Reactome discovery ranking. (N00041 EGFR- and N00022
-# ERBB2-overexpression -> RAS-ERK have no MSigDB set, so they are omitted.)
-KEGG_NSCLC_PANEL = {
-    "KEGG_MEDICUS_VARIANT_MUTATION_ACTIVATED_EGFR_TO_RAS_ERK_SIGNALING_PATHWAY": "N00014 EGFR->RAS-ERK",
-    "KEGG_MEDICUS_VARIANT_MUTATION_ACTIVATED_MET_TO_RAS_ERK_SIGNALING_PATHWAY": "N01062 MET->RAS-ERK",
-    "KEGG_MEDICUS_VARIANT_RET_FUSION_KINASE_TO_RAS_ERK_SIGNALING_PATHWAY": "N00008 RET-fusion->RAS-ERK",
-    "KEGG_MEDICUS_VARIANT_EML4_ALK_FUSION_KINASE_TO_RAS_ERK_SIGNALING_PATHWAY": "N00007 EML4-ALK->RAS-ERK",
-    "KEGG_MEDICUS_VARIANT_MUTATION_ACTIVATED_KRAS_NRAS_TO_ERK_SIGNALING_PATHWAY": "N00012 KRAS/NRAS->ERK",
-    "KEGG_MEDICUS_VARIANT_MUTATION_ACTIVATED_EGFR_TO_PI3K_SIGNALING_PATHWAY": "N00036 EGFR->PI3K",
-    "KEGG_MEDICUS_VARIANT_MUTATION_ACTIVATED_MET_TO_PI3K_SIGNALING_PATHWAY": "N01063 MET->PI3K",
-    "KEGG_MEDICUS_VARIANT_EML4_ALK_FUSION_KINASE_TO_PI3K_SIGNALING_PATHWAY": "N00047 EML4-ALK->PI3K",
-    "KEGG_MEDICUS_VARIANT_MUTATION_ACTIVATED_KRAS_NRAS_TO_PI3K_SIGNALING_PATHWAY": "N00032 KRAS/NRAS->PI3K",
-    "KEGG_MEDICUS_VARIANT_LOSS_OF_RASSF1_TO_RAS_RASSF1_SIGNALING_PATHWAY": "N00097 RASSF1-loss",
-    "KEGG_MEDICUS_VARIANT_EML4_ALK_FUSION_KINASE_TO_JAK_STAT_SIGNALING_PATHWAY": "N00105 EML4-ALK->JAK-STAT",
-    "KEGG_MEDICUS_VARIANT_MUTATION_ACTIVATED_EGFR_TO_PLCG_ERK_SIGNALING_PATHWAY": "N00024 EGFR->PLCG-ERK",
-    "KEGG_MEDICUS_VARIANT_EML4_ALK_FUSION_KINASE_TO_PLCG_ERK_SIGNALING_PATHWAY": "N00025 EML4-ALK->PLCG-ERK",
-    "KEGG_MEDICUS_REFERENCE_P16_CELL_CYCLE_G1_S": "N00070 p16/CDKN2A->G1/S",
-    "KEGG_MEDICUS_VARIANT_MUTATION_INACTIVATED_TP53_TO_TRANSCRIPTION": "N00115 TP53->transcription",
-}
-
 
 # ---------------------------------------------------------------------------
 # Gene sets and the Ensembl -> symbol map (MSigDB, offline)
@@ -389,266 +366,6 @@ def sign_agreement_by_column(a, b):
         out=np.full(a.shape[1], np.nan, dtype=float),
         where=denom > 0,
     )
-
-
-def score_luad_panel(
-    msigdb_dir,
-    symbols,
-    ig_symbols,
-    path_gradient_symbols,
-    local_gradient_symbols,
-    output_dir,
-    primary_col="summed_abs_ig",
-    min_members=3,
-    discovery_ranking_values=None,
-    expression_symbols=None,
-    patient_ids=None,
-    write_figures=False,
-):
-    """Confirmatory KEGG NSCLC driver panel (nt06266) -- NOT part of discovery.
-
-    Scores the KEGG_NSCLC_PANEL modules off the same per-patient attributions, using the
-    SAME primary statistic the discovery ranks by (default summed |IG|), so
-    percentile_vs_discovery is apples-to-apples with the headline ranking. Reports
-    summed |IG|, |local gradient| and |path gradient| side by side, plus each
-    module's direction and coverage. Writes known_luad_kegg_nsclc_scores.csv.
-    min_members is low here (driver modules are small, ~5-20 genes); modules below it still
-    appear, flagged scored=False.
-    """
-    try:
-        gene_sets, _ = load_collections(msigdb_dir, ("c2.cp.kegg_medicus",))
-    except FileNotFoundError:
-        logger.warning("kegg_medicus not fetched; skipping the KEGG NSCLC panel.")
-        return None
-
-    missing = [name for name in KEGG_NSCLC_PANEL if name not in gene_sets]
-    if missing:
-        logger.warning(f"KEGG NSCLC panel: {len(missing)} module(s) absent from MSigDB.")
-
-    index = {s: i for i, s in enumerate(symbols)}
-
-    def summed_abs(matrix, mem, n):
-        if matrix is None:
-            return np.nan
-        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
-            return float(np.abs((matrix @ mem) / n).sum())
-
-    def patient_mean(matrix, mem, n):
-        if matrix is None:
-            return np.nan
-        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
-            return float((matrix @ mem).mean() / n)
-
-    def per_patient(matrix, mem, n):
-        # patients x genes -> per-patient mean pathway score (the beeswarm dot values).
-        if matrix is None:
-            return None
-        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
-            return (matrix @ mem) / n
-
-    rows = []
-    series = {}  # name -> per-patient vectors (ig / local / path / expr) for scored modules
-    for name, node in KEGG_NSCLC_PANEL.items():
-        annotated = gene_sets.get(name)
-        if annotated is None:
-            continue
-        members = [index[m] for m in annotated if m in index]
-        row = {
-            "kegg_node": node,
-            "pathway": name,
-            "n_annotated_genes": len(annotated),
-            "n_measured_genes": len(members),
-            "coverage": len(members) / len(annotated) if annotated else np.nan,
-            "scored": len(members) >= min_members,
-        }
-        if len(members) >= min_members:
-            mem = np.zeros(len(symbols), dtype=np.float64)
-            mem[members] = 1.0
-            n = len(members)
-            row["summed_abs_local_gradient"] = summed_abs(local_gradient_symbols, mem, n)
-            row["summed_abs_path_gradient"] = summed_abs(path_gradient_symbols, mem, n)
-            row["summed_abs_ig"] = summed_abs(ig_symbols, mem, n)
-            row["mean_local_gradient"] = patient_mean(local_gradient_symbols, mem, n)
-            row["mean_path_gradient"] = patient_mean(path_gradient_symbols, mem, n)
-            direction_val = row["mean_local_gradient"]
-            if np.isnan(direction_val):
-                direction_val = row["mean_path_gradient"]
-            row["direction"] = direction_label(direction_val)
-            primary = row.get(primary_col, np.nan)
-            if discovery_ranking_values is not None and not np.isnan(primary):
-                row["percentile_vs_discovery"] = float(
-                    np.mean(np.asarray(discovery_ranking_values) < primary)
-                )
-            series[name] = {
-                "label": node,
-                "ig": per_patient(ig_symbols, mem, n),
-                "local": per_patient(local_gradient_symbols, mem, n),
-                "path": per_patient(path_gradient_symbols, mem, n),
-                "expr": per_patient(expression_symbols, mem, n),
-            }
-        rows.append(row)
-
-    if not rows:
-        logger.warning("No KEGG NSCLC panel modules found; skipping.")
-        return None
-
-    sort_col = primary_col if any(primary_col in r for r in rows) else "summed_abs_ig"
-    table = pd.DataFrame(rows).sort_values(
-        ["scored", sort_col], ascending=[False, False], na_position="last"
-    )
-    path = os.path.join(output_dir, "known_luad_kegg_nsclc_scores.csv")
-    table.to_csv(path, index=False)
-    n_scored = int(table["scored"].sum())
-    logger.info(
-        f"KEGG NSCLC driver panel (nt06266), primary={primary_col} -> {path} "
-        f"({n_scored}/{len(table)} modules scored at min_members={min_members})"
-    )
-
-    # Beeswarms for the panel, mirroring the discovery set (x = IG spread, colour =
-    # gradient direction; plus the gradient-x views). Ordered by the same primary
-    # statistic the panel table is sorted by, so the top module sits at the top.
-    if write_figures:
-        ordered = [
-            name
-            for name in table.loc[table["scored"], "pathway"]
-            if name in series
-        ]
-        if not ordered:
-            logger.warning("KEGG NSCLC panel: no scored modules to plot; skipping figures.")
-        else:
-            labels = [series[name]["label"] for name in ordered]
-
-            def stack(key):
-                cols = [series[name][key] for name in ordered]
-                if any(c is None for c in cols):
-                    return None
-                return np.column_stack(cols)
-
-            panel_ig = stack("ig")
-            panel_local = stack("local")
-            panel_path = stack("path")
-            panel_expr = stack("expr")
-            n_mod = len(ordered)
-
-            if patient_ids is not None and panel_ig is not None:
-                pd.DataFrame(panel_ig, index=patient_ids, columns=labels).to_csv(
-                    os.path.join(output_dir, "known_luad_ig_scores_matrix.csv")
-                )
-
-            ig_x_label = (
-                "Mean IG attribution over module genes "
-                "[Δ log-risk per gene, i.e. log hazard ratio]\n"
-                "(per patient, relative to the cohort-mean-expression baseline; "
-                "+ = raises risk)"
-            )
-
-            # Gradient-x beeswarms, coloured by IG (x and colour are different quantities).
-            if panel_local is not None:
-                plot_beeswarm(
-                    panel_local, labels,
-                    os.path.join(output_dir, "known_luad_local_gradient_beeswarm.png"),
-                    n_mod,
-                    xlabel=(
-                    "Mean local gradient over genes "
-                    "[Δ log-risk per unit expression]\n"
-                    "(per patient; + = raises predicted risk)"
-                ),
-                    title="KEGG NSCLC panel: local gradients (coloured by IG attribution)",
-                    color_scores=panel_ig,
-                    color_label="Mean IG attribution over module genes\n(Δ log-risk per gene)",
-                )
-            if panel_path is not None:
-                plot_beeswarm(
-                    panel_path, labels,
-                    os.path.join(output_dir, "known_luad_path_gradient_beeswarm.png"),
-                    n_mod,
-                    xlabel=(
-                    "Mean path-averaged gradient over genes "
-                    "[Δ log-risk per unit expression]\n"
-                    "(per patient; + = raises risk)"
-                ),
-                    title="KEGG NSCLC panel: path-averaged gradients (coloured by IG)",
-                    color_scores=panel_ig,
-                    color_label="Mean IG attribution over module genes\n(Δ log-risk per gene)",
-                )
-
-            # Headline IG beeswarms: x = IG spread, colour = gradient direction.
-            if panel_ig is not None and panel_local is not None:
-                plot_beeswarm(
-                    panel_ig, labels,
-                    os.path.join(
-                        output_dir, "known_luad_ig_beeswarm_local_gradient_color.png"
-                    ),
-                    n_mod,
-                    xlabel=ig_x_label,
-                    title="KEGG NSCLC panel: IG (x) coloured by local gradient (direction)",
-                    color_scores=panel_local,
-                    color_label=(
-                        "Mean local gradient over module genes\n"
-                        "(Δ log-risk per unit expression; red = raises risk)"
-                    ),
-                )
-            if panel_ig is not None and panel_path is not None:
-                plot_beeswarm(
-                    panel_ig, labels,
-                    os.path.join(
-                        output_dir, "known_luad_ig_beeswarm_path_gradient_color.png"
-                    ),
-                    n_mod,
-                    xlabel=ig_x_label,
-                    title="KEGG NSCLC panel: IG (x) coloured by path gradient (direction)",
-                    color_scores=panel_path,
-                    color_label=(
-                        "Mean path-averaged gradient over module genes\n"
-                        "(Δ log-risk per unit expression; red = raises risk)"
-                    ),
-                )
-            if panel_ig is not None:
-                plot_beeswarm(
-                    panel_ig, labels,
-                    os.path.join(output_dir, "known_luad_ig_beeswarm.png"),
-                    n_mod,
-                    xlabel=ig_x_label,
-                    title="KEGG NSCLC panel: baseline-aware IG attribution",
-                    color_scores=panel_ig,
-                    color_label="Mean IG attribution over module genes\n(Δ log-risk per gene)",
-                )
-            if panel_ig is not None and panel_expr is not None:
-                plot_beeswarm(
-                    panel_ig, labels,
-                    os.path.join(
-                        output_dir, "known_luad_ig_beeswarm_expression_color.png"
-                    ),
-                    n_mod,
-                    xlabel=ig_x_label,
-                    title="KEGG NSCLC panel: IG (x) coloured by module expression",
-                    color_scores=panel_expr,
-                    color_label=(
-                        "Mean expression over module genes\n"
-                        "(row-standardised across patients for display)"
-                    ),
-                    standardize_color_by_row=True,
-                    center_color_at_zero=True,
-                    color_limits=(-2, 2),
-                )
-
-            # Direction bar, matching pathway_direction.png.
-            direction_frame = pd.DataFrame(
-                {
-                    "pathway": labels,
-                    "mean_gradient": [
-                        table.loc[table["pathway"] == name, "mean_local_gradient"].iloc[0]
-                        for name in ordered
-                    ],
-                }
-            )
-            plot_direction(
-                direction_frame,
-                os.path.join(output_dir, "known_luad_direction.png"),
-                n_mod,
-            )
-
-    return table
 
 
 def add_lung_name_flag(table):
@@ -1098,7 +815,6 @@ def run(
     msigdb_dir=MSIGDB_DIR,
     collections=DEFAULT_COLLECTIONS,
     min_members=10,
-    panel_min_members=3,
     top_n=20,
     gene_info_cache_dir="assets/gene_info",
     require_gradients=True,
@@ -1255,23 +971,6 @@ def run(
         f"{output_dir}/pathway_ig_magnitude_scores.csv"
     )
 
-    # Confirmatory KEGG NSCLC driver panel (nt06266) -- separate from the Reactome
-    # discovery ranking; reports how the model behaved for the established NSCLC drivers.
-    score_luad_panel(
-        msigdb_dir,
-        symbols,
-        ig_symbols,
-        path_gradient_symbols,
-        local_gradient_symbols,
-        output_dir,
-        primary_col=ranking_column,
-        min_members=panel_min_members,
-        discovery_ranking_values=table[ranking_column].to_numpy(),
-        expression_symbols=expression_symbols,
-        patient_ids=patient_ids,
-        write_figures=write_figures,
-    )
-
     top_pathways = table["pathway"].head(top_n).tolist()
     order = [names.index(p) for p in top_pathways]
     ig_top_pathways = ig_table["pathway"].head(top_n).tolist()
@@ -1336,15 +1035,12 @@ def run(
 
     # --- Figures -------------------------------------------------------------------
     if write_figures:
-        ig_x_label = (
-            "Mean IG attribution over pathway genes "
-            "[Δ log-risk per gene, i.e. log hazard ratio]\n"
-            "(per patient, relative to the cohort-mean-expression baseline; "
-            "+ = raises risk)"
-        )
-
-        # Gradient beeswarms (x = gradient direction), coloured by the IG attribution so
-        # the colour is a DIFFERENT quantity than the x-axis (not a redundant re-encoding).
+        # Gradient beeswarms: x = the gradient (the real risk direction), colour = mean IG
+        # (baseline-relative, so the colour shows which patients sit below/above the cohort
+        # baseline while the x-axis shows the actual increase/decrease in risk). These are
+        # the informative views; the mean-IG-on-x beeswarms were removed -- IG magnitude on
+        # the x-axis is patient-relative to the baseline, not a direction, so it was
+        # redundant with the colour here.
         if local_gradient_scores is not None:
             plot_beeswarm(
                 local_gradient_scores[:, order],
@@ -1376,78 +1072,6 @@ def run(
                 color_label="Mean IG attribution over pathway genes\n(Δ log-risk per gene)",
             )
 
-        # Headline IG beeswarms: x = per-patient IG (carries the spread), coloured by the
-        # gradient DIRECTION (local / path). The gradient is near-constant per patient, so
-        # each row's colour reads as that pathway's risk direction (red = raises risk).
-        if local_gradient_scores is not None:
-            plot_beeswarm(
-                scores[:, order],
-                top_pathways,
-                os.path.join(output_dir, "pathway_ig_beeswarm_local_gradient_color.png"),
-                top_n,
-                xlabel=ig_x_label,
-                title="IG attribution (x) coloured by local gradient (direction)",
-                color_scores=local_gradient_scores[:, order],
-                color_label=(
-                    "Mean local gradient over pathway genes\n"
-                    "(Δ log-risk per unit expression; red = raises risk)"
-                ),
-            )
-        if path_gradient_scores is not None:
-            plot_beeswarm(
-                scores[:, order],
-                top_pathways,
-                os.path.join(output_dir, "pathway_ig_beeswarm_path_gradient_color.png"),
-                top_n,
-                xlabel=ig_x_label,
-                title="IG attribution (x) coloured by path-averaged gradient (direction)",
-                color_scores=path_gradient_scores[:, order],
-                color_label=(
-                    "Mean path-averaged gradient over pathway genes\n"
-                    "(Δ log-risk per unit expression; red = raises risk)"
-                ),
-            )
-
-        # IG attribution coloured by its own value, and the |IG|-ranked ordering.
-        plot_beeswarm(
-            scores[:, order],
-            top_pathways,
-            os.path.join(output_dir, "pathway_ig_beeswarm.png"),
-            top_n,
-            xlabel=ig_x_label,
-            title="Baseline-aware IG attribution (top pathways)",
-            color_scores=scores[:, order],
-            color_label="Mean IG attribution over pathway genes",
-        )
-        plot_beeswarm(
-            scores[:, ig_order],
-            ig_top_pathways,
-            os.path.join(output_dir, "pathway_ig_magnitude_beeswarm.png"),
-            top_n,
-            xlabel=ig_x_label,
-            title="Top pathways by summed |IG| attribution",
-            color_scores=scores[:, ig_order],
-            color_label="Mean IG attribution over pathway genes",
-        )
-        if expression_symbols is not None:
-            expression_top = pathway_scores(expression_symbols, membership, sizes)[:, order]
-            plot_beeswarm(
-                scores[:, order],
-                top_pathways,
-                os.path.join(output_dir, "pathway_ig_beeswarm_expression_color.png"),
-                top_n,
-                xlabel=ig_x_label,
-                title="IG attribution (x) coloured by pathway expression",
-                color_scores=expression_top,
-                color_label=(
-                    "Mean expression over pathway genes\n"
-                    "(row-standardised across patients for display)"
-                ),
-                standardize_color_by_row=True,
-                center_color_at_zero=True,
-                color_limits=(-2, 2),
-            )
-
         plot_direction(table, os.path.join(output_dir, "pathway_direction.png"), top_n)
         plot_gradient_comparison(
             table, os.path.join(output_dir, "pathway_gradient_comparison.png"), top_n
@@ -1471,8 +1095,10 @@ def run(
         "local_gradient_abs": "local gradients",
         "path_gradient_abs": "path-averaged gradients",
     }
+    # IG magnitude ranks the sets, but the informative figures put the gradient on the x-axis
+    # (direction) coloured by IG, so the primary figure for ig_abs is the path-gradient view.
     primary_figure_by_statistic = {
-        "ig_abs": "pathway_ig_beeswarm.png",
+        "ig_abs": "pathway_path_gradient_beeswarm.png",
         "local_gradient_abs": "pathway_local_gradient_beeswarm.png",
         "path_gradient_abs": "pathway_path_gradient_beeswarm.png",
     }
@@ -1576,7 +1202,6 @@ def main(config, opt):
         msigdb_dir=opt.msigdb_dir,
         collections=primary_collections,
         min_members=opt.min_members,
-        panel_min_members=opt.panel_min_members,
         top_n=opt.top_n,
         gene_info_cache_dir=opt.gene_info_dir,
         require_gradients=not opt.allow_missing_gradients,
@@ -1595,7 +1220,6 @@ def main(config, opt):
             msigdb_dir=opt.msigdb_dir,
             collections=supplemental_collections,
             min_members=opt.min_members,
-            panel_min_members=opt.panel_min_members,
             top_n=opt.top_n,
             gene_info_cache_dir=opt.gene_info_dir,
             require_gradients=not opt.allow_missing_gradients,
@@ -1675,11 +1299,6 @@ def parse_args():
     )
     parser.add_argument("--min-members", type=int, default=10,
                         help="Drop discovery gene sets with fewer measured genes than this.")
-    parser.add_argument("--panel-min-members", type=int, default=3,
-                        help="Min measured genes to SCORE a KEGG NSCLC driver module "
-                             "(lower than discovery, since driver modules are small; "
-                             "modules below this still appear in the panel CSV, flagged "
-                             "scored=False).")
     parser.add_argument("--top-n", type=int, default=20,
                         help="Pathways to plot and to drill into.")
     parser.add_argument("--gene-info-dir", type=str, default="assets/gene_info")

@@ -61,14 +61,6 @@ GSEA_THREADS="${GSEA_THREADS:-$NCORES}"
 # Set to 1 to skip GSEA (permutation stats + ORA only).
 SKIP_GSEA=0
 
-# The known-LUAD/NSCLC panel has its own script (run_known_luad_pathway_tests.sh),
-# so it is skipped here by default to avoid overwriting that output. Set to 0 to
-# also run the panel as part of this discovery pass (uses the settings below).
-SKIP_KNOWN_LUAD=1
-N_BOOT=5000
-CI_LEVEL=0.95
-PANEL_MIN_MEMBERS=3
-
 ARGS=(
   --config "$CONFIG"
   --out-dir "$PATHWAY_DIR"
@@ -81,17 +73,10 @@ ARGS=(
   --ora-top-n "$ORA_TOP_N"
   --min-members "$MIN_MEMBERS"
   --gsea-threads "$GSEA_THREADS"
-  --n-boot "$N_BOOT"
-  --ci-level "$CI_LEVEL"
-  --panel-min-members "$PANEL_MIN_MEMBERS"
 )
 
 if [[ "$SKIP_GSEA" == "1" ]]; then
   ARGS+=(--skip-gsea)
-fi
-
-if [[ "$SKIP_KNOWN_LUAD" == "1" ]]; then
-  ARGS+=(--skip-known-luad)
 fi
 
 # Opt-in process parallelism (single-threaded-BLAS fallback only): JOBS=-1 qsub ...

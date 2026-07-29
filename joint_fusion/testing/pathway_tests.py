@@ -6,9 +6,7 @@ rebuilds the gene-set membership for the requested --collections on the bundle's
 and runs three tests -- gene-label permutation null, GSEA prerank, hypergeometric ORA --
 writing their p-values / FDR / leading-edge tables. Because membership is rebuilt at test
 time, ONE gene bundle serves every collection (Reactome, Hallmark, C6, ...); run one
-collection per invocation so each keeps its own FDR family (do not pool). The known-LUAD
-panel additionally loads the KEGG Medicus NSCLC modules from MSigDB, scored outside the
-discovery universe.
+collection per invocation so each keeps its own FDR family (do not pool).
 
 --tail sets how the permutation p is extrapolated below the empirical floor: gpd
 (default; peaks-over-threshold with the tail shape fixed to xi=0, i.e. the exponential
@@ -22,7 +20,6 @@ Run (bare uses the fold-1 config's output folder; --out-dir sets the per-collect
         --out-dir <output_base_dir>/pathway_interpret_reactome
     python -m joint_fusion.testing.pathway_tests --collections h.all \
         --out-dir <output_base_dir>/pathway_interpret_hallmark
-    python -m joint_fusion.testing.pathway_tests --only-known-luad --n-perm 10000
     python -m joint_fusion.testing.pathway_tests --tail empirical   # floored ground truth
 
     Outputs (written to --out-dir):
@@ -33,9 +30,6 @@ Run (bare uses the fold-1 config's output folder; --out-dir sets the per-collect
                                         (only if pathway_scores.csv is present)
         gsea_prerank.csv                GSEApy prerank NES / p / FDR / leading edge
         ora_{magnitude,up,down}.csv     hypergeometric enrichment of the top genes
-        known_luad_panel_stats.csv      targeted KEGG NSCLC module permutation p/FDR
-                                        plus bootstrap CIs
-        known_luad_gsea_prerank.csv     targeted KEGG NSCLC module GSEA, if gradients exist
 """
 
 import argparse
@@ -51,7 +45,6 @@ from statsmodels.stats.multitest import multipletests
 
 from joint_fusion.testing.pathway_interpret import (
     GENE_BUNDLE_NAME,
-    KEGG_NSCLC_PANEL,
     MSIGDB_DIR,
     build_membership,
     direction_label,
@@ -511,7 +504,7 @@ def over_representation(hits, gene_sets, background, min_members=10):
 
 
 # ---------------------------------------------------------------------------
-# Bundle I/O and the targeted known-LUAD/NSCLC driver panel
+# Gene bundle I/O and discovery membership helpers
 # ---------------------------------------------------------------------------
 
 
@@ -541,252 +534,6 @@ def measured_gene_sets(membership, names, symbols):
     }
 
 
-def known_luad_panel_membership(symbols, msigdb_dir=MSIGDB_DIR, min_members=3):
-    """Build the pre-specified KEGG Medicus NSCLC driver panel on the bundle gene axis."""
-    gene_sets, _ = load_collections(msigdb_dir, ("c2.cp.kegg_medicus",))
-    symbol_index = {symbol: i for i, symbol in enumerate(symbols)}
-
-    rows = []
-    membership_rows = []
-    scored_names = []
-    scored_nodes = []
-    scored_sizes = []
-
-    for pathway, node in KEGG_NSCLC_PANEL.items():
-        annotated = gene_sets.get(pathway)
-        if annotated is None:
-            rows.append(
-                {
-                    "kegg_node": node,
-                    "pathway": pathway,
-                    "n_annotated_genes": 0,
-                    "n_measured_genes": 0,
-                    "coverage": np.nan,
-                    "scored": False,
-                    "skip_reason": "missing_from_msigdb",
-                }
-            )
-            continue
-
-        members = [symbol_index[g] for g in annotated if g in symbol_index]
-        scored = len(members) >= min_members
-        rows.append(
-            {
-                "kegg_node": node,
-                "pathway": pathway,
-                "n_annotated_genes": len(annotated),
-                "n_measured_genes": len(members),
-                "coverage": len(members) / len(annotated) if annotated else np.nan,
-                "scored": scored,
-                "skip_reason": (
-                    "" if scored else f"fewer_than_{min_members}_measured_genes"
-                ),
-            }
-        )
-        if scored:
-            row = np.zeros(len(symbols), dtype=np.float64)
-            row[members] = 1.0
-            membership_rows.append(row)
-            scored_names.append(pathway)
-            scored_nodes.append(node)
-            scored_sizes.append(len(members))
-
-    membership = (
-        np.vstack(membership_rows)
-        if membership_rows
-        else np.zeros((0, len(symbols)), dtype=np.float64)
-    )
-    return (
-        pd.DataFrame(rows),
-        membership,
-        scored_names,
-        scored_nodes,
-        np.asarray(scored_sizes),
-    )
-
-
-def bootstrap_panel_scores(
-    ig_scores, path_gradient_scores=None, n_boot=2000, seed=0, ci_level=0.95,
-    boot_batch=512,
-):
-    """Patient bootstrap CIs for panel effect-size summaries.
-
-    Complements the permutation test's competitive p-value: measures how stable the panel
-    score is across the patient cohort. Note this is the bootstrap, NOT the permutation
-    null -- it resamples patients with replacement and reports percentile CIs, and does
-    not use the exponential/GPD tail model (that is permutation-only; see
-    ``permutation_null`` and ``_gpd_tail_pvalues``).
-
-    Vectorised: the per-resample means are computed with NumPy fancy-indexing over batches
-    of ``boot_batch`` resamples at a time rather than in a Python loop, so the arithmetic
-    runs in compiled/SIMD array code over the whole cohort at once. The draws are
-    *identical* to the equivalent serial loop for a given ``seed`` -- ``rng.integers`` fills
-    the (batch, n_patients) block row-major, so each row is exactly one loop iteration's
-    resample -- so the CIs are unchanged bit-for-bit; only the wall-clock differs.
-    Batching bounds peak memory to ``boot_batch * n_patients * n_pathways`` floats; the
-    panel is small (~15 modules), a few MB even at ``n_boot=2000``. (Process-level
-    parallelism is unwarranted here: this is elementwise abs/mean, not the large matmul the
-    permutation null runs, and the panel work completes well under a second.)
-    """
-    if n_boot < 1:
-        raise ValueError("n_boot must be at least 1.")
-    if not 0 < ci_level < 1:
-        raise ValueError("ci_level must be between 0 and 1.")
-    if boot_batch < 1:
-        raise ValueError("boot_batch must be at least 1.")
-
-    rng = np.random.default_rng(seed)
-    n_patients, n_pathways = ig_scores.shape
-    alpha = (1.0 - ci_level) / 2.0
-
-    boot_mean_abs_ig = np.empty((n_boot, n_pathways), dtype=np.float64)
-    boot_mean_gradient = (
-        np.empty((n_boot, n_pathways), dtype=np.float64)
-        if path_gradient_scores is not None
-        else None
-    )
-
-    for start in range(0, n_boot, boot_batch):
-        b = min(boot_batch, n_boot - start)
-        # (b, n_patients) resample indices; row-major fill == b consecutive serial draws.
-        idx = rng.integers(0, n_patients, size=(b, n_patients))
-        boot_mean_abs_ig[start : start + b] = np.abs(ig_scores[idx]).mean(axis=1)
-        if path_gradient_scores is not None:
-            boot_mean_gradient[start : start + b] = path_gradient_scores[idx].mean(axis=1)
-
-    out = {
-        "mean_abs_ig_boot_mean": boot_mean_abs_ig.mean(axis=0),
-        "mean_abs_ig_ci_low": np.quantile(boot_mean_abs_ig, alpha, axis=0),
-        "mean_abs_ig_ci_high": np.quantile(boot_mean_abs_ig, 1.0 - alpha, axis=0),
-    }
-    if boot_mean_gradient is not None:
-        out.update(
-            {
-                "mean_path_gradient_boot_mean": boot_mean_gradient.mean(axis=0),
-                "mean_path_gradient_ci_low": np.quantile(
-                    boot_mean_gradient, alpha, axis=0
-                ),
-                "mean_path_gradient_ci_high": np.quantile(
-                    boot_mean_gradient, 1.0 - alpha, axis=0
-                ),
-                "bootstrap_frac_risk_increasing": (boot_mean_gradient > 0).mean(axis=0),
-            }
-        )
-    return out
-
-
-def run_known_luad_panel(
-    bundle,
-    output_dir,
-    msigdb_dir=MSIGDB_DIR,
-    n_perm=1000,
-    n_boot=2000,
-    seed=0,
-    min_members=3,
-    ci_level=0.95,
-    skip_gsea=False,
-    gsea_threads=1,
-    tail="gpd",
-    n_jobs=1,
-):
-    """Targeted evidence layer for the pre-specified KEGG NSCLC driver panel."""
-    ig_symbols = bundle["ig_symbols"]
-    path_gradient_symbols = bundle["path_gradient_symbols"]
-    symbols = bundle["symbols"]
-
-    panel_base, membership, names, nodes, sizes = known_luad_panel_membership(
-        symbols, msigdb_dir=msigdb_dir, min_members=min_members
-    )
-    if len(names) == 0:
-        panel_path = os.path.join(output_dir, "known_luad_panel_stats.csv")
-        panel_base.to_csv(panel_path, index=False)
-        logger.info(f"Known LUAD panel: no modules scored -> {panel_path}")
-        return
-
-    logger.info(
-        f"Known LUAD/NSCLC panel permutation for {len(names)} scored modules "
-        f"({n_perm} permutations)"
-    )
-    null = permutation_null(
-        ig_symbols, membership, sizes, n_perm, seed, tail=tail, n_jobs=n_jobs
-    )
-    ig_scores = pathway_scores(ig_symbols, membership, sizes)
-    path_scores = (
-        pathway_scores(path_gradient_symbols, membership, sizes)
-        if path_gradient_symbols is not None
-        else None
-    )
-    boot = bootstrap_panel_scores(
-        ig_scores,
-        path_scores,
-        n_boot=n_boot,
-        seed=seed,
-        ci_level=ci_level,
-    )
-
-    scored = pd.DataFrame(
-        {
-            "pathway": names,
-            "kegg_node": nodes,
-            "summed_abs_ig": null["observed"],
-            "mean_abs_ig": np.abs(ig_scores).mean(axis=0),
-            "perm_z": null["z"],
-            "perm_null_mean": null["null_mean"],
-            "perm_p_value": null["p_value"],
-            "perm_p_empirical": null["p_empirical"],
-            "perm_fdr_q": benjamini_hochberg(null["p_value"]),
-            "perm_tail": null["tail"],
-            "perm_gpd_shape": null["shape"],
-            "mean_path_gradient": (
-                path_scores.mean(axis=0)
-                if path_scores is not None
-                else np.full(len(names), np.nan)
-            ),
-            "path_direction": (
-                [direction_label(x) for x in path_scores.mean(axis=0)]
-                if path_scores is not None
-                else ["unknown"] * len(names)
-            ),
-        }
-    )
-    for col, values in boot.items():
-        scored[col] = values
-
-    table = panel_base.merge(scored, on=["pathway", "kegg_node"], how="left")
-    table = table.sort_values(
-        ["scored", "perm_fdr_q", "summed_abs_ig"],
-        ascending=[False, True, False],
-        na_position="last",
-        ignore_index=True,
-    )
-    panel_path = os.path.join(output_dir, "known_luad_panel_stats.csv")
-    table.to_csv(panel_path, index=False)
-    n_sig = int((table["perm_fdr_q"] < 0.05).sum())
-    logger.info(
-        f"Known LUAD panel -> {panel_path} "
-        f"({n_sig} modules at targeted panel FDR < 0.05)"
-    )
-
-    if path_gradient_symbols is not None and not skip_gsea:
-        logger.info(f"Known LUAD GSEA prerank via GSEApy ({n_perm} permutations)")
-        gsea = gsea_prerank(
-            path_gradient_symbols.mean(axis=0),
-            membership,
-            names,
-            n_perm,
-            seed,
-            symbols,
-            threads=gsea_threads,
-        )
-        gsea["kegg_node"] = gsea["pathway"].map(dict(zip(names, nodes)))
-        gsea_path = os.path.join(output_dir, "known_luad_gsea_prerank.csv")
-        gsea.to_csv(gsea_path, index=False)
-        n_gsea_sig = int((gsea["fdr_q"] < 0.25).sum())
-        logger.info(
-            f"Known LUAD GSEA -> {gsea_path} " f"({n_gsea_sig} modules at FDR < 0.25)"
-        )
-
-
 # ---------------------------------------------------------------------------
 # Orchestration and CLI
 # ---------------------------------------------------------------------------
@@ -802,10 +549,6 @@ def run_layer_c(
     min_members=10,
     skip_gsea=False,
     msigdb_dir=MSIGDB_DIR,
-    panel_min_members=3,
-    n_boot=2000,
-    ci_level=0.95,
-    skip_known_luad=False,
     gsea_threads=1,
     tail="gpd",
     n_jobs=1,
@@ -912,27 +655,6 @@ def run_layer_c(
             f"ORA ({label}, top {ora_top_n}) -> {ora_path} ({n_sig} at FDR < 0.05)"
         )
 
-    # 4. Targeted known-LUAD/NSCLC panel: FDR over the pre-specified modules only,
-    # separate from the discovery universe.
-    if not skip_known_luad:
-        try:
-            run_known_luad_panel(
-                bundle,
-                output_dir,
-                msigdb_dir=msigdb_dir,
-                n_perm=n_perm,
-                n_boot=n_boot,
-                seed=seed,
-                min_members=panel_min_members,
-                ci_level=ci_level,
-                skip_gsea=skip_gsea,
-                gsea_threads=gsea_threads,
-                tail=tail,
-                n_jobs=n_jobs,
-            )
-        except FileNotFoundError as e:
-            logger.warning(f"Known LUAD panel skipped: {e}")
-
 
 DEFAULT_CONFIG = "joint_fusion/config/config_checkpoint_2026-04-07-04-58-17_fold1.yaml"
 
@@ -1004,18 +726,6 @@ def main():
         "statistic's bounded support and free of the free-shape MLE's endpoint "
         "ill-conditioning. empirical is the floored ground-truth p, kept for comparison.",
     )
-    parser.add_argument(
-        "--n-boot",
-        type=int,
-        default=2000,
-        help="Patient bootstrap resamples for known_luad_panel_stats.csv.",
-    )
-    parser.add_argument(
-        "--ci-level",
-        type=float,
-        default=0.95,
-        help="Bootstrap confidence level for the known LUAD panel.",
-    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--ora-top-n", type=int, default=100)
     parser.add_argument("--min-members", type=int, default=10)
@@ -1023,13 +733,7 @@ def main():
         "--msigdb-dir",
         type=str,
         default=MSIGDB_DIR,
-        help="MSigDB asset folder; needed for the KEGG NSCLC/LUAD panel.",
-    )
-    parser.add_argument(
-        "--panel-min-members",
-        type=int,
-        default=3,
-        help="Min measured genes to score a KEGG NSCLC driver module.",
+        help="MSigDB asset folder holding the .gmt collections.",
     )
     parser.add_argument(
         "--gsea-threads",
@@ -1050,19 +754,7 @@ def main():
         "single-threaded BLAS.",
     )
     parser.add_argument("--skip-gsea", action="store_true")
-    parser.add_argument(
-        "--skip-known-luad",
-        action="store_true",
-        help="Skip the targeted known LUAD/NSCLC KEGG panel.",
-    )
-    parser.add_argument(
-        "--only-known-luad",
-        action="store_true",
-        help="Run only the targeted known LUAD/NSCLC KEGG panel.",
-    )
     opt = parser.parse_args()
-    if opt.only_known_luad and opt.skip_known_luad:
-        parser.error("--only-known-luad cannot be combined with --skip-known-luad.")
 
     collections = tuple(c.strip() for c in opt.collections.split(",") if c.strip())
     gene_bundle_path, out_dir = resolve_gene_bundle_and_out(opt)
@@ -1074,49 +766,24 @@ def main():
         )
     logger.info(f"Loading gene bundle: {gene_bundle_path}")
     bundle = load_gene_bundle(gene_bundle_path)
-    if opt.only_known_luad:
-        run_known_luad_panel(
-            bundle,
-            output_dir=str(out_dir),
-            msigdb_dir=opt.msigdb_dir,
-            n_perm=opt.n_perm,
-            n_boot=opt.n_boot,
-            seed=opt.seed,
-            min_members=opt.panel_min_members,
-            ci_level=opt.ci_level,
-            skip_gsea=opt.skip_gsea,
-            gsea_threads=opt.gsea_threads,
-            tail=opt.tail,
-            n_jobs=opt.jobs,
-        )
-        logger.info(
-            "\nDone. See known_luad_panel_stats.csv and, unless skipped, "
-            "known_luad_gsea_prerank.csv."
-        )
-    else:
-        os.makedirs(out_dir, exist_ok=True)
-        run_layer_c(
-            bundle,
-            output_dir=str(out_dir),
-            collections=collections,
-            n_perm=opt.n_perm,
-            seed=opt.seed,
-            ora_top_n=opt.ora_top_n,
-            min_members=opt.min_members,
-            skip_gsea=opt.skip_gsea,
-            msigdb_dir=opt.msigdb_dir,
-            panel_min_members=opt.panel_min_members,
-            n_boot=opt.n_boot,
-            ci_level=opt.ci_level,
-            skip_known_luad=opt.skip_known_luad,
-            gsea_threads=opt.gsea_threads,
-            tail=opt.tail,
-            n_jobs=opt.jobs,
-        )
-        logger.info(
-            "\nDone. See pathway_scores_with_stats.csv, gsea_prerank.csv, "
-            "ora_*.csv, and known_luad_panel_stats.csv."
-        )
+    os.makedirs(out_dir, exist_ok=True)
+    run_layer_c(
+        bundle,
+        output_dir=str(out_dir),
+        collections=collections,
+        n_perm=opt.n_perm,
+        seed=opt.seed,
+        ora_top_n=opt.ora_top_n,
+        min_members=opt.min_members,
+        skip_gsea=opt.skip_gsea,
+        msigdb_dir=opt.msigdb_dir,
+        gsea_threads=opt.gsea_threads,
+        tail=opt.tail,
+        n_jobs=opt.jobs,
+    )
+    logger.info(
+        "\nDone. See pathway_scores_with_stats.csv, gsea_prerank.csv, and ora_*.csv."
+    )
 
 
 if __name__ == "__main__":
