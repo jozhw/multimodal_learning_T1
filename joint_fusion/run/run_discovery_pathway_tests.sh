@@ -23,17 +23,35 @@ PATHWAY_DIR="${PATHWAY_DIR:-$CKPT_BASE/$OUT_NAME}"
 # The gene bundle is shared across collections (written to CKPT_BASE by pathway_interpret).
 GENE_BUNDLE="${GENE_BUNDLE:-$CKPT_BASE/gene_attribution_bundle.npz}"
 
-# Cores this job may use. sched_getaffinity respects PBS cpu-binding on Linux/Polaris;
-# falls back to the logical CPU count elsewhere. Override by exporting NCORES.
-NCORES="${NCORES:-$(python -c 'import os; print(len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 4))' 2>/dev/null || echo 4)}"
+# PHYSICAL cores to give BLAS/GSEA. Physical, NOT logical: each permutation is a small
+# matmul, and setting the thread count to the logical CPU count (SMT/hyperthreads, e.g. 64
+# or 128 on a many-core node) OVERSUBSCRIBES it -- benchmarked ~10x slower, effectively a
+# standstill. Physical-core count (e.g. 32 on a Polaris node) is 1:1 with the hardware and
+# safe. Override by exporting NCORES.
+if [[ -z "${NCORES:-}" ]]; then
+  if command -v lscpu >/dev/null 2>&1; then
+    _sock=$(lscpu | awk -F: '/^Socket\(s\)/{gsub(/ /,"",$2); print $2}')
+    _cps=$(lscpu | awk -F: '/^Core\(s\) per socket/{gsub(/ /,"",$2); print $2}')
+    NCORES=$(( ${_sock:-0} * ${_cps:-0} ))
+    if [[ "$NCORES" -lt 1 ]]; then NCORES=$(nproc 2>/dev/null || echo 8); fi
+  elif [[ "$(uname)" == "Darwin" ]]; then
+    NCORES=$(sysctl -n hw.physicalcpu 2>/dev/null || echo 8)
+  elif command -v nproc >/dev/null 2>&1; then
+    NCORES=$(nproc)
+  else
+    NCORES=8
+  fi
+fi
+if [[ -z "$NCORES" || "$NCORES" -lt 1 ]]; then NCORES=8; fi
 
-# The PERMUTATION null is one large matmul per iteration; numpy's BLAS parallelises it
-# across cores automatically -- so "run the permutation on all cores" needs nothing more
-# than letting BLAS see them. Setting the thread caps to $NCORES does exactly that (and
-# guards against an HPC module env that pins them to 1, which would force it single-
-# threaded). No --jobs / process pool is needed on a normal multithreaded BLAS.
+# Give BLAS the physical-core count. This both uses the hardware and guards against an HPC
+# module env that pins the thread vars to 1. No --jobs / process pool is needed.
 export OMP_NUM_THREADS="$NCORES" OPENBLAS_NUM_THREADS="$NCORES" MKL_NUM_THREADS="$NCORES"
-export VECLIB_MAXIMUM_THREADS="$NCORES" NUMEXPR_NUM_THREADS="$NCORES"
+export VECLIB_MAXIMUM_THREADS="$NCORES"
+# NumExpr (pulled in by pandas) hard-errors at import if its thread count exceeds
+# NUMEXPR_MAX_THREADS (default 64) -- which crashes on nodes with >64 visible CPUs. It is
+# not a bottleneck here (the permutation is a BLAS matmul), so cap it at 64.
+export NUMEXPR_NUM_THREADS="$(( NCORES < 64 ? NCORES : 64 ))"
 
 # Discovery settings. The discovery universe is whatever collection the bundle was
 # built with (Reactome C2:CP by default in pathway_interpret.py).
