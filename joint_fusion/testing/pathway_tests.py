@@ -1,11 +1,14 @@
 """
 pathway_tests.py
 
-Reads the pathway_analysis_bundle.npz written by pathway_interpret.py and runs three tests --
-gene-label permutation null, GSEA prerank, hypergeometric ORA -- writing their
-p-values / FDR / leading-edge tables. The discovery tests need only the bundle (symbol
-attribution matrices + membership); the known-LUAD panel additionally loads the KEGG
-Medicus NSCLC modules from MSigDB, since it is scored outside the discovery universe.
+Reads the collection-independent gene_attribution_bundle.npz written by pathway_interpret.py,
+rebuilds the gene-set membership for the requested --collections on the bundle's gene axis,
+and runs three tests -- gene-label permutation null, GSEA prerank, hypergeometric ORA --
+writing their p-values / FDR / leading-edge tables. Because membership is rebuilt at test
+time, ONE gene bundle serves every collection (Reactome, Hallmark, C6, ...); run one
+collection per invocation so each keeps its own FDR family (do not pool). The known-LUAD
+panel additionally loads the KEGG Medicus NSCLC modules from MSigDB, scored outside the
+discovery universe.
 
 --tail sets how the permutation p is extrapolated below the empirical floor: gpd
 (default; peaks-over-threshold with the tail shape fixed to xi=0, i.e. the exponential
@@ -13,14 +16,16 @@ member of the GPD family -- conservative under the statistic's bounded support a
 the free-shape MLE's endpoint ill-conditioning) or empirical (raw floored p, no
 extrapolation).
 
-Run (bare uses the fold-1 config's output folder; override with --dir or --bundle):
-    python -m joint_fusion.testing.pathway_tests
-    python -m joint_fusion.testing.pathway_tests --dir <output_base_dir>/pathway_interpret
-    python -m joint_fusion.testing.pathway_tests --bundle path/to/pathway_analysis_bundle.npz
+Run (bare uses the fold-1 config's output folder; --out-dir sets the per-collection folder,
+--gene-bundle the shared bundle, --collections which universe):
+    python -m joint_fusion.testing.pathway_tests --collections c2.cp.reactome \
+        --out-dir <output_base_dir>/pathway_interpret_reactome
+    python -m joint_fusion.testing.pathway_tests --collections h.all \
+        --out-dir <output_base_dir>/pathway_interpret_hallmark
     python -m joint_fusion.testing.pathway_tests --only-known-luad --n-perm 10000
     python -m joint_fusion.testing.pathway_tests --tail empirical   # floored ground truth
 
-    Outputs (written next to the bundle):
+    Outputs (written to --out-dir):
         pathway_permutation_stats.csv   per-pathway summed|IG|, perm_z, p, empirical p,
                                         FDR, perm_tail (the tail model used),
                                         perm_gpd_shape (diagnostic free-shape GPD xi)
@@ -45,11 +50,13 @@ from scipy.stats import genpareto, hypergeom
 from statsmodels.stats.multitest import multipletests
 
 from joint_fusion.testing.pathway_interpret import (
-    ANALYSIS_BUNDLE_NAME,
+    GENE_BUNDLE_NAME,
     KEGG_NSCLC_PANEL,
     MSIGDB_DIR,
+    build_membership,
     direction_label,
     load_collections,
+    load_gene_bundle,
     pathway_scores,
 )
 
@@ -508,21 +515,18 @@ def over_representation(hits, gene_sets, background, min_members=10):
 # ---------------------------------------------------------------------------
 
 
-def load_bundle(bundle_path):
-    """Load the symbol-level matrices + membership the three tests need."""
-    d = np.load(bundle_path, allow_pickle=False)
-    has_pg = int(d["has_path_gradients"]) == 1
-    return {
-        "ig_symbols": d["ig_symbols"].astype(np.float64),
-        "path_gradient_symbols": (
-            d["path_gradient_symbols"].astype(np.float64) if has_pg else None
-        ),
-        "membership": d["membership"].astype(np.float64),
-        "sizes": d["sizes"].astype(np.float64),
-        "names": [str(x) for x in d["names"]],
-        "symbols": [str(x) for x in d["symbols"]],
-        "collections": [str(x) for x in d["collections"]],
-    }
+def build_discovery_membership(symbols, collections, msigdb_dir=MSIGDB_DIR, min_members=10):
+    """Build the (pathway x gene) membership for a collection on the gene bundle's axis.
+
+    This is what makes the gene bundle collection-independent: membership is rebuilt here at
+    test time for whatever ``collections`` is requested, rather than baked into the bundle,
+    so one gene bundle serves Reactome, Hallmark, C6, ... Returns membership (float64),
+    pathway names, sizes (float64), and a name->collection map.
+    """
+    gene_sets, collection_source = load_collections(msigdb_dir, collections)
+    membership, names, sizes, _coverage = build_membership(gene_sets, symbols, min_members)
+    collection_of = {name: collection_source[name] for name in names}
+    return membership.astype(np.float64), names, sizes.astype(np.float64), collection_of
 
 
 def measured_gene_sets(membership, names, symbols):
@@ -791,6 +795,7 @@ def run_known_luad_panel(
 def run_layer_c(
     bundle,
     output_dir,
+    collections=("c2.cp.reactome",),
     n_perm=1000,
     seed=0,
     ora_top_n=100,
@@ -807,12 +812,18 @@ def run_layer_c(
 ):
     ig_symbols = bundle["ig_symbols"]
     path_gradient_symbols = bundle["path_gradient_symbols"]
-    membership = bundle["membership"]
-    sizes = bundle["sizes"]
-    names = bundle["names"]
     symbols = bundle["symbols"]
-    collection_of = dict(zip(names, bundle["collections"]))
+    # Rebuild membership for the requested collection on the gene bundle's axis (the bundle
+    # is collection-independent; membership is never persisted). min_members is the single
+    # size floor used both here and by ORA below.
+    membership, names, sizes, collection_of = build_discovery_membership(
+        symbols, collections, msigdb_dir, min_members
+    )
     os.makedirs(output_dir, exist_ok=True)
+    logger.info(
+        f"Built membership for {len(names)} sets from {', '.join(collections)} "
+        f"(min_members={min_members}) on {len(symbols)} measured genes"
+    )
 
     # 1. Permutation null on the paper's own pathway statistic.
     logger.info(f"Permutation null for {len(names)} pathways ({n_perm} permutations)")
@@ -926,17 +937,28 @@ def run_layer_c(
 DEFAULT_CONFIG = "joint_fusion/config/config_checkpoint_2026-04-07-04-58-17_fold1.yaml"
 
 
-def resolve_bundle_path(opt):
-    if opt.bundle:
-        return Path(opt.bundle)
-    if opt.dir:
-        return Path(opt.dir) / ANALYSIS_BUNDLE_NAME
-    # Neither given: mirror pathway_interpret's output folder so a bare run matches it.
-    from joint_fusion.config.config_manager import ConfigManager
+def resolve_gene_bundle_and_out(opt):
+    """Resolve (gene_bundle_path, output_dir).
 
-    config = ConfigManager.load_config(opt.config)
-    base = Path(config.testing.output_base_dir) / "pathway_interpret"
-    return base / ANALYSIS_BUNDLE_NAME
+    The gene bundle is collection-independent and shared, so it lives one level above the
+    per-collection output dir (<base>/gene_attribution_bundle.npz). --out-dir is the
+    per-collection folder that holds this collection's pathway_scores.csv and receives the
+    test outputs.
+    """
+    if opt.out_dir:
+        out_dir = Path(opt.out_dir)
+    else:
+        from joint_fusion.config.config_manager import ConfigManager
+
+        config = ConfigManager.load_config(opt.config)
+        out_dir = Path(config.testing.output_base_dir) / "pathway_interpret"
+
+    if opt.gene_bundle:
+        gene_bundle = Path(opt.gene_bundle)
+    else:
+        # pathway_interpret writes the shared gene bundle to the base dir (out_dir's parent).
+        gene_bundle = out_dir.parent / GENE_BUNDLE_NAME
+    return gene_bundle, out_dir
 
 
 def main():
@@ -946,20 +968,30 @@ def main():
         type=str,
         default=DEFAULT_CONFIG,
         help="Fold-1 config by default; used to locate the output folder "
-        "when --dir/--bundle are not given.",
+        "when --out-dir is not given.",
     )
     parser.add_argument(
-        "--dir",
+        "--out-dir",
         type=str,
         default=None,
-        help="pathway_interpret output folder holding the bundle "
-        "(overrides --config).",
+        help="Per-collection output folder (holds this collection's pathway_scores.csv "
+        "and receives the test outputs). Overrides --config.",
     )
     parser.add_argument(
-        "--bundle",
+        "--gene-bundle",
         type=str,
         default=None,
-        help="Path to pathway_analysis_bundle.npz (overrides --dir).",
+        help="Path to the collection-independent gene_attribution_bundle.npz. Defaults to "
+        "<out-dir>/../gene_attribution_bundle.npz (the shared base dir where "
+        "pathway_interpret writes it).",
+    )
+    parser.add_argument(
+        "--collections",
+        type=str,
+        default="c2.cp.reactome",
+        help="Gene-set collection(s) to test, rebuilt on the gene bundle's axis at test "
+        "time (comma-separated). Run ONE collection per invocation to keep each its own "
+        "FDR family -- e.g. c2.cp.reactome, or h.all, or c6.all. Do not pool.",
     )
     parser.add_argument("--n-perm", type=int, default=1000)
     parser.add_argument(
@@ -1032,18 +1064,20 @@ def main():
     if opt.only_known_luad and opt.skip_known_luad:
         parser.error("--only-known-luad cannot be combined with --skip-known-luad.")
 
-    bundle_path = resolve_bundle_path(opt)
-    if not bundle_path.exists():
+    collections = tuple(c.strip() for c in opt.collections.split(",") if c.strip())
+    gene_bundle_path, out_dir = resolve_gene_bundle_and_out(opt)
+    if not gene_bundle_path.exists():
         raise SystemExit(
-            f"Bundle not found: {bundle_path}\n"
-            "Run joint_fusion.testing.pathway_interpret first (it writes the bundle)."
+            f"Gene bundle not found: {gene_bundle_path}\n"
+            "Run joint_fusion.testing.pathway_interpret first (it writes the "
+            "collection-independent gene_attribution_bundle.npz)."
         )
-    logger.info(f"Loading bundle: {bundle_path}")
-    bundle = load_bundle(bundle_path)
+    logger.info(f"Loading gene bundle: {gene_bundle_path}")
+    bundle = load_gene_bundle(gene_bundle_path)
     if opt.only_known_luad:
         run_known_luad_panel(
             bundle,
-            output_dir=str(bundle_path.parent),
+            output_dir=str(out_dir),
             msigdb_dir=opt.msigdb_dir,
             n_perm=opt.n_perm,
             n_boot=opt.n_boot,
@@ -1060,9 +1094,11 @@ def main():
             "known_luad_gsea_prerank.csv."
         )
     else:
+        os.makedirs(out_dir, exist_ok=True)
         run_layer_c(
             bundle,
-            output_dir=str(bundle_path.parent),
+            output_dir=str(out_dir),
+            collections=collections,
             n_perm=opt.n_perm,
             seed=opt.seed,
             ora_top_n=opt.ora_top_n,

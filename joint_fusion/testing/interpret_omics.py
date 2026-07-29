@@ -64,7 +64,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from joint_fusion.config.config_manager import ConfigManager
 from joint_fusion.utils.logging import setup_logging
 
 logger = logging.getLogger(__name__)
@@ -871,6 +870,10 @@ def parse_args():
 
 
 if __name__ == "__main__":
+    # Lazy import so importing this module as a library does not require the training-config
+    # stack (pydantic); only the CLI entry point needs ConfigManager.
+    from joint_fusion.config.config_manager import ConfigManager
+
     opt = parse_args()
     config = ConfigManager.load_config(opt.config)
 

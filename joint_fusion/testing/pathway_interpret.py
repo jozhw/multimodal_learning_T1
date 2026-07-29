@@ -36,14 +36,17 @@ Inputs (offline):
   assets/msigdb/               .gmt gene sets + Ensembl->symbol .chip
                                (fetch once: python -m joint_fusion.fetch_msigdb)
 
-Outputs (<output_base_dir>/pathway_interpret/): pathway_scores.csv (+ lung-named subset),
+Outputs: per-collection scores/figures in <output_base_dir>/<output-dir> (default
+pathway_interpret_reactome): pathway_scores.csv (+ lung-named subset),
 pathway_ig_magnitude_scores.csv, per-patient and per-gene beeswarms, member-gene table,
-direction/gradient plots, the score matrices, pathway_analysis_bundle.npz
-(for pathway_tests.py), run_metadata.json.
+direction/gradient plots, the score matrices, run_metadata.json. Plus the shared,
+collection-INDEPENDENT gene_attribution_bundle.npz (written to <output_base_dir>), which
+pathway_tests.py reads and rebuilds membership from for any --collections.
 
 Run:
   python -m joint_fusion.testing.pathway_interpret \
-      --config=joint_fusion/config/config_checkpoint_2026-04-07-04-58-17_fold1.yaml
+      --config=joint_fusion/config/config_checkpoint_2026-04-07-04-58-17_fold1.yaml \
+      --collections=c2.cp.reactome --output-dir=<...>/pathway_interpret_reactome
 """
 
 import argparse
@@ -57,7 +60,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from joint_fusion.config.config_manager import ConfigManager
 from joint_fusion.testing.interpret_omics import (
     annotate_genes,
     clean_ensembl_id,
@@ -1043,25 +1045,17 @@ def resolve_gene_axis(mapping_file_path, gene_axis_path):
     return gene_names
 
 
-ANALYSIS_BUNDLE_NAME = "pathway_analysis_bundle.npz"
+GENE_BUNDLE_NAME = "gene_attribution_bundle.npz"
 
 
-def save_analysis_bundle(
-    path,
-    ig_symbols,
-    path_gradient_symbols,
-    membership,
-    sizes,
-    names,
-    symbols,
-    patient_ids,
-    collections_per_pathway,
-):
-    """Persist everything Layer C needs so pathway_tests.py can reproduce the tests later.
+def save_gene_bundle(path, ig_symbols, path_gradient_symbols, symbols, patient_ids):
+    """Persist the COLLECTION-INDEPENDENT gene-level attribution matrices.
 
-    The tests are pure functions of the symbol-level attribution matrices and the
-    membership matrix, so this bundle removes any need for the model, raw IG files, or
-    MSigDB. Strings are stored as unicode arrays so it loads without pickle.
+    These symbol-axis matrices are all pathway_tests.py needs to rebuild membership for
+    ANY gene-set collection at test time, so this bundle deliberately carries NO membership
+    or pathway names -- one gene bundle serves Reactome, Hallmark, C6, ... without
+    re-running this module per collection. Strings are stored as unicode arrays so it loads
+    without pickle.
     """
     has_path_gradients = path_gradient_symbols is not None
     np.savez_compressed(
@@ -1073,13 +1067,27 @@ def save_analysis_bundle(
             else np.zeros((0, 0), dtype=np.float32)
         ),
         has_path_gradients=np.array(1 if has_path_gradients else 0, dtype=np.int8),
-        membership=np.asarray(membership, dtype=np.int8),
-        sizes=np.asarray(sizes, dtype=np.int64),
-        names=np.asarray(list(names), dtype=str),
         symbols=np.asarray(list(symbols), dtype=str),
         patient_ids=np.asarray([str(p) for p in patient_ids], dtype=str),
-        collections=np.asarray(list(collections_per_pathway), dtype=str),
     )
+
+
+def load_gene_bundle(path):
+    """Load the collection-independent gene bundle written by save_gene_bundle.
+
+    Returns the symbol-level matrices + axes; membership is rebuilt by the caller for the
+    collection under test (see pathway_tests.build_discovery_membership).
+    """
+    d = np.load(path, allow_pickle=False)
+    has_pg = int(d["has_path_gradients"]) == 1
+    return {
+        "ig_symbols": d["ig_symbols"].astype(np.float64),
+        "path_gradient_symbols": (
+            d["path_gradient_symbols"].astype(np.float64) if has_pg else None
+        ),
+        "symbols": [str(x) for x in d["symbols"]],
+        "patient_ids": [str(x) for x in d["patient_ids"]],
+    }
 
 
 def run(
@@ -1098,6 +1106,7 @@ def run(
     write_figures=True,
     write_member_genes=True,
     write_bundle=True,
+    gene_bundle_path=None,
 ):
     os.makedirs(output_dir, exist_ok=True)
 
@@ -1313,21 +1322,17 @@ def run(
         members.to_csv(os.path.join(output_dir, "pathway_member_genes.csv"), index=False)
         logger.info(f"Member genes -> {output_dir}/pathway_member_genes.csv")
 
-    # --- Save the bundle for the optional pathway_tests.py evidence step -----------
+    # --- Save the collection-independent gene bundle for pathway_tests.py ----------
+    # Shared across collections: pathway_tests rebuilds membership for whatever collection
+    # it is asked to test, so this is written once (to gene_bundle_path, typically the
+    # shared base dir) rather than baked per collection.
     if write_bundle:
-        bundle_path = os.path.join(output_dir, ANALYSIS_BUNDLE_NAME)
-        save_analysis_bundle(
-            bundle_path,
-            ig_symbols,
-            path_gradient_symbols,
-            membership,
-            sizes,
-            names,
-            symbols,
-            patient_ids,
-            [collection_of[n] for n in names],
+        gene_bundle = gene_bundle_path or os.path.join(output_dir, GENE_BUNDLE_NAME)
+        os.makedirs(os.path.dirname(gene_bundle) or ".", exist_ok=True)
+        save_gene_bundle(
+            gene_bundle, ig_symbols, path_gradient_symbols, symbols, patient_ids
         )
-        logger.info(f"Analysis bundle (for pathway_tests.py) -> {bundle_path}")
+        logger.info(f"Gene bundle (for pathway_tests.py) -> {gene_bundle}")
 
     # --- Figures -------------------------------------------------------------------
     if write_figures:
@@ -1475,7 +1480,7 @@ def run(
     metadata = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "n_patients": len(patient_ids),
-        "analysis_bundle": ANALYSIS_BUNDLE_NAME if write_bundle else None,
+        "gene_bundle": GENE_BUNDLE_NAME if write_bundle else None,
         "attribution": {
             "primary_method": primary_method_by_statistic[ranking_statistic],
             "comparison_method": "path-averaged gradients",
@@ -1560,10 +1565,13 @@ def main(config, opt):
     supplemental_collections = tuple(
         c.strip() for c in opt.supplemental_collections.split(",") if c.strip()
     )
+    # The gene bundle is collection-independent, so it lives in the shared base dir (one
+    # bundle serves every collection's pathway_tests run), not in the per-collection dir.
+    gene_bundle_path = opt.gene_bundle or str(base_dir / GENE_BUNDLE_NAME)
     run(
         mapping_file_path=opt.mapping_file or config.data.json_file,
         ig_directory=opt.ig_dir or str(base_dir / "IG_6sep"),
-        output_dir=str(base_dir / "pathway_interpret"),
+        output_dir=opt.output_dir or str(base_dir / "pathway_interpret"),
         gene_axis_path=opt.gene_axis,
         msigdb_dir=opt.msigdb_dir,
         collections=primary_collections,
@@ -1576,6 +1584,7 @@ def main(config, opt):
         write_figures=True,
         write_member_genes=True,
         write_bundle=True,
+        gene_bundle_path=gene_bundle_path,
     )
     if not opt.no_supplemental_all and set(supplemental_collections) != set(primary_collections):
         run(
@@ -1596,8 +1605,10 @@ def main(config, opt):
             write_bundle=False,
         )
     logger.info(
-        "\nDone. Scores + figures + pathway_analysis_bundle.npz written. For "
-        "p-values / GSEA / ORA, run joint_fusion.testing.pathway_tests on the bundle."
+        f"\nDone. Scores + figures written to {opt.output_dir or (base_dir / 'pathway_interpret')}; "
+        f"collection-independent gene bundle -> {gene_bundle_path}. For p-values / GSEA / "
+        "ORA on any collection, run joint_fusion.testing.pathway_tests against that gene "
+        "bundle with --collections."
     )
 
 
@@ -1611,6 +1622,16 @@ def parse_args():
     )
     parser.add_argument("--ig-dir", type=str, default=None,
                         help="Defaults to <output_base_dir>/IG_6sep.")
+    parser.add_argument("--output-dir", type=str, default=None,
+                        help="Override the primary output directory (default: "
+                             "<output_base_dir>/pathway_interpret). Use a distinct name "
+                             "(e.g. <...>/pathway_interpret_reactome) to keep discovery "
+                             "universes -- Reactome vs Hallmark vs C6 -- side by side.")
+    parser.add_argument("--gene-bundle", type=str, default=None,
+                        help="Path for the collection-independent gene bundle "
+                             "(default: <output_base_dir>/gene_attribution_bundle.npz). "
+                             "Shared across collections; pathway_tests reads it and rebuilds "
+                             "membership per --collections.")
     parser.add_argument("--mapping-file", type=str, default=None,
                         help="Mapping JSON. Defaults to config.data.json_file.")
     parser.add_argument("--gene-axis", type=str, default=GENE_AXIS_CACHE,
@@ -1670,7 +1691,13 @@ def parse_args():
 
 
 if __name__ == "__main__":
+    # parse_args() first so --help works in the lean analysis env; the training-config
+    # stack (pydantic, via ConfigManager) is imported only after, and only when actually
+    # running -- importing this module as a library never pulls it in.
     opt = parse_args()
+
+    from joint_fusion.config.config_manager import ConfigManager
+
     config = ConfigManager.load_config(opt.config)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
