@@ -1,16 +1,15 @@
 #!/bin/bash -l
 
-# TEST step, C6. Runs run_discovery_pathway_tests.sh -> permutation / GSEA / ORA into
-# pathway_interpret_c6/. REQUIRES the gene bundle from qsub_interpret_c6.sh (run that first).
-# Uses the capacity queue with a long walltime so a full N_PERM=10000 run is not killed
-# mid-permutation. For a fast first pass submit with:  N_PERM=1000 qsub <this>.
-# C6 sets are directional (UP/DN) -- read gsea_prerank.csv / ora_up / ora_down as primary.
+# TEST step, Reactome. Runs run_discovery_pathway_tests.sh -> permutation / GSEA / ORA into
+# pathway_interpret_reactome/. REQUIRES the gene bundle from qsub_interpret_reactome.sh (run
+# that first). Uses the capacity queue with a long walltime so a full N_PERM=10000 run is not
+# killed mid-permutation. For a fast first pass submit with:  N_PERM=1000 qsub <this>.
 
 #PBS -A GeomicVar
 #PBS -l select=1
 #PBS -l walltime=06:00:00
 #PBS -l filesystems=home:eagle
-#PBS -N pw_test_c6
+#PBS -N pw_test_reactome
 #PBS -q capacity
 #PBS -k doe
 #PBS -o /grand/GeomicVar/jozhw/multimodal_learning_T1/tmp
@@ -39,4 +38,4 @@ if missing:
           "Install them, or set SKIP_GSEA=1 if only gseapy is missing.", file=sys.stderr)
 PY
 
-./joint_fusion/run/run_discovery_c6.sh
+./joint_fusion/run/run_discovery_reactome.sh

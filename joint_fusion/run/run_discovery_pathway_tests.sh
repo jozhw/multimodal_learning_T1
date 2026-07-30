@@ -64,7 +64,7 @@ GSEA_THREADS="${GSEA_THREADS:-$NCORES}"
 # --jobs (process parallelism for the permutation) is NOT used by default: the BLAS
 # threading set above already runs the permutation on every core and is the fast path.
 # It is only worth setting on a single-threaded BLAS build -- then submit with e.g.
-#   JOBS=-1 qsub joint_fusion/run/qsub_discovery_pathway_tests.sh   (or JOBS=$NCORES).
+#   JOBS=-1 qsub joint_fusion/run/qsub_discovery_reactome.sh   (or JOBS=$NCORES).
 
 # Set to 1 to skip GSEA (permutation stats + ORA only).
 SKIP_GSEA=0
