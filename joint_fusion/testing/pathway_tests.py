@@ -644,23 +644,34 @@ def run_layer_c(
         merged.to_csv(merged_path, index=False)
         logger.info(f"Scores + permutation stats -> {merged_path}")
 
-    # 2. GSEA prerank on the path gradients (direction-aware, threshold-free).
+    # 2. GSEA prerank on the path gradients (direction-aware, threshold-free). GSEApy runs at
+    #    its own default (single-threaded); we do not force a thread count. Wrapped so that a
+    #    GSEApy failure does not abort the run -- the permutation stats above and the ORA below
+    #    still complete.
     if path_gradient_symbols is not None and not skip_gsea:
-        logger.info(f"GSEA prerank via GSEApy ({n_perm} permutations)")
-        gsea = gsea_prerank(
-            path_gradient_symbols.mean(axis=0),
-            membership,
-            names,
-            n_perm,
-            seed,
-            symbols,
-            threads=gsea_threads,
-        )
-        gsea["collection"] = gsea["pathway"].map(collection_of)
-        gsea_path = os.path.join(output_dir, "gsea_prerank.csv")
-        gsea.to_csv(gsea_path, index=False)
-        n_sig = int((gsea["fdr_q"] < 0.25).sum())
-        logger.info(f"GSEA -> {gsea_path} ({n_sig} pathways at FDR < 0.25)")
+        try:
+            logger.info(f"GSEA prerank via GSEApy ({n_perm} permutations)")
+            gsea = gsea_prerank(
+                path_gradient_symbols.mean(axis=0),
+                membership,
+                names,
+                n_perm,
+                seed,
+                symbols,
+                threads=gsea_threads,
+            )
+            gsea["collection"] = gsea["pathway"].map(collection_of)
+            gsea_path = os.path.join(output_dir, "gsea_prerank.csv")
+            gsea.to_csv(gsea_path, index=False)
+            n_sig = int((gsea["fdr_q"] < 0.25).sum())
+            logger.info(f"GSEA -> {gsea_path} ({n_sig} pathways at FDR < 0.25)")
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as e:  # incl. pyo3 PanicException (a BaseException subclass)
+            logger.error(
+                f"GSEA failed ({type(e).__name__}: {e}); skipping GSEA and continuing "
+                "with ORA. Re-run with --skip-gsea to suppress this step."
+            )
     else:
         logger.info("GSEA skipped (bundle has no path gradients, or --skip-gsea).")
 

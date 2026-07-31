@@ -37,10 +37,6 @@ if [[ -n "${NUMEXPR_NUM_THREADS:-}" && "${NUMEXPR_NUM_THREADS}" -gt 64 ]]; then
   export NUMEXPR_NUM_THREADS=64
 fi
 
-# Threads for GSEApy prerank only (it is single-threaded unless told; not BLAS). Defaults to
-# numpy's view of the core count; override with GSEA_THREADS.
-NCORES="${NCORES:-$(python -c 'import os; print(os.cpu_count() or 8)' 2>/dev/null || echo 8)}"
-
 # Discovery settings. The discovery universe is whatever collection the bundle was
 # built with (Reactome C2:CP by default in pathway_interpret.py).
 # N_PERM is overridable: e.g. N_PERM=1000 for a fast first pass (10x cheaper); 10000 is the
@@ -55,18 +51,10 @@ ORA_TOP_N=100                       # top genes per ORA list (magnitude / up / d
 # run_interpret_pathway.sh's MIN_MEMBERS for the same collection.
 MIN_MEMBERS="${MIN_MEMBERS:-10}"
 
-# GSEA is computed with GSEApy; it must be installed in your active Python env
-# (set SKIP_GSEA=1 to run only the permutation stats + ORA). Unlike the permutation,
-# GSEApy prerank is genuinely single-threaded unless told otherwise and is the longest
-# step at N_PERM=10000, so give it all the cores too. Override with GSEA_THREADS.
-GSEA_THREADS="${GSEA_THREADS:-$NCORES}"
-
-# --jobs (process parallelism for the permutation) is NOT used by default: the BLAS
-# threading set above already runs the permutation on every core and is the fast path.
-# It is only worth setting on a single-threaded BLAS build -- then submit with e.g.
-#   JOBS=-1 qsub joint_fusion/run/qsub_discovery_reactome.sh   (or JOBS=$NCORES).
-
-# Set to 1 to skip GSEA (permutation stats + ORA only).
+# GSEA (GSEApy) and ORA are NOT parallelised here -- GSEApy runs at its own default and both
+# are fast enough. Forcing a high thread count made GSEApy's Rust backend crash on the node's
+# thread limit, so we do not pass a thread count at all. Set SKIP_GSEA=1 to run permutation +
+# ORA only.
 SKIP_GSEA=0
 
 ARGS=(
@@ -80,7 +68,6 @@ ARGS=(
   --tail "$TAIL"
   --ora-top-n "$ORA_TOP_N"
   --min-members "$MIN_MEMBERS"
-  --gsea-threads "$GSEA_THREADS"
 )
 
 if [[ "$SKIP_GSEA" == "1" ]]; then
