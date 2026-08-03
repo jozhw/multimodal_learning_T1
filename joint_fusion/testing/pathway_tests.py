@@ -392,11 +392,15 @@ def gsea_prerank(
     seed=0,
     symbols=None,
     threads=1,
+    plot_outdir=None,
 ):
     """GSEA prerank via GSEApy (Subramanian et al. 2005; Fang et al. 2023).
 
     The bundle membership already applied the intended size filter, so GSEApy's min_size
     is set to 1 to avoid dropping small pre-specified driver modules.
+
+    If ``plot_outdir`` is given, GSEApy writes its own enrichment-score plot per gene set
+    (plus report files) into that folder; otherwise no plots are produced.
     """
     try:
         import gseapy as gp
@@ -423,10 +427,12 @@ def gsea_prerank(
     ranks = ranks.sort_values("rank_metric", ascending=False, ignore_index=True)
     gene_sets = _membership_to_gene_sets(membership[:, finite], names, symbols[finite])
 
+    if plot_outdir is not None:
+        os.makedirs(plot_outdir, exist_ok=True)
     result = gp.prerank(
         rnk=ranks,
         gene_sets=gene_sets,
-        outdir=None,
+        outdir=plot_outdir,
         min_size=1,
         max_size=len(ranks),
         permutation_num=n_perm,
@@ -434,7 +440,7 @@ def gsea_prerank(
         ascending=False,
         threads=threads,
         seed=seed,
-        no_plot=True,
+        no_plot=plot_outdir is None,
         verbose=False,
     )
     table = result.res2d.rename(
@@ -581,6 +587,7 @@ def run_layer_c(
     gsea_threads=1,
     tail="exponential",
     n_jobs=1,
+    gsea_plots=True,
 ):
     ig_symbols = bundle["ig_symbols"]
     path_gradient_symbols = bundle["path_gradient_symbols"]
@@ -659,6 +666,9 @@ def run_layer_c(
                 seed,
                 symbols,
                 threads=gsea_threads,
+                plot_outdir=(
+                    os.path.join(output_dir, "gsea_plots") if gsea_plots else None
+                ),
             )
             gsea["collection"] = gsea["pathway"].map(collection_of)
             gsea_path = os.path.join(output_dir, "gsea_prerank.csv")
@@ -798,6 +808,13 @@ def main():
         "single-threaded BLAS.",
     )
     parser.add_argument("--skip-gsea", action="store_true")
+    parser.add_argument(
+        "--skip-gsea-plots",
+        action="store_true",
+        help="Do not have GSEApy draw its enrichment-score plots. By default (plots on) "
+        "GSEApy writes one plot per gene set plus report files into "
+        "<out-dir>/gsea_plots/.",
+    )
     opt = parser.parse_args()
 
     collections = tuple(c.strip() for c in opt.collections.split(",") if c.strip())
@@ -824,6 +841,7 @@ def main():
         gsea_threads=opt.gsea_threads,
         tail=opt.tail,
         n_jobs=opt.jobs,
+        gsea_plots=not opt.skip_gsea_plots,
     )
     logger.info(
         "\nDone. See pathway_scores_with_stats.csv, gsea_prerank.csv, and ora_*.csv."

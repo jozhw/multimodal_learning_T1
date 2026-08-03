@@ -57,6 +57,12 @@ MIN_MEMBERS="${MIN_MEMBERS:-10}"
 # ORA only.
 SKIP_GSEA=0
 
+# GSEA enrichment plots are ON by default: GSEApy writes one enrichment-score plot per gene
+# set (plus report files) into $PATHWAY_DIR/gsea_plots/. That is one image per tested set,
+# so a large collection (e.g. Reactome) produces many files. Set SKIP_GSEA_PLOTS=1 to run
+# GSEA without drawing plots.
+SKIP_GSEA_PLOTS="${SKIP_GSEA_PLOTS:-0}"
+
 ARGS=(
   --config "$CONFIG"
   --out-dir "$PATHWAY_DIR"
@@ -72,6 +78,10 @@ ARGS=(
 
 if [[ "$SKIP_GSEA" == "1" ]]; then
   ARGS+=(--skip-gsea)
+fi
+
+if [[ "$SKIP_GSEA_PLOTS" == "1" ]]; then
+  ARGS+=(--skip-gsea-plots)
 fi
 
 # Opt-in process parallelism (single-threaded-BLAS fallback only): JOBS=-1 qsub ...
