@@ -280,11 +280,13 @@ def collapse_to_symbols(matrices, ensembl_ids, chip):
             [matrix[:, idx].mean(axis=1) for idx in index_groups]
         )
 
+    unmapped_ensembl_ids = [ensembl_ids[i] for i, s in enumerate(symbols) if not s]
     stats = {
         "n_ensembl_ids": len(ensembl_ids),
         "n_unmapped_to_symbol": len(ensembl_ids) - len(resolved),
         "n_symbols": len(ordered_symbols),
         "n_symbols_from_multiple_ensembl": sum(1 for g in index_groups if len(g) > 1),
+        "unmapped_ensembl_ids": unmapped_ensembl_ids,
     }
     logger.info(
         f"gene axis: {stats['n_ensembl_ids']} Ensembl IDs -> {stats['n_symbols']} symbols "

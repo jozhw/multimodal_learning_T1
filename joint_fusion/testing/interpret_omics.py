@@ -40,6 +40,8 @@ pathway_interpret.py tests (permutation FDR, GSEA, hypergeometric ORA against th
 measured-gene background) rather than something asserted here.
 
 Outputs (under <output_base_dir>/interpret_omics/):
+  all_gene_ig_scores.csv  one row per measured gene (all ~9k), IG magnitude plus path
+                          and vanilla gradient direction summaries, keyed by Ensembl ID
   top_genes.csv           one row per top gene, with IG magnitude plus path and
                           vanilla gradient direction summaries
   top_genes.json          same content, nested
@@ -786,6 +788,14 @@ def run(
     )
     logger.info(f"Primary direction source: {direction_source}")
 
+    # Full per-gene attribution table (every measured gene, not just the top ranks): IG
+    # magnitude + path/vanilla gradient direction columns keyed by Ensembl ID.
+    all_genes_path = os.path.join(output_dir, "all_gene_ig_scores.csv")
+    stats.sort_values("mean_abs_ig", ascending=False, ignore_index=True).to_csv(
+        all_genes_path, index=False
+    )
+    logger.info(f"All-gene attribution table ({len(stats)} genes) -> {all_genes_path}")
+
     ranking_frames = rank_genes(stats, top_n, direction_source)
 
     ensembl_ids = list(
@@ -821,7 +831,8 @@ def main(config, opt):
         gene_info_cache_dir=opt.gene_info_dir,
     )
     logger.info(
-        "\nDone. See top_genes.csv and patient_top_genes.csv. For the pathway-level "
+        "\nDone. See all_gene_ig_scores.csv (every gene), top_genes.csv and "
+        "patient_top_genes.csv. For the pathway-level "
         "analysis and the statistical evidence, run joint_fusion.testing.pathway_interpret."
     )
 
